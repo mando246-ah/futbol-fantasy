@@ -13,6 +13,7 @@ import {
   callMaybeStartDraft,
   callStartDraftNow,
   callAutoPick,
+  logAnalyticsEvent,
 } from "../firebase";
 import {
   doc,
@@ -256,6 +257,7 @@ export default function DraftWithPresence() {
     });
   }, [roomId]);
 
+
   //Clock tick
   useEffect(() => {
     const id = setInterval(() => setClockNow(Date.now()), 1000);
@@ -378,6 +380,11 @@ export default function DraftWithPresence() {
       updatedAt: serverTimestamp(),
     });
 
+    logAnalyticsEvent("create_room", {
+      room_id: key,
+      source: "draft_page",
+    });
+
     } catch (e) {
       console.error(e);
       alert("Failed to create room. Check console for details.");
@@ -423,6 +430,10 @@ export default function DraftWithPresence() {
 
 
     setRoomId(key);
+      logAnalyticsEvent("join_room", {
+      room_id: key,
+      join_method: "code",
+    });
   }
 
   // Host: schedule start
@@ -456,6 +467,10 @@ export default function DraftWithPresence() {
 
     try {
       await callStartDraftNow({ roomId });
+      logAnalyticsEvent("draft_started", {
+        room_id: roomId,
+        start_method: "manual",
+      });
     } catch (e) {
       alert(e?.message || "Failed to start");
     }
@@ -475,7 +490,15 @@ export default function DraftWithPresence() {
     const tid = setInterval(async () => {
       if (Date.now() >= targetMillis) {
         clearInterval(tid);
-        try { await callMaybeStartDraft({ roomId }); } catch {}
+        try { await callMaybeStartDraft({ roomId }); 
+
+        if(room?.hostUid === user?.uid){
+        logAnalyticsEvent("draft_started", {
+          room_id: roomId,
+          start_method: "scheduled",
+        });}
+
+      } catch {}
       }
     }, 1000);
     return () => clearInterval(tid);

@@ -1146,3 +1146,219 @@
 .tpBenchList .tpRowWrap.tpRowOpen{
   border-color: rgba(245, 158, 11, 0.32);
 }
+
+/* Week History (previous weeks) */
+.tpHistoryHeader{
+  display:flex;
+  align-items:flex-end;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.tpHistoryTitle{ margin-bottom: 0; }
+.tpHistoryControls{
+  display:flex;
+  align-items:center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.tpHistorySelect{
+  min-width: 260px;
+  max-width: 100%;
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(255,255,255,0.16);
+  background: rgba(255,255,255,0.06);
+  color: rgba(255,255,255,0.92);
+  font-weight: 800;
+  outline: none;
+}
+.tpHistorySelect:focus{ border-color: rgba(34,211,238,0.28); }
+.tpMiniBtn{
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(255,255,255,0.16);
+  background: rgba(255,255,255,0.06);
+  color: rgba(255,255,255,0.92);
+  font-weight: 900;
+  cursor: pointer;
+}
+.tpMiniBtn:hover{
+  background: rgba(255,255,255,0.10);
+  border-color: rgba(34,211,238,0.22);
+}
+.tpHistoryMeta{ margin-top: 10px; }
+.tpHistoryList{
+  display:flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 10px;
+}
+.tpHistoryRow{
+  display:flex;
+  align-items:center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 16px;
+  border: 1px solid rgba(255,255,255,0.12);
+  background: rgba(0,0,0,0.18);
+}
+.tpHistoryRow:hover{
+  background: rgba(0,0,0,0.24);
+  border-color: rgba(34,211,238,0.18);
+}
+.tpHistoryTeams{
+  display:flex;
+  align-items:center;
+  gap: 10px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+.tpHistoryScore{
+  display:flex;
+  align-items:center;
+  gap: 10px;
+  font-weight: 900;
+  flex: 0 0 auto;
+}
+.tpHistoryResult{
+  opacity: 0.7;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+/* Force dark dropdown menu */
+.tpHistorySelect {
+  color-scheme: dark;              /* helps Chrome/Edge/Safari use dark native UI */
+  background-color: rgba(255,255,255,0.06);
+  color: rgba(255,255,255,0.92);
+}
+
+/* Dropdown options */
+.tpHistorySelect option,
+.tpHistorySelect optgroup {
+  background-color: #0b1220;       /* dark menu */
+  color: rgba(255,255,255,0.92);
+}
+.tpHistoryRowWrap { display: flex; flex-direction: column; gap: 10px; }
+.tpBreakdownWrap{
+  margin-top: 10px;
+  padding: 12px;
+  border-radius: 16px;
+  border: 1px solid rgba(255,255,255,0.12);
+  background: rgba(0,0,0,0.20);
+}
+
+.tpBreakdownCols{
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+@media (max-width: 900px){
+  .tpBreakdownCols{ grid-template-columns: 1fr; }
+}
+
+.tpBreakdownColTitle{
+  font-weight: 900;
+  opacity: 0.9;
+  margin-bottom: 8px;
+}
+
+.tpBreakdownSectionTitle{
+  font-weight: 900;
+  opacity: 0.7;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin: 10px 0 6px;
+}
+
+.tpBreakdownPlayer{
+  border: 1px solid rgba(255,255,255,0.10);
+  border-radius: 14px;
+  background: rgba(255,255,255,0.04);
+  padding: 8px 10px;
+  margin-bottom: 8px;
+}
+
+.tpBreakdownSummary{
+  list-style: none;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  cursor: pointer;
+}
+
+.tpBreakdownName{
+  font-weight: 900;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tpBreakdownMeta{
+  font-weight: 800;
+  opacity: 0.75;
+  white-space: nowrap;
+}
+
+.tpBreakdownParts{
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(255,255,255,0.10);
+  display: grid;
+  gap: 6px;
+}
+
+.tpBreakdownPartRow{
+  display:flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-weight: 800;
+  opacity: 0.9;
+}
+
+.tpBreakdownPartKey{ opacity: 0.75; }
+.tpMuted{ opacity: 0.6; }
+
+.tpBenchLine{
+  display:flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 14px;
+  border: 1px solid rgba(255,255,255,0.08);
+  background: rgba(255,255,255,0.03);
+  margin-bottom: 8px;
+}
+
+/* Scoring popover: more compact + 2 columns */
+.tpScoringPopover{
+  width: 520px;
+}
+
+.tpScoringList{
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.tpScoringItem{
+  padding: 8px;
+}
+
+.tpScoringLabel{
+  font-size: 0.9rem;
+}
+
+.tpScoringDetail{
+  font-size: 0.8rem;
+}
+
+@media (max-width: 720px){
+  .tpScoringPopover{ width: 360px; }
+  .tpScoringList{ grid-template-columns: 1fr; }
+}

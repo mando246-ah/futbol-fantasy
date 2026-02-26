@@ -252,14 +252,6 @@ export default function Marketplace({ roomId, user, isHost, players= [] }) {
     };
   }, [roomId]);
 
-
- /* useEffect(() => watchMarket(roomId, (m, wholeRoom) => {
-    setMarket(m || { status: "closed" });
-    setRoom(wholeRoom || null);
-  }), [roomId]); */
-
-
-
   // Load undrafted & my roster
   useEffect(() => {
     async function load() {
@@ -372,10 +364,15 @@ export default function Marketplace({ roomId, user, isHost, players= [] }) {
   useEffect(() => {
   if (!roomId || !isHost) return;
 
-  if (market?.status !== "resolving") {
+  const shouldResolve =
+    market?.status === "resolving" ||
+    (market?.status === "closed" && market?.closesAt && toMillis(market.closesAt) <= Date.now());
+
+  if (!shouldResolve) {
     resolveOnceRef.current = false;
     return;
   }
+
 
   if (resolveOnceRef.current) return;
   resolveOnceRef.current = true;
@@ -424,20 +421,30 @@ export default function Marketplace({ roomId, user, isHost, players= [] }) {
     if (!durationMs) return alert("Please set a duration.");
     await marketOpenNow({ roomId, durationMs });
   }
-  async function onSchedule() {
-  if (!durationMs || !startISO) return alert("Start time + duration required.");
+
+     async function onSchedule() {
+    if (!durationMs || !startISO) return alert("Start time + duration required.");
 
     const whenMillis = new Date(startISO).getTime();
     if (!Number.isFinite(whenMillis)) return alert("Invalid start time.");
 
-    // call your Cloud Function (this is the one that emails everyone + writes market/current)
-    const res = await fnScheduleMarket({
-      roomId,
-      scheduledAtMs: whenMillis,
-      durationMs,
-    });
+    try {
+      const res = await fnScheduleMarket({
+        roomId,
+        scheduledAtMs: whenMillis,
+        durationMs,
+      });
 
-    console.log("scheduleMarket()", res);
+      console.log("scheduleMarket ok:", res?.data ?? res);
+    } catch (e) {
+      console.error("scheduleMarket failed:", {
+        code: e?.code,
+        message: e?.message,
+        details: e?.details,
+        raw: e,
+      });
+      alert(`scheduleMarket failed: ${e?.message ?? e}`);
+    }
   }
 
   async function onResolve() {
@@ -455,6 +462,8 @@ export default function Marketplace({ roomId, user, isHost, players= [] }) {
             <span className="marketBadge marketBadgeOpen">Open • {countdown ?? "—"}</span>
           ) : market?.status === "resolved" ? (
             <span className="marketBadge marketBadgeResolved">Resolved</span>
+          ) :  market?.status === "resolving" ? (
+            <span className="marketBadge marketBadgeScheduled">Resolving…</span>
           ) : scheduledAtMs && scheduledAtMs > Date.now() ? (
             <span className="marketBadge marketBadgeScheduled">
               Scheduled • {scheduledOpenCountdown.label}

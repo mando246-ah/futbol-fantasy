@@ -1,5 +1,5 @@
 // web/src/App.jsx
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useRef } from "react";
 import {
   BrowserRouter as Router,
   Routes,
@@ -26,6 +26,8 @@ import {
   signInWithGoogleWithPref,
   setRememberMe,
   getRememberMe,
+  logPageView,
+  logAnalyticsEvent,
 } from "./firebase";
 import TournamentPage from "./pages/TournamentPage/TournamentPage";
 import { Avatar, AvatarImage, AvatarFallback } from "./components/ui/avatar";
@@ -57,7 +59,7 @@ function Nav({ user, displayName, photoURL }) {
 
   const tabs = [
     { to: "/", label: "Home" },
-    { to: "/draft", label: "Draft" },
+    { to: "/draft", label: "Draft", hideWhenNoUser: true },
     {
       to: lastRoomId ? `/room?room=${lastRoomId}` : null,
       label: "View Rosters",
@@ -84,10 +86,10 @@ function Nav({ user, displayName, photoURL }) {
         <Link to="/" className="flex items-center gap-3 font-bold text-xl whitespace-nowrap">
           <img
             src={logo}
-            alt="Football Fantasy"
+            alt="Fútbol Fantasy"
             className="h-12 w-16 object-contain shrink-0"
           />
-          <span>Football Fantasy</span>
+          <span>Fútbol Fantasy</span>
         </Link>
         {/* Desktop nav */}
         <nav className="hidden md:flex items-center gap-4 text-sm">
@@ -268,7 +270,7 @@ function SignIn() {
     <div className="min-h-[60vh] grid place-items-center p-6">
       <div className="rounded-2xl border border-white/10 bg-white/5 backdrop-blur-md shadow-lg p-6 w-full max-w-md text-white">
         <h1 className="text-xl font-bold mb-2">Sign in</h1>
-        <p className="text-sm opacity-70 mb-4">Use Google or a passwordless email link.</p>
+        <p className="text-sm opacity-70 mb-4">Please sign in with Google</p>
 
         <label className="flex items-center gap-2 text-sm opacity-90 mb-4 select-none">
           <input
@@ -288,7 +290,7 @@ function SignIn() {
           Continue with Google
         </button>
 
-        <div className="flex items-center gap-3 mb-4">
+        {/*<div className="flex items-center gap-3 mb-4">
           <div className="h-px flex-1 bg-white/10" />
           <div className="text-xs opacity-50">OR</div>
           <div className="h-px flex-1 bg-white/10" />
@@ -318,7 +320,7 @@ function SignIn() {
           </div>
         )}
 
-        {err && <div className="text-red-600 text-sm mt-3">{String(err)}</div>}
+        {err && <div className="text-red-600 text-sm mt-3">{String(err)}</div>} */}
       </div>
     </div>
   );
@@ -339,6 +341,33 @@ function AppLayout({ user, displayName, photoURL }) {
   );
 }
 
+//Analytics
+function AnalyticsRouteTracker() {
+  const location = useLocation();
+
+  useEffect(() => {
+    const { pathname, search } = location;
+
+    // Nice clean titles per route (fixes your "Football/Fútbol/Fútball" duplicates too)
+    let title = "Fútbol Fantasy";
+    if (pathname === "/") title = "Fútbol Fantasy — Home";
+    else if (pathname === "/signin") title = "Fútbol Fantasy — Sign In";
+    else if (pathname === "/profile") title = "Fútbol Fantasy — Profile";
+    else if (pathname === "/draft") title = "Fútbol Fantasy — Draft";
+    else if (pathname === "/room") title = "Fútbol Fantasy — Rosters";
+    else if (pathname.startsWith("/tournament")) title = "Fútbol Fantasy — Tournament";
+
+    document.title = title;
+
+    // Log a page_view for every route change (SPA fix)
+    logPageView({
+      page_path: pathname + search,
+      page_title: title,
+    });
+  }, [location.pathname, location.search]);
+
+  return null;
+}
 
 // ---------- App ----------
 export default function App() {
@@ -346,12 +375,29 @@ export default function App() {
   const [profile, setProfile] = useState(null);
   const displayName = profile?.displayName;
   const photoURL = profile?.photoURL;
+  const loginLoggedRef = useRef(false);
 
   useEffect(() => {
-    completeRedirectIfAny();
     completeGoogleRedirectIfAny().catch(console.error);
-    completeRedirectIfAny().catch(console.error);
-    const unsub = watchAuth(setUser);
+
+    const unsub = watchAuth((u) => {
+      setUser(u);
+
+      // Log once per login
+      if (u && !loginLoggedRef.current) {
+        loginLoggedRef.current = true;
+
+        logAnalyticsEvent("login_success", {
+          method: u.providerData?.[0]?.providerId || "unknown",
+        });
+      }
+
+      // Reset when signed out so it can log next time
+      if (!u) {
+        loginLoggedRef.current = false;
+      }
+    });
+
     return unsub;
   }, []);
 
@@ -363,8 +409,29 @@ export default function App() {
     return watchUserProfile(user.uid, setProfile);
   }, [user?.uid]);
 
+  useEffect(() => {
+    const unsub = watchAuth((u) => {
+      setUser(u);
+
+      if (u && !loginLoggedRef.current) {
+        loginLoggedRef.current = true;
+
+        logAnalyticsEvent("login_success", {
+          method: u.providerData?.[0]?.providerId || "unknown",
+        });
+      }
+
+      if (!u) {
+        loginLoggedRef.current = false; // allow it to log next time user logs in
+      }
+    });
+
+    return () => unsub?.();
+  }, []);
+
   return (
     <Router>
+      <AnalyticsRouteTracker />
       <Routes>
         <Route element={<AppLayout user={user} displayName={displayName} photoURL={photoURL} />}>
           <Route path="/" element={<Home user={user} />} />

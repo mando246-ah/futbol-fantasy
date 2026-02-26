@@ -39,7 +39,7 @@ service cloud.firestore {
     }
     match /rooms/{roomId}/lineups/{uid} {
       allow read: if authed();
-      allow create, update: if authed() && request.auth.uid == uid;
+      allow create, update: if authed() && (request.auth.uid == uid || isHostUid(roomId));
       allow delete: if false;
     }
 
@@ -119,7 +119,9 @@ service cloud.firestore {
 
       // market interest — per-user doc
       match /marketInterest/{uid} {
-        allow read, create, update, delete: if authed() && request.auth.uid == uid;
+        allow read: if authed();
+  			allow create, update: if authed() && request.auth.uid == uid;
+  			allow delete: if authed() && (request.auth.uid == uid || isHostUid(roomId));
       }
 
       // market results — host writes, all read

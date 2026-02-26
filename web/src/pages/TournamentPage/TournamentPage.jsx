@@ -1,7 +1,7 @@
 // src/pages/TournamentPage/TournamentPage.jsx
 import { useEffect, useState, useRef} from "react";
 import { useParams, Link } from "react-router-dom";
-import { doc, onSnapshot } from "firebase/firestore";
+import { doc, onSnapshot, collection, query, orderBy, limit } from "firebase/firestore";
 
 import { useTournament } from "../../tournament/hooks/useTournament";
 import { app, auth, db } from "../../firebase";
@@ -10,6 +10,83 @@ import "./TournamentPage.css";
 import { Avatar, AvatarImage, AvatarFallback } from "../../components/ui/avatar";
 import { httpsCallable } from "firebase/functions"; 
 import { functions } from "../../firebase";
+
+//Labels for stats
+const STAT_LABELS = {
+  // Core
+  appearance: "Appearance",
+  sixtyPlus: "Played 60+ mins",
+  goals: "Goals",
+  assists: "Assists",
+  cleanSheet: "Clean sheet (60+ mins)",
+  saves: "Saves",
+  goalsConceded: "Goals conceded",
+  yellow: "Yellow card",
+  red: "Red card",
+  ownGoals: "Own goal",
+
+  // Penalties
+  pensSaved: "Penalty saved",
+  pensMissed: "Penalty missed",
+  pensCommitted: "Penalty committed",
+
+  // Passing
+  passesCompleted: "Passes completed",
+
+  // Advanced
+  tackles: "Tackles",
+  duelsWon: "Duels won",
+  dribblesSuccess: "Dribbles (successful)",
+  foulsCommitted: "Fouls committed",
+  offsides: "Offsides",
+  shotsOnTarget: "Shots on target",
+  rating: "Rating",
+  rating85: "Rating 8.5+",
+
+  minutes: "Minutes played",
+  pensScored: "Penalty scored",
+  dribbles: "Dribbles",
+  duels: "Duels",
+  shotsOn: "Shots on target",
+};
+
+function prettyStatLabel(key) {
+  if (!key) return "";
+  if (STAT_LABELS[key]) return STAT_LABELS[key];
+
+  // fallback: camelCase / snake_case -> Title Case
+  const s = String(key)
+    .replace(/_/g, " ")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .trim();
+
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+function getUserBreakdown(resultsDoc, uid) {
+  const bd = resultsDoc?.breakdownByUserId?.[uid] || null;
+  if (!bd) return { starters: [], bench: [], partsByPlayerId: {} };
+
+  const starters = bd.starters || bd.startingXI || bd.starting || bd.xi || [];
+  const bench = bd.bench || bd.subs || bd.substitutes || [];
+  const partsByPlayerId =
+    bd.partsByPlayerId || bd.playerBreakdown || bd.breakdownByPlayerId || {};
+
+  return { starters, bench, partsByPlayerId };
+}
+
+function playerIdOf(p) {
+  return String(p?.playerId ?? p?.id ?? p?.pid ?? "");
+}
+function playerNameOf(p) {
+  return p?.name ?? p?.playerName ?? p?.fullName ?? "Player";
+}
+function playerPosOf(p) {
+  return p?.pos ?? p?.position ?? "";
+}
+function playerPtsOf(p) {
+  return Number(p?.pts ?? p?.points ?? p?.total ?? 0);
+}
 
 function fmtDT(v) {
   if (!v) return "—";
@@ -99,17 +176,36 @@ function UserChip({ user }) {
 
 // --- PASTE THIS AT THE TOP OF THE FILE (Outside the component) ---
 const SCORING_DISPLAY = [
-  { label: "Playing Time", detail: "1 pt (Appearance) + 1 pt (60+ mins)" },
-  { label: "Goals", detail: "GK/DEF: 6, MID: 5, FWD: 4" },
-  { label: "Assists", detail: "3 pts" },
-  { label: "Clean Sheet", detail: "GK/DEF: 4, MID: 1 (Min 60 mins)" },
-  { label: "Saves (GK)", detail: "1 pt every 3 saves" },
-  { label: "Goals Conceded", detail: "-1 pt every 2 goals (GK/DEF)" },
-  { label: "Penalties", detail: "Saved: +5, Missed: -2" },
-  { label: "Cards", detail: "Yellow: -1, Red: -3" },
-  { label: "Passing (Total)", detail: "GK: 30, DEF/MID: 25, FWD: 20 passes = 1 pt" },
-];
+  { label: "Appearance", detail: "+1 (any minutes)" },
+  { label: "Played 60+ mins", detail: "+1 (60+ minutes)" },
 
+  { label: "Goals", detail: "FWD: +4 • MID: +5 • DEF/GK: +6" },
+  { label: "Assists", detail: "+3" },
+
+  { label: "Clean Sheet (60+ mins)", detail: "DEF/GK: +4 • MID: +1 • FWD: +0" },
+  { label: "Saves (GK)", detail: "+1 per 2 saves" },
+  { label: "Goals Conceded", detail: "-1 per 2 conceded (DEF/GK)" },
+
+  { label: "Yellow Card", detail: "-1" },
+  { label: "Red Card", detail: "-3" },
+
+  { label: "Rating 8.5+", detail: "+3" },
+
+  { label: "Penalties Saved (GK)", detail: "+5" },
+  { label: "Penalties Missed", detail: "-2" },
+  { label: "Penalties Committed", detail: "-1" },
+
+  { label: "Passing Total", detail: "GK: 30 • DEF/MID: 25 • FWD: 20 = +1" },
+
+  { label: "Tackles", detail: "+1 per 2" },
+  { label: "Duels Won", detail: "+1 per 4" },
+  { label: "Dribbles Success", detail: "+1 per 2" },
+
+  { label: "Fouls Committed", detail: "-1 per 2" },
+  { label: "Offsides", detail: "-1 per 3" },
+
+  { label: "Shots on Target", detail: "+1 each" },
+];
 
 export default function TournamentPage() {
   const { roomId } = useParams();
@@ -146,6 +242,12 @@ export default function TournamentPage() {
   const [showScoring, setShowScoring] = useState(false);
   const [forcingUpdate, setForcingUpdate] = useState(false);
   const [creatingNextWeek, setCreatingNextWeek] = useState(false);
+  // Week history (previous weeks dropdown)
+  const [weekHistory, setWeekHistory] = useState([]);
+  const [historyWeekIndex, setHistoryWeekIndex] = useState(null);
+  const [historyWeekDoc, setHistoryWeekDoc] = useState(null);
+  const [historyWeekResults, setHistoryWeekResults] = useState(null);
+  const [openBreakdownKey, setOpenBreakdownKey] = useState(null);
 
 
   // Other Matchups expand/collapse (separate from main matchup player expand)
@@ -205,7 +307,8 @@ export default function TournamentPage() {
     try {
       setForcingUpdate(true);
       const fn = httpsCallable(functions, "debugForceUpdateWeek");
-      const res = await fn({ roomId, weekIndex: currentWeekIndex });
+      const res = await fn({ roomId, weekIndex: currentWeekIndex });        //does current week buttom one for specific weeks
+      //const res = await fn({ roomId, weekIndex: 1});
       console.log("debugForceUpdateWeek:", res?.data);
       alert("Success! Stats updated and saved.");
     } catch (e) {
@@ -240,6 +343,64 @@ export default function TournamentPage() {
       alert("Could not copy. Room code: " + String(roomId));
     }
   }
+
+  //History Matches
+  useEffect(() => {
+    if (!roomId) {
+      setWeekHistory([]);
+      return;
+    }
+
+    const qy = query(
+      collection(db, "rooms", roomId, "weeks"),
+      orderBy("index", "desc"),
+      limit(20)
+    );
+
+    const unsub = onSnapshot(
+      qy,
+      (snap) => {
+        const items = snap.docs
+          .map((d) => {
+            const data = d.data() || {};
+            const idx = Number(data.index ?? d.id);
+            return { id: d.id, ...data, index: idx };
+          })
+          .filter((w) => Number.isFinite(Number(w.index)))
+          .sort((a, b) => Number(b.index) - Number(a.index));
+        setWeekHistory(items);
+      },
+      () => setWeekHistory([])
+    );
+
+    return () => unsub();
+  }, [roomId]);
+
+  useEffect(() => {
+    if (!roomId || historyWeekIndex == null) {
+      setHistoryWeekDoc(null);
+      setHistoryWeekResults(null);
+      return;
+    }
+
+    const u1 = onSnapshot(
+      doc(db, "rooms", roomId, "weeks", String(historyWeekIndex)),
+      (s) => setHistoryWeekDoc(s.exists() ? s.data() : null),
+      () => setHistoryWeekDoc(null)
+    );
+
+    const u2 = onSnapshot(
+      doc(db, "rooms", roomId, "weekResults", String(historyWeekIndex)),
+      (s) => setHistoryWeekResults(s.exists() ? s.data() : null),
+      () => setHistoryWeekResults(null)
+    );
+
+    return () => {
+      u1();
+      u2();
+    };
+  }, [roomId, historyWeekIndex]);
+
 
 
 
@@ -589,6 +750,33 @@ export default function TournamentPage() {
   const boardRows = activeResults.weekLeaderboard || activeResults.leaderboard || [];
   const standingsRows = standingsDoc?.standings || [];
   const wrStatus = String(weekResults?.status || "").toUpperCase();
+  const historyOptions = (weekHistory || [])
+    .map((w) => ({
+      index: Number(w.index ?? w.id),
+      roundLabel: w.roundLabel || null,
+      status: w.status || null,
+    }))
+    .filter((w) => Number.isFinite(w.index))
+    .filter((w) => currentWeekIndex == null || w.index !== Number(currentWeekIndex))
+    .sort((a, b) => b.index - a.index);
+
+  const histResults = historyWeekResults || null;
+  const histWeek = historyWeekDoc || null;
+
+  const histMatchupsRaw =
+    histResults?.matchups?.length ? histResults.matchups : histWeek?.matchups || [];
+
+  const histMatchups = (histMatchupsRaw || []).map((m) => {
+    const homeTotal = m.homeTotal ?? (histResults?.teamScoresByUserId?.[m.homeUserId] ?? 0);
+    const awayTotal = m.awayTotal ?? (histResults?.teamScoresByUserId?.[m.awayUserId] ?? 0);
+
+    const homeResult =
+      m.homeResult ?? (homeTotal > awayTotal ? "W" : homeTotal < awayTotal ? "L" : "D");
+    const awayResult =
+      m.awayResult ?? (awayTotal > homeTotal ? "W" : awayTotal < homeTotal ? "L" : "D");
+
+    return { ...m, homeTotal, awayTotal, homeResult, awayResult };
+  });
 
   return (
     <div className="tpPage">
@@ -1301,6 +1489,245 @@ export default function TournamentPage() {
   )}
 
   </div>
+  {/*Week History*/}
+  <div className="tpCard tpFull">
+    <div className="tpHistoryHeader">
+      <h3 className="tpCardTitle tpHistoryTitle">Week History</h3>
+
+      <div className="tpHistoryControls">
+        <select
+          className="tpHistorySelect"
+          value={historyWeekIndex == null ? "" : String(historyWeekIndex)}
+          onChange={(e) => {
+            const v = e.target.value;
+            setHistoryWeekIndex(v ? Number(v) : null);
+          }}
+        >
+          <option value="">Select a previous week…</option>
+          {historyOptions.map((w) => (
+            <option key={w.index} value={String(w.index)}>
+              Week {w.index}
+              {w.roundLabel ? ` — ${w.roundLabel}` : ""}
+              {w.status ? ` (${String(w.status).toUpperCase()})` : ""}
+            </option>
+          ))}
+        </select>
+
+        {historyWeekIndex != null && (
+          <button type="button" className="tpMiniBtn" onClick={() => setHistoryWeekIndex(null)}>
+            Clear
+          </button>
+        )}
+      </div>
+    </div>
+
+    {historyWeekIndex == null ? (
+      <p className="tpText">Pick a previous week to view final scores.</p>
+    ) : !histWeek ? (
+      <p className="tpText">Loading week…</p>
+    ) : (
+      <>
+        <p className="tpText tpHistoryMeta">
+          Window: <b>{fmtDT(histWeek.startAtMs)}</b> → <b>{fmtDT(histWeek.endAtMs)}</b>
+          {histWeek.roundLabel ? (
+            <> • Round: <b>{histWeek.roundLabel}</b></>
+          ) : null}
+          {histResults?.status ? (
+            <> • Status: <b>{String(histResults.status).toUpperCase()}</b></>
+          ) : null}
+        </p>
+
+        {!histMatchups.length ? (
+          <p className="tpText">No matchups found for this week.</p>
+        ) : (
+          <div className="tpHistoryList">
+            
+          </div>
+        )}
+      </>
+    )}
+  </div>
+    {histMatchups.map((m) => {
+      const matchupKey = `hist-${historyWeekIndex}-${m.homeUserId}-${m.awayUserId}`;
+      const bdKey = `histbd-${historyWeekIndex}-${m.homeUserId}-${m.awayUserId}`;
+      const isOpen = openBreakdownKey === bdKey;
+
+      const homeUid = String(m.homeUserId);
+      const awayUid = String(m.awayUserId);
+
+      const homeUser = userById[m.homeUserId] || {
+        userId: m.homeUserId,
+        displayName: nameById[m.homeUserId] || m.homeUserId,
+        teamName: "",
+        photoURL: "",
+      };
+
+      const awayUser = userById[m.awayUserId] || {
+        userId: m.awayUserId,
+        displayName: nameById[m.awayUserId] || m.awayUserId,
+        teamName: "",
+        photoURL: "",
+      };
+
+      // ---- Breakdown helpers (local to this matchup) ----
+      // NOTE:
+      // - per-player breakdown is in breakdownByUserId[uid].perPlayer
+      // - bench list is in benchByUserId[uid]
+      // - starters list will only be in startersByUserId[uid] if you add it in functions;
+      //   otherwise we fallback to current lineup in userById[uid].starters
+      const getBD = (uid) => {
+        const u = userById?.[uid] || null;
+
+        const starters =
+          histResults?.startersByUserId?.[uid] || u?.starters || [];
+
+        const bench =
+          histResults?.benchByUserId?.[uid] || u?.bench || [];
+
+        const perPlayer =
+          histResults?.breakdownByUserId?.[uid]?.perPlayer || {};
+
+        return { starters, bench, perPlayer };
+      };
+
+      const pidOf = (p) => String(p?.id ?? p?.playerId ?? p?.pid ?? "");
+      const nameOf = (p) => p?.name ?? p?.playerName ?? p?.fullName ?? "Player";
+      const posOf = (p) => p?.position ?? p?.pos ?? "";
+
+      const normalizeParts = (entry) => {
+        if (!entry || typeof entry !== "object") return null;
+        // most common: entry.breakdown (what your backend stores)
+        if (entry.breakdown && typeof entry.breakdown === "object") return entry.breakdown;
+        // sometimes: entry.parts
+        if (entry.parts && typeof entry.parts === "object") return entry.parts;
+        // sometimes: entry.stats (still useful)
+        if (entry.stats && typeof entry.stats === "object") return entry.stats;
+        return null;
+      };
+
+      const renderSide = (title, bd) => (
+        <div className="tpBreakdownCol">
+          <div className="tpBreakdownColTitle">{title}</div>
+
+          <div className="tpBreakdownSectionTitle">Starters</div>
+          {(bd.starters || []).length ? (
+            (bd.starters || []).map((p) => {
+              const pid = pidOf(p);
+              const entry = bd.perPlayer?.[pid] || bd.perPlayer?.[String(pid)] || null;
+              const totalPts = Number(entry?.points ?? p?.pts ?? p?.points ?? p?.total ?? 0);
+              const parts = normalizeParts(entry);
+
+              return (
+                <details key={`s-${title}-${pid}`} className="tpBreakdownPlayer">
+                  <summary className="tpBreakdownSummary">
+                    <span className="tpBreakdownName">{nameOf(p)}</span>
+                    <span className="tpBreakdownMeta">
+                      {posOf(p)} • {totalPts} pts
+                    </span>
+                  </summary>
+
+                  {parts ? (
+                    <div className="tpBreakdownParts">
+                      {Object.entries(parts)
+                        .filter(([, v]) => v != null && Number(v) !== 0)
+                        .map(([k, v]) => (
+                          <div key={k} className="tpBreakdownPartRow">
+                            <span className="tpBreakdownPartKey">{prettyStatLabel(k)}</span>
+                            <span className="tpBreakdownPartVal">{String(v)}</span>
+                          </div>
+                        ))}
+                    </div>
+                  ) : (
+                    <div className="tpBreakdownParts tpMuted">No stat breakdown saved</div>
+                  )}
+                </details>
+              );
+            })
+          ) : (
+            <div className="tpMuted">No starters saved for this week</div>
+          )}
+
+          <div className="tpBreakdownSectionTitle">Bench (not counted)</div>
+          {(bd.bench || []).length ? (
+            (bd.bench || []).map((p) => {
+              const pid = pidOf(p);
+              const entry = bd.perPlayer?.[pid] || bd.perPlayer?.[String(pid)] || null;
+              const totalPts = Number(entry?.points ?? p?.pts ?? p?.points ?? p?.total ?? 0);
+
+              return (
+                <details key={`b-${title}-${pid}`} className="tpBreakdownPlayer">
+                  <summary className="tpBreakdownSummary">
+                    <span className="tpBreakdownName">{nameOf(p)}</span>
+                    <span className="tpBreakdownMeta">
+                      {posOf(p)} • {totalPts} pts
+                    </span>
+                  </summary>
+
+                  {normalizeParts(entry) ? (
+                    <div className="tpBreakdownParts">
+                      {Object.entries(normalizeParts(entry))
+                        .filter(([, v]) => v != null && Number(v) !== 0)
+                        .map(([k, v]) => (
+                          <div key={k} className="tpBreakdownPartRow">
+                            <span className="tpBreakdownPartKey">{prettyStatLabel(k)}</span>
+                            <span className="tpBreakdownPartVal">{String(v)}</span>
+                          </div>
+                        ))}
+                    </div>
+                  ) : (
+                    <div className="tpBreakdownParts tpMuted">No stat breakdown saved</div>
+                  )}
+                </details>
+              );
+            })
+          ) : (
+            <div className="tpMuted">No bench saved for this week</div>
+          )}
+        </div>
+      );
+
+      const homeBD = getBD(homeUid);
+      const awayBD = getBD(awayUid);
+
+      return (
+        <div key={matchupKey} className="tpHistoryRowWrap">
+          <div className="tpHistoryRow">
+            <div className="tpHistoryTeams">
+              <UserChip user={homeUser} />
+              <span className="tpVs">vs</span>
+              <UserChip user={awayUser} />
+            </div>
+
+            <div className="tpHistoryScore">
+              <span className="tpMatchScore">
+                {Number(m.homeTotal ?? 0)} — {Number(m.awayTotal ?? 0)}
+              </span>
+              <span className="tpHistoryResult">
+                {m.homeResult}/{m.awayResult}
+              </span>
+
+              <button
+                type="button"
+                className="tpMiniBtn"
+                onClick={() => setOpenBreakdownKey(isOpen ? null : bdKey)}
+                style={{ marginLeft: 10 }}
+              >
+                {isOpen ? "Hide" : "Breakdown"}
+              </button>
+            </div>
+          </div>
+
+          {isOpen && (
+            <div className="tpBreakdownWrap">
+              <div className="tpBreakdownCols">
+                {renderSide("Home", homeBD)}
+                {renderSide("Away", awayBD)}
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    })}
 
   </div>
     </div>
@@ -1341,7 +1768,7 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
             if (!labels[k]) return null;
             return (
               <div key={k} className="tpStatRow">
-                <span>{labels[k]}</span>
+                <span>{prettyStatLabel(k)}</span>
                 <span>{String(v)}</span>
               </div>
             );

@@ -1,9 +1,139 @@
 const admin = require("firebase-admin");
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
 const { onSchedule } = require("firebase-functions/v2/scheduler");
+const logger = require("firebase-functions/logger"); // optional but nice
 
-admin.initializeApp();
+if (!admin.apps.length) admin.initializeApp();
 const db = admin.firestore();
+const { FieldValue } = admin.firestore;
+
+//Serve Resolve Market Helpers
+async function loadStandingsByUid(roomRef) {
+  const snap = await roomRef.collection("standings").doc("current").get();
+  const map = new Map();
+  if (!snap.exists) return map;
+
+  const data = snap.data() || {};
+  const arr = Array.isArray(data.standings) ? data.standings : [];
+
+  for (const row of arr) {
+    const uid = row?.userId || row?.uid;
+    if (!uid) continue;
+    map.set(String(uid), row);
+  }
+  return map;
+}
+
+function getPriority(standingsByUid, uid) {
+  const row = standingsByUid.get(String(uid)) || {};
+  return {
+    matchPts: Number(row.tablePoints ?? 0),
+    totalFantasy: Number(row.totalFantasyPoints ?? 0),
+  };
+}
+
+function comparePriority(a, b) {
+  if (a.matchPts !== b.matchPts) return a.matchPts - b.matchPts;
+  if (a.totalFantasy !== b.totalFantasy) return a.totalFantasy - b.totalFantasy;
+  return 0;
+}
+
+
+//Emails
+async function getEmailsForUids(uids) {
+  const list = Array.from(new Set((uids || []).map(String).filter(Boolean)));
+  if (list.length === 0) return [];
+
+  // Fetch emails from Firebase Auth (no need to store emails in /users docs)
+  const emails = [];
+  for (let i = 0; i < list.length; i += 100) {
+    const chunk = list.slice(i, i + 100);
+    const res = await admin.auth().getUsers(chunk.map((uid) => ({ uid })));
+    for (const u of res.users) {
+      if (u.email) emails.push(u.email);
+    }
+  }
+  return emails;
+}
+
+const DEFAULT_TZ = "America/Los_Angeles";
+
+function getRoomTimeZone(room) {
+  return (
+    room?.competition?.timezone ||
+    room?.competitionState?.timezone ||
+    room?.timezone ||
+    DEFAULT_TZ
+  );
+}
+
+function formatWhen(ms, timeZone = DEFAULT_TZ) {
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n <= 0) return "—";
+
+  return new Date(n).toLocaleString("en-US", {
+    timeZone,
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+function formatDuration(ms) {
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n <= 0) return "0m";
+
+  const totalSeconds = Math.floor(n / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+
+  const parts = [];
+  if (hours) parts.push(`${hours}h`);
+  parts.push(`${minutes}m`);
+  return parts.join(" ");
+}
+
+
+
+// Writes to Firestore `mail` collection (works with the "Trigger Email" Firebase extension)
+async function queueEmails(recipients, subject, html, text, extra = {}) {
+  const to = Array.from(new Set((recipients || []).map(String).filter(Boolean)));
+  if (to.length === 0) return 0;
+
+  const batch = db.batch();
+  for (const email of to) {
+    const ref = db.collection("mail").doc();
+    batch.set(ref, {
+      to: email,
+      message: { subject, html, text },
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      ...extra,
+    });
+  }
+  await batch.commit();
+  return to.length;
+}
+
+// Supports BOTH membership models: room.members[] and rooms/{roomId}/members subcollection
+async function getRoomMemberUids(roomRef, room) {
+  const arr = Array.isArray(room?.members) ? room.members : [];
+  const fromArray = arr
+    .map((m) => (typeof m === "string" ? m : m?.uid))
+    .filter(Boolean)
+    .map(String);
+
+  let fromSub = [];
+  try {
+    const snap = await roomRef.collection("members").get();
+    fromSub = snap.docs.map((d) => d.id).filter(Boolean);
+  } catch (_) {}
+
+  return Array.from(new Set([...fromArray, ...fromSub]));
+}
+
 
 //API
 const { defineSecret } = require("firebase-functions/params");
@@ -344,32 +474,64 @@ function extractBench(lineupData) {
   return [];
 }
 
-
 const SCORING = {
   appearance: { anyMinutes: 1, sixtyPlus: 1 },
   assists: 3,
   goals: { GK: 6, DEF: 6, MID: 5, FWD: 4 },
   cleanSheet: { GK: 4, DEF: 4, MID: 1, FWD: 0, minMinutes: 60 },
   goalsConceded: { GK: -1, DEF: -1, per: 2 },
-  saves: { GK: 1, per: 3 },
+  saves: { GK: 1, per: 2 },
   cards: { yellow: -1, red: -3 },
-  pens: { saved: 5, missed: -2 },
-  passesCompleted: { enabled: true, perByPos: { GK: 30, DEF: 25, MID: 25, FWD: 20 }, pointsPerChunk: 1 },
+  pens: { saved: 5, missed: -2, committed: -1 },
+  rating: { threshold: 8.5, points: 3 },
+
+  passesCompleted: {
+    enabled: true,
+    perByPos: { GK: 30, DEF: 25, MID: 25, FWD: 20 },
+    pointsPerChunk: 1,
+  },
+
+  // ✅ advanced stats
+  tackles: { per: 2, pointsPerChunk: 1 },
+  duelsWon: { per: 4, pointsPerChunk: 1 },        
+  dribblesSuccess: { per: 2, pointsPerChunk: 1 },
+  foulsCommitted: { per: 2, pointsPerChunk: -1 },
+  offsides: { per: 3, pointsPerChunk: -1 },
+  shotsOnTarget: { per: 1, pointsPerChunk: 1 },
 };
+
 
 function scorePlayer(stats, pos) {
   const s = {
     minutes: Number(stats?.minutes ?? 0),
+
     goals: Number(stats?.goals ?? 0),
     assists: Number(stats?.assists ?? 0),
+
+    // Passing Total
     passesCompleted: Number(stats?.passesCompleted ?? 0),
-    cleanSheet: Number(stats?.cleanSheet ?? 0),
+
+    cleanSheet: Boolean(stats?.cleanSheet),
+
     goalsConceded: Number(stats?.goalsConceded ?? 0),
     saves: Number(stats?.saves ?? 0),
+
     yellow: Number(stats?.yellow ?? 0),
     red: Number(stats?.red ?? 0),
+
     pensSaved: Number(stats?.pensSaved ?? 0),
     pensMissed: Number(stats?.pensMissed ?? 0),
+    pensCommitted: Number(stats?.pensCommitted ?? 0),
+
+    rating: Number(stats?.rating ?? 0),
+
+    tackles: Number(stats?.tackles ?? 0),
+    duelsWon: Number(stats?.duelsWon ?? 0),
+    dribblesSuccess: Number(stats?.dribblesSuccess ?? 0),
+    foulsCommitted: Number(stats?.foulsCommitted ?? 0),
+    offsides: Number(stats?.offsides ?? 0),
+    shotsOnTarget: Number(stats?.shotsOnTarget ?? 0),
+
     ownGoals: Number(stats?.ownGoals ?? 0),
   };
 
@@ -449,6 +611,11 @@ function scorePlayer(stats, pos) {
     points += pts;
     breakdown.pensMissed = pts;
   }
+  if (s.pensCommitted > 0) {
+    const pts = (SCORING.pens.committed || -1) * s.pensCommitted;
+    points += pts;
+    breakdown.pensCommitted = pts;
+  }
 
   // 8. Cards
   if (s.yellow > 0) {
@@ -462,6 +629,53 @@ function scorePlayer(stats, pos) {
     breakdown.red = pts;
   }
 
+  // Rating (8.5+)
+  if (s.rating >= (SCORING.rating.threshold || 8.5)) {
+    points += SCORING.rating.points || 3;
+    breakdown.rating85 = SCORING.rating.points || 3;
+  }
+
+  // Tackles (+1 per 2)
+  if (s.tackles > 0) {
+    const chunk = SCORING.tackles.per || 2;
+    const pts = Math.floor(s.tackles / chunk) * (SCORING.tackles.pointsPerChunk || 1);
+    if (pts) { points += pts; breakdown.tackles = pts; }
+  }
+
+  // Duels won (+1 per 4)
+  if (s.duelsWon > 0) {
+    const chunk = SCORING.duelsWon.per || 4;
+    const pts = Math.floor(s.duelsWon / chunk) * (SCORING.duelsWon.pointsPerChunk || 1);
+    if (pts) { points += pts; breakdown.duelsWon = pts; }
+  }
+
+  // Dribbles success (+1 per 2)
+  if (s.dribblesSuccess > 0) {
+    const chunk = SCORING.dribblesSuccess.per || 2;
+    const pts = Math.floor(s.dribblesSuccess / chunk) * (SCORING.dribblesSuccess.pointsPerChunk || 1);
+    if (pts) { points += pts; breakdown.dribblesSuccess = pts; }
+  }
+
+  // Fouls committed (-1 per 2)
+  if (s.foulsCommitted > 0) {
+    const chunk = SCORING.foulsCommitted.per || 2;
+    const pts = Math.floor(s.foulsCommitted / chunk) * (SCORING.foulsCommitted.pointsPerChunk || -1);
+    if (pts) { points += pts; breakdown.foulsCommitted = pts; }
+  }
+
+  // Offsides (-1 per 3)
+  if (s.offsides > 0) {
+    const chunk = SCORING.offsides.per || 3;
+    const pts = Math.floor(s.offsides / chunk) * (SCORING.offsides.pointsPerChunk || -1);
+    if (pts) { points += pts; breakdown.offsides = pts; }
+  }
+
+  // Shots on target (+1 each)
+  if (s.shotsOnTarget > 0) {
+    const pts = s.shotsOnTarget * (SCORING.shotsOnTarget.pointsPerChunk || 1);
+    if (pts) { points += pts; breakdown.shotsOnTarget = pts; }
+  }
+
   // 9. Passes (Total)
   if (SCORING.passesCompleted.enabled && s.passesCompleted > 0) {
     const threshold = SCORING.passesCompleted.perByPos[pos] || 25; 
@@ -472,6 +686,7 @@ function scorePlayer(stats, pos) {
     }
   }
 
+
   return { points, breakdown };
 }
 
@@ -481,7 +696,8 @@ function scoreTeam(starters, statsByPlayerId) {
 
   for (const p of starters) {
     const st = statsByPlayerId[p.id] || {};
-    const r = scorePlayer(st, p.position);
+    const pos = toPos(p.position || st.position || st.pos || st.role);
+    const r = scorePlayer(st, pos);
     
     perPlayer[p.id] = {
       points: r.points,
@@ -805,40 +1021,6 @@ exports.seedDemoOpponents = onCall({ region: "us-west2" }, async (request) => {
 
   return { ok: true, created: count };
 });
-
-
-function extractBench(lineupData) {
-  if (!lineupData) return [];
-
-  const candidates = [
-    lineupData.bench,
-    lineupData.subs,
-    lineupData.substitutes,
-    lineupData.benchIds,
-    lineupData.subIds,
-    lineupData.benchPlayers,
-    lineupData.benchPlayerIds,
-    lineupData.lineup?.bench,
-    lineupData.lineup?.subs,
-    lineupData.currentLineup?.bench,
-    lineupData.currentLineup?.subs,
-  ];
-
-  for (const c of candidates) {
-    if (!Array.isArray(c) || c.length === 0) continue;
-
-    // ids
-    if (typeof c[0] === "string" || typeof c[0] === "number") {
-      return c.map((id) => ({ id: String(id), name: "Unknown", position: "MID" }));
-    }
-
-    // inline objects
-    const inline = c.map(normalizePlayer).filter(Boolean);
-    if (inline.length) return inline;
-  }
-
-  return [];
-}
 
 
 function extractRoster(lineupData) {
@@ -1575,6 +1757,17 @@ function buildPlayerStatsMapFromFixturePlayersResponse(responseArr) {
       const red = toNum(st?.cards?.red);
       const pensSaved = toNum(st?.penalty?.saved);
       const pensMissed = toNum(st?.penalty?.missed);
+      const pos = toPos(st?.games?.position);
+      const rating = toNum(st?.games?.rating);
+
+      const tackles = toNum(st?.tackles?.total);
+      const duelsWon = toNum(st?.duels?.won);
+      const dribblesSuccess = toNum(st?.dribbles?.success);
+
+      const foulsCommitted = toNum(st?.fouls?.committed);
+      const offsides = toNum(st?.offsides);
+      const shotsOnTarget = toNum(st?.shots?.on);
+      const pensCommitted = toNum(st?.penalty?.commited ?? st?.penalty?.committed);
 
       let cleanSheet = false;
       if (minutes > 0 && goalsConceded === 0) cleanSheet = true;
@@ -1596,7 +1789,15 @@ function buildPlayerStatsMapFromFixturePlayersResponse(responseArr) {
         pensMissed,
         cleanSheet,
         ownGoals,
-        // We will merge the status in the main loop
+        position: pos,
+        rating,
+        tackles,
+        duelsWon,
+        dribblesSuccess,
+        foulsCommitted,
+        offsides,
+        shotsOnTarget,
+        pensCommitted,
       };
     }
   }
@@ -1653,6 +1854,55 @@ async function getFixtureStatusMap({ fixtureIds, timezone, apiKey }) {
   const out = {};
   if (!ids.length) return out;
 
+  const now = Date.now();
+
+  // TTL policy (tweak anytime)
+  const LIVE_TTL_MS = 60 * 1000;        // 1 min while in-play
+  const NS_TTL_MS = 10 * 60 * 1000;     // 10 min if not started
+  const FIN_TTL_MS = 60 * 60 * 1000;    // 60 min if finished
+  const DEFAULT_TTL_MS = 5 * 60 * 1000; // 5 min fallback
+
+  const ttlForShort = (short) => {
+    if (!short) return DEFAULT_TTL_MS;
+    if (isInPlay(short)) return LIVE_TTL_MS;
+    if (short === "NS") return NS_TTL_MS;
+    if (isFinished(short)) return FIN_TTL_MS;
+    return DEFAULT_TTL_MS;
+  };
+
+  // 1) Read cache for each fixtureId (global cache by fixture)
+  // We only fetch from API for ids that are missing/expired.
+  const missing = [];
+
+  await Promise.all(
+    ids.map(async (id) => {
+      try {
+        const ref = db.doc(`apiCache/fixtureStatus_${id}`);
+        const snap = await ref.get();
+        if (!snap.exists) {
+          missing.push(id);
+          return;
+        }
+
+        const d = snap.data() || {};
+        const short = d.short || null;
+        const updatedAtMs = Number(d.updatedAtMs || 0);
+        const ttlMs = ttlForShort(short);
+
+        if (short && updatedAtMs && now - updatedAtMs < ttlMs) {
+          out[id] = short;
+        } else {
+          // expired or incomplete, refetch
+          missing.push(id);
+        }
+      } catch (_) {
+        // If cache read fails, refetch from API
+        missing.push(id);
+      }
+    })
+  );
+
+  // 2) Fetch missing statuses from API (try multi-id first)
   const fetchList = async (params) => {
     const r = await apiFootballGet("fixtures", { ...params, timezone }, apiKey);
     return Array.isArray(r?.response) ? r.response : [];
@@ -1660,31 +1910,52 @@ async function getFixtureStatusMap({ fixtureIds, timezone, apiKey }) {
 
   let list = [];
 
-  // Try multi-id first (fastest)
-  if (ids.length > 1) {
-    list = await fetchList({ ids: ids.join("-") });     // API-Football common format
-    if (!list.length) list = await fetchList({ ids: ids.join(",") }); // fallback
-  } else {
-    list = await fetchList({ id: ids[0] });
-  }
+  if (missing.length) {
+    if (missing.length > 1) {
+      list = await fetchList({ ids: missing.join("-") });
+      if (!list.length) list = await fetchList({ ids: missing.join(",") });
+    } else {
+      list = await fetchList({ id: missing[0] });
+    }
 
-  // If still empty, fallback per-id (more calls, but reliable)
-  if (!list.length) {
-    for (const id of ids) {
-      const one = await fetchList({ id });
-      if (one?.[0]) list.push(one[0]);
+    // Fallback per-id if still empty
+    if (!list.length) {
+      for (const id of missing) {
+        const one = await fetchList({ id });
+        if (one?.[0]) list.push(one[0]);
+      }
     }
   }
 
-  for (const f of list) {
-    const fixtureId = String(f?.fixture?.id ?? "");
-    const short = f?.fixture?.status?.short ?? null;
-    if (fixtureId && short) out[fixtureId] = short;
+  // 3) Write fresh statuses back to global cache and to output map
+  // Note: we only cache statuses we actually received.
+  if (list.length) {
+    const writes = [];
+
+    for (const f of list) {
+      const fixtureId = String(f?.fixture?.id ?? "");
+      const short = f?.fixture?.status?.short ?? null;
+      if (!fixtureId || !short) continue;
+
+      out[fixtureId] = short;
+
+      const ref = db.doc(`apiCache/fixtureStatus_${fixtureId}`);
+      writes.push(
+        ref.set(
+          { short, updatedAtMs: now },
+          { merge: true }
+        )
+      );
+    }
+
+    // Don't fail the whole function if a write fails
+    try {
+      await Promise.all(writes);
+    } catch (_) {}
   }
 
   return out;
 }
-
 
 function isInPlay(short) {
   return ["1H", "HT", "2H", "ET", "BT", "P"].includes(short);
@@ -1771,7 +2042,7 @@ async function computeAndWriteLiveWeek({ roomId, weekIndex, apiKey }) {
     return Number.isFinite(ko) && now >= ko && now <= ko + MATCH_RUNTIME_MS;
   });
 
-  const shouldFinalize = Number.isFinite(endAtMs) && now > endAtMs + POST_WINDOW_MS && !anyInPlay && allFinished;
+  const shouldFinalize = Number.isFinite(endAtMs) && now >= endAtMs + POST_WINDOW_MS && !anyInPlay && allFinished;
   const statusValue = shouldFinalize ? "final" : ((anyInPlay || inRuntimeWindow) ? "live" : "idle");
 
   // Next kickoff (for UI + scheduling hints)
@@ -1810,10 +2081,13 @@ async function computeAndWriteLiveWeek({ roomId, weekIndex, apiKey }) {
       id: pid,
       name: d.name || d.fullName || d.displayName || "Unknown",
       position: toPos(d.position || d.pos || d.role),
+      teamName: d.teamName || "",
+      teamLogo: d.teamLogo || "",
     });
   }
 
   // Build rosterByUid from picks (this is the reliable ownership source)
+  const pickDocToPlayer = new Map(); 
   const rosterByUid = {};
   const picksSnap = await db.collection(`rooms/${roomId}/picks`).get();
 
@@ -1841,9 +2115,8 @@ async function computeAndWriteLiveWeek({ roomId, weekIndex, apiKey }) {
       };
 
     (rosterByUid[String(owner)] ||= []).push(p);
+    pickDocToPlayer.set(pk.id, p);
   }
-
-
 
   const users = [];
   for (const mUid of memberUids) {
@@ -1857,9 +2130,30 @@ async function computeAndWriteLiveWeek({ roomId, weekIndex, apiKey }) {
 
     const lineupSnap = await db.doc(`rooms/${roomId}/lineups/${mUid}`).get();
     const lineup = lineupSnap.exists ? lineupSnap.data() : null;
-    
-    const starters = extractStarters(lineup);
-    let bench = extractBench(lineup);
+
+    const resolveLineupEntry = (entry) => {
+    const raw = String(entry?.id ?? entry?.playerId ?? entry ?? "");
+    if (!raw) return null;
+
+    // If lineup stored the PICK DOC ID instead of playerId, translate it
+      const fromPick = pickDocToPlayer.get(raw) || null;
+      const pid = String(fromPick?.id ?? raw);
+
+      // Prefer /players, then fallback to pick object
+      const known = playersById.get(pid) || fromPick || null;
+
+      return {
+        id: pid,
+        name: known?.name || entry?.name || entry?.fullName || entry?.displayName || "Unknown",
+        position: toPos(known?.position || entry?.position || entry?.pos || entry?.role || ""),
+        teamName: known?.teamName || "",
+        teamLogo: known?.teamLogo || "",
+      };
+    };
+
+    const starters = extractStarters(lineup).map(resolveLineupEntry).filter(Boolean);
+    let bench = extractBench(lineup).map(resolveLineupEntry).filter(Boolean);
+        
 
     // If lineup doc doesn't store bench, derive from roster (picks - starters)
     if (!bench.length) {
@@ -1878,9 +2172,11 @@ async function computeAndWriteLiveWeek({ roomId, weekIndex, apiKey }) {
   const starterIds = new Set();
   const trackedIds = new Set();
   const benchByUserId = {};
+  const startersByUserId = {};
 
   for (const u of users) {
     benchByUserId[u.userId] = u.bench || [];
+    startersByUserId[u.userId] = u.starters || [];
 
     for (const p of (u.starters || [])) {
       const pid = String(p.id);
@@ -1892,7 +2188,6 @@ async function computeAndWriteLiveWeek({ roomId, weekIndex, apiKey }) {
       trackedIds.add(String(p.id));
     }
   }
-
 
   // If no starters yet, still write status so UI updates, but don't write totals
   if (starterIds.size === 0) {
@@ -1939,8 +2234,19 @@ async function computeAndWriteLiveWeek({ roomId, weekIndex, apiKey }) {
       const prev = aggStatsByPlayerId[pid] || {
         minutes: 0, passesCompleted: 0, goals: 0, assists: 0,
         saves: 0, goalsConceded: 0, yellow: 0, red: 0,
-        pensSaved: 0, pensMissed: 0, cleanSheet: false,
+        pensSaved: 0, pensMissed: 0, pensCommitted: 0,
+        rating: 0,
+
+        tackles: 0,
+        duelsWon: 0,
+        dribblesSuccess: 0,
+        foulsCommitted: 0,
+        offsides: 0,
+        shotsOnTarget: 0,
+
+        cleanSheet: false,
         ownGoals: 0,
+
         teamName: "",
         opponentName: "",
         isLive: false,
@@ -1948,20 +2254,34 @@ async function computeAndWriteLiveWeek({ roomId, weekIndex, apiKey }) {
         fixtureId: null,
         kickoffMs: null,
       };
-
+            
       aggStatsByPlayerId[pid] = {
         minutes: prev.minutes + (st.minutes || 0),
         goals: prev.goals + (st.goals || 0),
         assists: prev.assists + (st.assists || 0),
         passesCompleted: prev.passesCompleted + (st.passesCompleted || 0),
+
         saves: prev.saves + (st.saves || 0),
         goalsConceded: prev.goalsConceded + (st.goalsConceded || 0),
+
         yellow: prev.yellow + (st.yellow || 0),
         red: prev.red + (st.red || 0),
+
         pensSaved: prev.pensSaved + (st.pensSaved || 0),
         pensMissed: prev.pensMissed + (st.pensMissed || 0),
-        cleanSheet: prev.cleanSheet || st.cleanSheet || false,
+        pensCommitted: (prev.pensCommitted || 0) + (st.pensCommitted || 0), 
+
+        cleanSheet: Boolean(prev.cleanSheet) || Boolean(st.cleanSheet),
         ownGoals: (prev.ownGoals || 0) + (st.ownGoals || 0),
+
+        // advanced stats (sum most, max rating)
+        rating: Math.max(prev.rating || 0, st.rating || 0),
+        tackles: (prev.tackles || 0) + (st.tackles || 0),
+        duelsWon: (prev.duelsWon || 0) + (st.duelsWon || 0),
+        dribblesSuccess: (prev.dribblesSuccess || 0) + (st.dribblesSuccess || 0),
+        foulsCommitted: (prev.foulsCommitted || 0) + (st.foulsCommitted || 0),
+        offsides: (prev.offsides || 0) + (st.offsides || 0),
+        shotsOnTarget: (prev.shotsOnTarget || 0) + (st.shotsOnTarget || 0),
 
         teamName: st.teamName || prev.teamName || "",
         opponentName: st.opponentName || prev.opponentName || "",
@@ -2151,6 +2471,7 @@ async function computeAndWriteLiveWeek({ roomId, weekIndex, apiKey }) {
       updatedAtMs: Date.now(),
       computedAt: admin.firestore.FieldValue.serverTimestamp(),
       benchByUserId,
+      startersByUserId,
     },
     { merge: true }
   );
@@ -2166,7 +2487,11 @@ async function computeAndWriteLiveWeek({ roomId, weekIndex, apiKey }) {
 
   if (shouldFinalize) {
     await weekRef.set(
-      { status: "final", finalizedAt: admin.firestore.FieldValue.serverTimestamp() },
+      {
+        status: "final",
+        finalizedAt: admin.firestore.FieldValue.serverTimestamp(),
+        finalizedAtMs: Date.now(),
+      },
       { merge: true }
     );
   }
@@ -2187,6 +2512,15 @@ async function autoAdvanceWeekIfFinal({ roomId, room, currentWeekIndex }) {
 
   const curWeek = curSnap.data() || {};
   if (curWeek.status !== "final") return null;
+  const HOLD_FINAL_MS = 24 * 60 * 60 * 1000;
+
+  const finalizedAtMs =
+    Number(curWeek.finalizedAtMs || 0) ||
+    (curWeek.finalizedAt?.toMillis ? curWeek.finalizedAt.toMillis() : 0);
+
+  if (finalizedAtMs && nowMs < finalizedAtMs + HOLD_FINAL_MS) {
+    return null; // stay on FINAL for 24h
+  }
 
   const endAtMs = Number(curWeek.endAtMs || 0);
 
@@ -2561,7 +2895,12 @@ exports.debugForceUpdateWeek = onCall(
     );
         
     // This calls your existing worker function
-    await computeAndWriteLiveWeek({ roomId, weekIndex, apiKey });
+    try {
+      await computeAndWriteLiveWeek({ roomId, weekIndex, apiKey });
+    } catch (e) {
+      console.error("debugForceUpdateWeek failed", e);
+      throw new HttpsError("internal", e?.message || String(e));
+    }
 
     // 3. Return the results so you can verify in browser console
     const resultRef = db.doc(`rooms/${roomId}/weekResults/${weekIndex}`);
@@ -2711,17 +3050,25 @@ exports.pollLiveTournamentWeeks = onSchedule(
         }
 
         if (!shouldRun) {
-          // Mark idle for UI (do not overwrite points)
-          await db.doc(`rooms/${roomId}/weekResults/${String(weekIndex)}`).set(
-            {
-              roomId,
-              weekIndex: Number(weekIndex),
-              status: "idle",
-              updatedAtMs: Date.now(),
-              computedAt: admin.firestore.FieldValue.serverTimestamp(),
-            },
-            { merge: true }
-          );
+          const endAtMs = Number(week.endAtMs || 0);
+          const POST_MS = 3 * 60 * 60 * 1000;
+
+          // If we're past the post-window and not final yet, run compute once to finalize + advance
+          if (week.status !== "final" && Number.isFinite(endAtMs) && nowMs >= endAtMs + POST_MS) {
+            await computeAndWriteLiveWeek({ roomId, weekIndex: Number(weekIndex), apiKey });
+          } else {
+            // Mark idle for UI (do not overwrite points)
+            await db.doc(`rooms/${roomId}/weekResults/${String(weekIndex)}`).set(
+              {
+                roomId,
+                weekIndex: Number(weekIndex),
+                status: "idle",
+                updatedAtMs: Date.now(),
+                computedAt: admin.firestore.FieldValue.serverTimestamp(),
+              },
+              { merge: true }
+            );
+          }
           continue;
         }
 
@@ -2732,6 +3079,7 @@ exports.pollLiveTournamentWeeks = onSchedule(
     }
   }
 );
+
 exports.scheduleDraft = onCall({ region: "us-west2" }, async (request) => {
   if (!request.auth) throw new HttpsError("unauthenticated", "Login required.");
 
@@ -2744,21 +3092,17 @@ exports.scheduleDraft = onCall({ region: "us-west2" }, async (request) => {
   const snap = await roomRef.get();
   if (!snap.exists) throw new HttpsError("not-found", "Room not found.");
 
-  const room = snap.data();
+  const room = snap.data() || {};
   if (room.hostUid !== request.auth.uid) {
     throw new HttpsError("permission-denied", "Only host can schedule.");
   }
 
-  const members = Array.isArray(room.members) ? room.members : [];
-  const memberUids = members
-    .map((m) => (typeof m === "string" ? m : m?.uid))
-    .filter(Boolean);
+  const tz = getRoomTimeZone(room);
+  const whenStr = formatWhen(Number(startAtMs), tz);
 
-  if (memberUids.length === 0) return { ok: true, emailsQueued: 0 };
+  const memberUids = await getRoomMemberUids(roomRef, room);
 
-  const whenStr = formatWhen(Number(startAtMs));
   const reminderSendAtMs = Number(startAtMs) - 10 * 60 * 1000;
-
   const oldReminderId = room.draftReminderId || null;
   const newReminderRef = db.collection("reminders").doc();
 
@@ -2782,6 +3126,8 @@ exports.scheduleDraft = onCall({ region: "us-west2" }, async (request) => {
   });
 
   await batch.commit();
+
+  if (memberUids.length === 0) return { ok: true, emailsQueued: 0 };
 
   const recipients = await getEmailsForUids(memberUids);
   const subject = "Football Fantasy — Draft Scheduled";
@@ -2813,7 +3159,7 @@ exports.scheduleMarket = onCall({ region: "us-west2" }, async (request) => {
   if (!request.auth) throw new HttpsError("unauthenticated", "Login required.");
 
   const { roomId, scheduledAtMs, durationMs } = request.data || {};
-  if (!roomId || !scheduledAtMs || durationMs == null) {
+  if (!roomId || scheduledAtMs == null || durationMs == null) {
     throw new HttpsError("invalid-argument", "Missing roomId/scheduledAtMs/durationMs.");
   }
 
@@ -2821,24 +3167,22 @@ exports.scheduleMarket = onCall({ region: "us-west2" }, async (request) => {
   const snap = await roomRef.get();
   if (!snap.exists) throw new HttpsError("not-found", "Room not found.");
 
-  const room = snap.data();
+  const room = snap.data() || {};
   if (room.hostUid !== request.auth.uid) {
     throw new HttpsError("permission-denied", "Only host can schedule.");
   }
 
-  const members = Array.isArray(room.members) ? room.members : [];
-  const memberUids = members
-    .map((m) => (typeof m === "string" ? m : m?.uid))
-    .filter(Boolean);
-
-  const openStr = formatWhen(Number(scheduledAtMs));
+  // ✅ NOW it's safe to use room + the input vars
+  const tz = getRoomTimeZone(room);
+  const openStr = formatWhen(Number(scheduledAtMs), tz);
   const durStr = formatDuration(Number(durationMs));
+
+  const memberUids = await getRoomMemberUids(roomRef, room);
 
   const marketRef = db.doc(`rooms/${roomId}/market/current`);
   const marketSnap = await marketRef.get();
   const prevMarket = marketSnap.exists ? (marketSnap.data() || {}) : {};
 
-  // NEW: create/replace market reminder
   const reminderSendAtMs = Number(scheduledAtMs) - 10 * 60 * 1000;
   const oldMarketReminderId = prevMarket.marketReminderId || null;
   const newMarketReminderRef = db.collection("reminders").doc();
@@ -2863,14 +3207,10 @@ exports.scheduleMarket = onCall({ region: "us-west2" }, async (request) => {
       status: "scheduled",
       scheduledAt: Number(scheduledAtMs),
       durationMs: Number(durationMs),
-
       openedAt: null,
       closesAt: null,
       resolvedAt: null,
-
-      // NEW: link reminder so reschedules replace it
       marketReminderId: newMarketReminderRef.id,
-
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     },
     { merge: true }
@@ -2879,6 +3219,8 @@ exports.scheduleMarket = onCall({ region: "us-west2" }, async (request) => {
   await batch.commit();
 
   // Email: "Market Scheduled" (immediate)
+  if (memberUids.length === 0) return { ok: true, emailsQueued: 0 };
+
   const recipients = await getEmailsForUids(memberUids);
   const subject = "Football Fantasy — Market Scheduled";
   const html = `
@@ -2902,6 +3244,7 @@ exports.scheduleMarket = onCall({ region: "us-west2" }, async (request) => {
 
   return { ok: true, emailsQueued };
 });
+
 
 /**
  * Runs every minute to send reminder emails that are due
@@ -3003,17 +3346,22 @@ exports.processMarketSchedule = onSchedule(
       if (!marketSnap.exists) continue;
 
       const m = marketSnap.data() || {};
+      const status = m.status || "idle";
+
       const scheduledAt = Number(m.scheduledAt);
       const durationMs = Number(m.durationMs || 0);
+      const closesAt = Number(m.closesAt);
 
-      if (m.status === "scheduled" && Number.isFinite(scheduledAt) && scheduledAt <= now) {
-        const closesAt = durationMs ? now + durationMs : null;
+      // 1) scheduled -> open
+      if (status === "scheduled" && Number.isFinite(scheduledAt) && scheduledAt <= now) {
+        // IMPORTANT: compute closesAt from scheduledAt (not "now"), so cron delay doesn't extend market
+        const computedClosesAt = durationMs ? scheduledAt + durationMs : null;
 
         await marketRef.set(
           {
             status: "open",
             openedAt: now,
-            closesAt,
+            closesAt: computedClosesAt,
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           },
           { merge: true }
@@ -3021,21 +3369,62 @@ exports.processMarketSchedule = onSchedule(
         continue;
       }
 
-      if (m.status === "open" && Number.isFinite(m.closesAt) && m.closesAt <= now) {
+      // 2) If open but missing closesAt (safety), compute it
+      if (
+        status === "open" &&
+        (!Number.isFinite(closesAt) || closesAt <= 0) &&
+        Number.isFinite(scheduledAt) &&
+        durationMs > 0
+      ) {
         await marketRef.set(
           {
-            status: "closed",
-            resolvedAt: now,
+            closesAt: scheduledAt + durationMs,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+      }
+
+      // 3) open -> resolving (UI should show "Resolving…" immediately) + then resolve
+      if (status === "open" && Number.isFinite(closesAt) && closesAt <= now) {
+        // Set resolving FIRST so the UI doesn't sit at 0 looking stuck
+        await marketRef.set(
+          {
+            status: "resolving",
+            closedAt: now,
+            resolvingAt: now,
             scheduledAt: null, // prevent reopening
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           },
           { merge: true }
         );
+
+        // Now actually resolve (server-side). If it fails, we keep "resolving" and retry next minute.
+        try {
+          await resolveMarketForRoom(roomId, { trigger: "scheduler" });
+        } catch (e) {
+          console.error("resolveMarketForRoom failed", roomId, e);
+        }
         continue;
+      }
+
+      // 4) Retry any stuck resolving markets (in case of transient errors)
+      if (status === "resolving" && !m.resolvedAtMs && !m.resolvedAt) {
+        const resolvingAt = Number(m.resolvingAt || m.closedAt || 0);
+
+        // Wait at least 30s before retrying to avoid thrashing
+        if (!resolvingAt || now - resolvingAt > 30 * 1000) {
+          try {
+            await resolveMarketForRoom(roomId, { trigger: "scheduler-retry" });
+          } catch (e) {
+            console.error("resolveMarketForRoom retry failed", roomId, e);
+          }
+        }
       }
     }
   }
 );
+
 
 exports.getLiveFixturesCached = onCall(
   { region: "us-west2", secrets: [APIFOOTBALL_KEY] },
@@ -3076,3 +3465,196 @@ exports.getLiveFixturesCached = onCall(
     return { ok: true, cached: false, data };
   }
 );
+
+//Market Server side
+async function resolveMarketForRoom(roomId, { trigger = "scheduler" } = {}) {
+  const roomRef = db.doc(`rooms/${roomId}`);
+  const marketRef = roomRef.collection("market").doc("current");
+  const now = Date.now();
+  const lockId = `${trigger}-${now}-${Math.random().toString(16).slice(2)}`;
+
+  // A) Lock + sanity checks
+  const locked = await db.runTransaction(async (tx) => {
+    const mSnap = await tx.get(marketRef);
+    if (!mSnap.exists) return { ok: false, reason: "no-market-doc" };
+
+    const m = mSnap.data() || {};
+    const status = m.status || "idle";
+    const closesAt = Number(m.closesAt || 0);
+
+    if (status === "resolved" || m.resolvedAt) return { ok: false, reason: "already-resolved" };
+    if (status === "resolving") return { ok: false, reason: "already-resolving" };
+
+    // Only resolve after close time (or if already closed)
+    if (status === "open" && closesAt && closesAt > now) {
+      return { ok: false, reason: "not-closed-yet" };
+    }
+
+    tx.set(
+      marketRef,
+      {
+        status: "resolving",
+        resolveLock: lockId,
+        resolvingAt: now,
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    return { ok: true };
+  });
+
+  if (!locked.ok) return locked;
+
+  // B) Load required data
+  const [interestSnap, picksSnap, lineupsSnap, standingsByUid] = await Promise.all([
+    roomRef.collection("marketInterest").get(),
+    roomRef.collection("picks").get(),
+    roomRef.collection("lineups").get(),
+    loadStandingsByUid(roomRef), // ✅ THIS IS WHERE standingsByUid goes
+  ]);
+
+  // C) Index picks: uid+playerId -> pickDocId, and roster set for validation
+  const pickDocIdByUidPlayer = new Map();
+  const rosterByUid = new Map(); // uid -> Set(playerId)
+
+  picksSnap.forEach((doc) => {
+    const d = doc.data() || {};
+    const uid = String(d.userId ?? d.uid ?? "");
+    const playerId = String(d.playerId ?? "");
+    if (!uid || !playerId) return;
+
+    pickDocIdByUidPlayer.set(`${uid}:${playerId}`, doc.id);
+
+    if (!rosterByUid.has(uid)) rosterByUid.set(uid, new Set());
+    rosterByUid.get(uid).add(playerId);
+  });
+
+  // D) Index lineups
+  const lineupByUid = new Map();
+  lineupsSnap.forEach((doc) => lineupByUid.set(String(doc.id), doc.data() || {}));
+
+  // E) Collect all requests (one doc per user, with choices[])
+  const requests = [];
+  interestSnap.forEach((doc) => {
+    const d = doc.data() || {};
+    const uid = String(d.uid ?? doc.id);
+    const choices = Array.isArray(d.choices) ? d.choices : [];
+    const updatedAtMs =
+      typeof d.updatedAtMs === "number"
+        ? d.updatedAtMs
+        : d.updatedAt?.toMillis?.() ?? 0;
+
+    for (const c of choices) {
+      const wantId = c?.wantId != null ? String(c.wantId) : null;
+      const swapOutId = c?.swapOutId != null ? String(c.swapOutId) : null;
+      if (!wantId || !swapOutId) continue;
+
+      requests.push({ uid, wantId, swapOutId, updatedAtMs });
+    }
+  });
+
+  // F) Group by wantId and pick winners by priority (lowest matchPts, tie lowest totalFantasy, tie earliest submit)
+  const byWant = new Map();
+  for (const r of requests) {
+    if (!byWant.has(r.wantId)) byWant.set(r.wantId, []);
+    byWant.get(r.wantId).push(r);
+  }
+
+  const decisions = []; // {wantId, uid, swapOutId, status, reason}
+  for (const [wantId, list] of byWant.entries()) {
+    // Validate each candidate
+    const candidates = list.filter((r) => {
+      const owned = rosterByUid.get(r.uid);
+      if (!owned || !owned.has(r.swapOutId)) return false; // must own swapOut
+      if (owned.has(wantId)) return false; // already owns want
+      return true;
+    });
+
+    if (candidates.length === 0) {
+      // No one eligible for this wantId
+      continue;
+    }
+
+    candidates.sort((a, b) => {
+      const pa = getPriority(standingsByUid, a.uid);
+      const pb = getPriority(standingsByUid, b.uid);
+      const cmp = comparePriority(pa, pb);
+      if (cmp !== 0) return cmp;
+      if (a.updatedAtMs !== b.updatedAtMs) return a.updatedAtMs - b.updatedAtMs;
+      return String(a.uid).localeCompare(String(b.uid));
+    });
+
+    const winner = candidates[0];
+    decisions.push({ wantId, uid: winner.uid, swapOutId: winner.swapOutId, status: "won" });
+
+    // record losers (optional, helps UI reasons)
+    for (let i = 1; i < candidates.length; i++) {
+      decisions.push({ wantId, uid: candidates[i].uid, swapOutId: candidates[i].swapOutId, status: "lost" });
+    }
+  }
+
+  // G) Apply changes + write results + cleanup
+  const batch = db.batch();
+
+  // Write marketResults
+  for (const dec of decisions) {
+    const resRef = roomRef.collection("marketResults").doc();
+    batch.set(resRef, {
+      uid: dec.uid,
+      wantId: dec.wantId,
+      swapOutId: dec.swapOutId,
+      gotId: dec.status === "won" ? dec.wantId : null,
+      result: dec.status,
+      resolvedAtMs: now,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+
+    if (dec.status !== "won") continue;
+
+    // Update pick: swapOut -> want
+    const pickId = pickDocIdByUidPlayer.get(`${dec.uid}:${dec.swapOutId}`);
+    if (pickId) {
+      batch.update(roomRef.collection("picks").doc(pickId), {
+        playerId: dec.wantId,
+        updatedAt: FieldValue.serverTimestamp(),
+        source: "market",
+      });
+    }
+
+    // Update lineup starters if needed
+    const lineup = lineupByUid.get(dec.uid);
+    if (lineup && Array.isArray(lineup.starters)) {
+      const starters = lineup.starters.map(String);
+      const idx = starters.indexOf(String(dec.swapOutId));
+      if (idx >= 0) {
+        starters[idx] = String(dec.wantId);
+        batch.set(roomRef.collection("lineups").doc(dec.uid), { starters, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
+      }
+    }
+  }
+
+  // Cleanup interests (so next market starts fresh)
+  interestSnap.forEach((doc) => batch.delete(doc.ref));
+
+  // Mark market resolved
+  batch.set(
+    marketRef,
+    {
+      status: "resolved",
+      resolvedAtMs: now,
+      updatedAt: FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+
+  await batch.commit();
+  return { ok: true, resolvedCount: decisions.length };
+}
+
+exports.resolveMarketNow = onCall({ region: "us-west2" }, async (req) => {
+  if (!req.auth) throw new HttpsError("unauthenticated", "Sign in first.");
+  const roomId = req.data?.roomId;
+  if (!roomId) throw new HttpsError("invalid-argument", "roomId required.");
+  return await resolveMarketForRoom(roomId, { trigger: "manual" });
+});

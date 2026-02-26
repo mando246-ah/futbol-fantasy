@@ -30,7 +30,10 @@ import { collection, getDocs, query, where, addDoc } from "firebase/firestore";
 import { writeBatch } from "firebase/firestore";
 import { getFunctions } from "firebase/functions";
 import { getStorage, ref, uploadBytes, getDownloadURL } from "firebase/storage";
-import { getAnalytics , isSupported } from "firebase/analytics";
+import { getAnalytics , isSupported, logEvent } from "firebase/analytics";
+import { setLogLevel } from "firebase/firestore";
+
+//setLogLevel("debug");
 
 //Player pool to FireStore
 export async function seedRoomPlayers(roomId, players) {
@@ -65,7 +68,7 @@ const firebaseConfig = {
 // Dev vs Prod base URL for magic link redirect
 const ORIGIN = (typeof window !== "undefined" && window.location.origin) || "";
 const IS_LOCAL = ORIGIN.includes("localhost") || ORIGIN.includes("127.0.0.1");
-const PROD_URL = "https://fifa-fantasy-4a7e3.web.app";
+const PROD_URL = "https://futbol-fantasy.com";
 export const WEB_BASE_URL = IS_LOCAL ? "http://localhost:5173" : PROD_URL;
 
 // Init
@@ -80,6 +83,32 @@ export let analytics = null;
 isSupported().then((ok) => {
   if (ok) analytics = getAnalytics(app);
 });
+// Safe wrapper for logging events (works even if analytics isn't ready yet)
+export function logAnalyticsEvent(name, params = {}) {
+  try {
+    if (!analytics) return;
+    logEvent(analytics, name, params);
+  } catch (e) {
+    // ignore analytics errors in production
+  }
+}
+
+export function logPageView({ page_path, page_title } = {}) {
+  try {
+    if (!analytics) return;
+
+    const fullPath = page_path || (window.location.pathname + window.location.search);
+    const fullUrl = window.location.href;
+
+    logEvent(analytics, "page_view", {
+      page_location: fullUrl,
+      page_path: fullPath,
+      page_title: page_title || document.title || "Futbol Fantasy",
+    });
+  } catch (e) {
+    // ignore
+  }
+}
 
 //User Pictures
 export async function uploadUserAvatar(uid, file) {
@@ -148,13 +177,21 @@ googleProvider.setCustomParameters({ prompt: "select_account" });
 export async function signInWithGoogleWithPref() {
   await choosePersistenceFromPref();
 
+  const provider = new GoogleAuthProvider();
+  const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+
+  // iOS Safari: always use redirect (most reliable)
+  if (isIOS) {
+    await signInWithRedirect(auth, provider);
+    return null;
+  }
+
+  // Desktop: popup (fallback to redirect if blocked)
   try {
-    // Best UX on desktop
-    return await signInWithPopup(auth, googleProvider);
+    return await signInWithPopup(auth, provider);
   } catch (e) {
-    // Popup blocked or third-party cookie issues → fallback
     if (e?.code === "auth/popup-blocked" || e?.code === "auth/popup-closed-by-user") {
-      await signInWithRedirect(auth, googleProvider);
+      await signInWithRedirect(auth, provider);
       return null;
     }
     throw e;
@@ -164,8 +201,9 @@ export async function signInWithGoogleWithPref() {
 // Call this once on app load (e.g., App.jsx useEffect) to complete redirect flow
 export async function completeGoogleRedirectIfAny() {
   try {
-    const res = await getRedirectResult(auth);
-    return res || null;
+    //const res = await getRedirectResult(auth);
+    //return res || null;
+    await getRedirectResult(auth);
   } catch (e) {
     // ignore if no redirect is pending
     if (e?.code === "auth/no-auth-event") return null;

@@ -40,7 +40,7 @@ export default function SignIn() {
 
   return (
     <div className="min-h-[60vh] grid place-items-center p-6">
-      <form onSubmit={onSubmit} className="w-full max-w-sm bg-white p-6 rounded-2xl shadow space-y-3">
+      {/*<form onSubmit={onSubmit} className="w-full max-w-sm bg-white p-6 rounded-2xl shadow space-y-3">
         <h1 className="text-xl font-bold text-center">Sign In</h1>
 
         <input
@@ -70,7 +70,13 @@ export default function SignIn() {
         </button>
 
         {msg && <div className="text-sm opacity-80 text-center">{msg}</div>}
-      </form>
+      </form> */}
+      <div className="w-full max-w-sm bg-white p-6 rounded-2xl shadow space-y-3 text-center">
+        <h1 className="text-xl font-bold">Sign In</h1>
+        <p className="text-sm opacity-80">
+          Please sign in with Google.
+        </p>
+      </div>
     </div>
   );
 }

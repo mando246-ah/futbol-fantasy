@@ -26,7 +26,7 @@ export default function Home() {
         {/* Foreground content */}
         <div className="homeHeroContent">
           <div className="homeHeroInner">
-            <img src={logo} alt="Football Fantasy Logo" className="homeHeroLogo" />
+            <img src={logo} alt="Fútball Fantasy Logo" className="homeHeroLogo" />
             <p className="homeKicker"></p>
 
             <h1 className="homeTitle">
@@ -62,7 +62,7 @@ export default function Home() {
       {/* LEARN MORE SECTION */}
       <section id="learn-more" className="homeSection">
         <div className="homeSectionInner">
-          <h2 className="homeSectionTitle">What is Football Fantasy?</h2>
+          <h2 className="homeSectionTitle">What is Fútball Fantasy?</h2>
           <p className="homeSectionText">
             Create a room, invite your friends, draft your squads, and compete weekly.
             Only your Starting XI scores — every pick matters.
