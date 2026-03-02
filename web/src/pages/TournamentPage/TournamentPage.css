@@ -1148,6 +1148,7 @@
 }
 
 /* Week History (previous weeks) */
+
 .tpHistoryHeader{
   display:flex;
   align-items:flex-end;
@@ -1220,8 +1221,46 @@
   align-items:center;
   gap: 10px;
   font-weight: 900;
-  flex: 0 0 auto;
+
+  /* ✅ allow shrinking so it doesn't push off-screen */
+  flex: 1 1 auto;
+  min-width: 0;
+
+  /* ✅ lets button wrap instead of overflow */
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
+
+/* ✅ your button has inline marginLeft:10; kill it on mobile */
+.tpHistoryScore .tpMiniBtn{
+  margin-left: 0 !important;
+}
+
+/* ✅ stop the Breakdown panel from making the whole page wider */
+.tpBreakdownWrap{
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;                 /* if something is too wide, scroll INSIDE */
+  -webkit-overflow-scrolling: touch;
+}
+
+.tpBreakdownCols,
+.tpBreakdownCol{
+  min-width: 0;
+}
+
+/* ✅ flex rows inside breakdown can force overflow; allow wrapping */
+.tpBreakdownPartRow{
+  flex-wrap: wrap;
+}
+
+.tpBreakdownPartKey{
+  flex: 1 1 70%;
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
 .tpHistoryResult{
   opacity: 0.7;
   font-size: 12px;

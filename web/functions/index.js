@@ -38,6 +38,99 @@ function comparePriority(a, b) {
   return 0;
 }
 
+function top3FromStandings(standingsArr) {
+  const arr = Array.isArray(standingsArr) ? standingsArr : [];
+  return arr.slice(0, 3).map((r, i) => ({
+    rank: i + 1,
+    userId: r.userId || r.uid || null,
+    name: r.name || "Unknown",
+    played: Number(r.played ?? 0),
+    wins: Number(r.wins ?? 0),
+    draws: Number(r.draws ?? 0),
+    losses: Number(r.losses ?? 0),
+    tablePoints: Number(r.tablePoints ?? 0),
+    totalFantasyPoints: Number(r.totalFantasyPoints ?? 0),
+  }));
+}
+
+//Functions to help end Final Draft for regular season
+function parseRoundNumber(label) {
+  if (!label) return null;
+  const m = String(label).match(/(\d+)\s*$/);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isFinite(n) ? n : null;
+}
+
+async function fetchTotalRoundsFromApi(competition, apiKey) {
+  const league = Number(competition?.league);
+  const season = Number(competition?.season);
+  if (!Number.isFinite(league) || !Number.isFinite(season)) return null;
+
+  // API-Football returns array like: ["Regular Season - 1", ... "Regular Season - 34"]
+  const res = await apiFootballGet("fixtures/rounds", { league, season }, apiKey);
+  const rounds = Array.isArray(res?.response) ? res.response : [];
+
+  let maxNum = null;
+  for (const r of rounds) {
+    const n = parseRoundNumber(r);
+    if (!Number.isFinite(n)) continue;
+    maxNum = maxNum == null ? n : Math.max(maxNum, n);
+  }
+
+  // fallback if no numeric suffix
+  if (maxNum == null && rounds.length) maxNum = rounds.length;
+
+  return Number.isFinite(maxNum) && maxNum > 0 ? maxNum : null;
+}
+
+async function ensureRoomTotalRounds({ roomId, room, competition, apiKey }) {
+  const existing = Number(room?.competitionMeta?.totalRounds);
+  if (Number.isFinite(existing) && existing > 0) return existing;
+
+  if (!apiKey) return null;
+
+  const totalRounds = await fetchTotalRoundsFromApi(competition, apiKey);
+  if (Number.isFinite(totalRounds) && totalRounds > 0) {
+    await db.doc(`rooms/${roomId}`).set({ "competitionMeta.totalRounds": totalRounds }, { merge: true });
+    return totalRounds;
+  }
+  return null;
+}
+
+async function writeFinalResultsSnapshot({ roomId }) {
+  const finalRef = db.doc(`rooms/${roomId}/finalResults/current`);
+  const finalSnap = await finalRef.get();
+  if (finalSnap.exists) return finalSnap.data() || {};
+
+  const standingsSnap = await db.doc(`rooms/${roomId}/standings/current`).get();
+  const standingsDoc = standingsSnap.exists ? (standingsSnap.data() || {}) : {};
+  const standings = Array.isArray(standingsDoc.standings) ? standingsDoc.standings : [];
+
+  const top3 = standings.slice(0, 3).map((r, i) => ({
+    rank: i + 1,
+    userId: r.userId || r.uid || null,
+    name: r.name || "Unknown",
+    played: Number(r.played ?? 0),
+    wins: Number(r.wins ?? 0),
+    draws: Number(r.draws ?? 0),
+    losses: Number(r.losses ?? 0),
+    tablePoints: Number(r.tablePoints ?? 0),
+    totalFantasyPoints: Number(r.totalFantasyPoints ?? 0),
+  }));
+
+  const payload = {
+    roomId,
+    computedAt: admin.firestore.FieldValue.serverTimestamp(),
+    computedAtMs: Date.now(),
+    championUserId: top3?.[0]?.userId || null,
+    top3,
+    standingsSnapshot: standings, // optional but nice for frozen history
+  };
+
+  await finalRef.set(payload, { merge: true });
+  return payload;
+}
 
 //Emails
 async function getEmailsForUids(uids) {
@@ -1086,12 +1179,11 @@ exports.getUserLockStatus = onCall(
     if (!roomSnap.exists) throw new HttpsError("not-found", "Room not found.");
     const room = roomSnap.data() || {};
 
-    const competition = room.competition || {
-      provider: "api-football",
-      league: 2,
-      season: 2025,
-      timezone: "America/Los_Angeles",
-    };
+    const competition = room.competition;
+    if (!competition?.league || !competition?.season) {
+      console.warn(`[autoAdvanceWeekIfFinal] Missing room.competition for room ${roomId}`);
+      return null; // or throw, depending on your preference
+    }
 
     const league = Number(competition.league ?? 2);
     const season = Number(competition.season ?? 2025);
@@ -1439,6 +1531,102 @@ async function fetchNextRoundWindow({ league, season, timezone }, opts={}) {
   };
 }
 
+async function ensureDefaultLineupsForRoom(roomId, memberUids) {
+  // Load players to know positions (for GK preference)
+  const playersSnap = await db.collection(`rooms/${roomId}/players`).get();
+  const posById = new Map();
+  playersSnap.forEach((doc) => {
+    const d = doc.data() || {};
+    const pid = String(d.id ?? d.playerId ?? doc.id);
+    posById.set(pid, toPos(d.position || d.pos || d.role));
+  });
+
+  // Load picks to build roster per user (in pick order if available)
+  const picksSnap = await db.collection(`rooms/${roomId}/picks`).get();
+  const rosterByUid = new Map();
+
+  function inferOwnerUid(d) {
+    const v =
+      d?.ownerUid ?? d?.ownerId ?? d?.ownedBy ?? d?.managerUid ??
+      d?.userId ?? d?.uid ?? d?.pickedByUid ?? d?.pickedBy ??
+      d?.owner?.uid ?? d?.owner?.id;
+    if (!v) return null;
+    if (typeof v === "string") return v;
+    if (typeof v === "object") return v.uid || v.id || null;
+    return null;
+  }
+
+  function pickOrder(d) {
+    const ms = d?.createdAt?.toMillis?.() ?? 0;
+    const n =
+      d?.pickIndex ?? d?.overallPick ?? d?.pickNumber ?? d?.pickNo ?? d?.index ?? d?.turn ?? d?.createdAtMs ?? ms;
+    const num = Number(n);
+    return Number.isFinite(num) ? num : ms;
+  }
+
+  picksSnap.forEach((doc) => {
+    const d = doc.data() || {};
+    const uid = inferOwnerUid(d);
+    const pid = String(d.playerId ?? d.pid ?? d.apiPlayerId ?? d.player?.id ?? d.player?.playerId ?? "");
+    if (!uid || !pid) return;
+
+    const arr = rosterByUid.get(uid) || [];
+    arr.push({ pid, order: pickOrder(d), pos: posById.get(pid) || "MID" });
+    rosterByUid.set(uid, arr);
+  });
+
+  const batch = db.batch();
+  let writes = 0;
+
+  for (const uid of memberUids) {
+    const lineupRef = db.doc(`rooms/${roomId}/lineups/${uid}`);
+    const snap = await lineupRef.get();
+    const existing = snap.exists ? (snap.data() || {}) : null;
+
+    // only create if missing or no starters
+    const startersExisting = Array.isArray(existing?.starters) ? existing.starters : [];
+    if (snap.exists && startersExisting.length > 0) continue;
+
+    const roster = (rosterByUid.get(uid) || [])
+      .sort((a, b) => a.order - b.order)
+      .map((x) => x.pid);
+
+    // choose XI: prefer 1 GK if available, then fill by pick order
+    const uniq = [];
+    const seen = new Set();
+    for (const pid of roster) {
+      if (!pid || seen.has(pid)) continue;
+      seen.add(pid);
+      uniq.push(pid);
+    }
+
+    const gk = uniq.find((pid) => posById.get(pid) === "GK");
+    const starters = [];
+
+    if (gk) starters.push(gk);
+    for (const pid of uniq) {
+      if (starters.length >= 11) break;
+      if (pid === gk) continue;
+      starters.push(pid);
+    }
+
+    // if they somehow have <11, just save what we have
+    batch.set(
+      lineupRef,
+      {
+        starters,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        autoInit: true,
+      },
+      { merge: true }
+    );
+    writes++;
+  }
+
+  if (writes > 0) await batch.commit();
+  return { writes };
+}
 
 exports.createNextWeek = onCall(
   { region: "us-west2", secrets: [APIFOOTBALL_KEY] },
@@ -1462,6 +1650,8 @@ exports.createNextWeek = onCall(
     if (memberUids.length < 2) throw new HttpsError("failed-precondition", "Need at least 2 managers.");
     if (memberUids.length % 2 !== 0) throw new HttpsError("failed-precondition", "Managers must be an even number.");
 
+    await ensureDefaultLineupsForRoom(roomId, memberUids);
+
     // determine next weekIndex
     const weeksSnap = await db.collection(`rooms/${roomId}/weeks`).get();
     let maxIdx = 0;
@@ -1472,12 +1662,22 @@ exports.createNextWeek = onCall(
     const weekIndex = maxIdx + 1;
 
     // Competition config (default to UCL for your test)
-    const competition = room.competition || {
-      provider: "api-football",
-      league: 2,          // UCL
-      season: 2025,       // from the API-Football table you showed
-      timezone: "America/Los_Angeles",
-    };
+   // Competition config (MUST come from the room)
+    const competition = room.competition;
+    if (!competition?.league || !competition?.season) {
+      throw new HttpsError("failed-precondition", "Competition not selected yet.");
+    }
+
+    // ✅ Auto-fetch totalRounds once (for new rooms)
+    const existingTR = Number(room?.competitionMeta?.totalRounds || 0);
+    if (!(Number.isFinite(existingTR) && existingTR > 0)) {
+      const apiKey = APIFOOTBALL_KEY.value();
+      const totalRounds = await fetchTotalRoundsFromApi(competition, apiKey);
+
+      if (Number.isFinite(totalRounds) && totalRounds > 0) {
+        await roomRef.set({ "competitionMeta.totalRounds": totalRounds }, { merge: true });
+      }
+    }
 
     const fallbackDate = room?.seedFilter?.fixtureDate || null;
     const window = await fetchNextRoundWindow(competition, { fallbackDate });
@@ -1717,7 +1917,7 @@ function toNum(v) {
   return 0;
 }
 
-function buildPlayerStatsMapFromFixturePlayersResponse(responseArr) {
+function buildPlayerStatsMapFromFixturePlayersResponse(responseArr, fixtureMeta) {
   const out = {};
   const teams = Array.isArray(responseArr) ? responseArr : [];
 
@@ -1752,7 +1952,6 @@ function buildPlayerStatsMapFromFixturePlayersResponse(responseArr) {
       const passesCompleted = toNum(st?.passes?.total); // Using Total Passes as discussed
       
       const saves = toNum(st?.goals?.saves);
-      const goalsConceded = toNum(st?.goals?.conceded);
       const yellow = toNum(st?.cards?.yellow);
       const red = toNum(st?.cards?.red);
       const pensSaved = toNum(st?.penalty?.saved);
@@ -1769,8 +1968,24 @@ function buildPlayerStatsMapFromFixturePlayersResponse(responseArr) {
       const shotsOnTarget = toNum(st?.shots?.on);
       const pensCommitted = toNum(st?.penalty?.commited ?? st?.penalty?.committed);
 
-      let cleanSheet = false;
-      if (minutes > 0 && goalsConceded === 0) cleanSheet = true;
+      // raw from API (mostly only useful for GK)
+      const rawConceded = toNum(st?.goals?.conceded);
+
+      // fixture-based conceded (correct for DEF/MID too)
+      let teamConceded = rawConceded;
+      const homeTeamId = fixtureMeta?.homeTeamId ?? null;
+      const awayTeamId = fixtureMeta?.awayTeamId ?? null;
+      const goalsHome = toNum(fixtureMeta?.goalsHome);
+      const goalsAway = toNum(fixtureMeta?.goalsAway);
+
+      if (teamId && homeTeamId && awayTeamId) {
+        if (teamId === homeTeamId) teamConceded = goalsAway;
+        else if (teamId === awayTeamId) teamConceded = goalsHome;
+      }
+
+      // Use teamConceded for clean sheet + conceded scoring
+      const goalsConceded = teamConceded;          // store real conceded
+      const cleanSheet = minutes > 0 && teamConceded === 0;
 
       const ownGoals = 0; 
 
@@ -1804,10 +2019,19 @@ function buildPlayerStatsMapFromFixturePlayersResponse(responseArr) {
   return out;
 }
 
-async function getFixturePlayersStatsMapCached({ fixtureId, apiKey, ttlMs }) {
+async function getFixturePlayersStatsMapCached({ fixtureId, apiKey, ttlMs, timeZone }) {
   //const ref = db.collection("apiCache").doc(`fixturePlayers_${String(fixtureId)}`);
   const ref = db.doc(`apiCache/fixturePlayers_${String(fixtureId)}`);
   const now = Date.now();
+  const metaSnap = await db.doc(`apiCache/fixtureStatus_${String(fixtureId)}`).get();
+  const metaDoc = metaSnap.exists ? (metaSnap.data() || {}) : {};
+
+  const fixtureMeta = {
+    homeTeamId: metaDoc.homeTeamId ?? null,
+    awayTeamId: metaDoc.awayTeamId ?? null,
+    goalsHome: toNum(metaDoc.goalsHome),
+    goalsAway: toNum(metaDoc.goalsAway),
+  };
 
   try {
     const snap = await ref.get();
@@ -1820,7 +2044,7 @@ async function getFixturePlayersStatsMapCached({ fixtureId, apiKey, ttlMs }) {
 
   // If fixture hasn't started yet, this can return 204 No Content (handled in apiFootballGet)
   const json = await apiFootballGet("fixtures/players", { fixture: String(fixtureId) }, apiKey);
-  const fresh = buildPlayerStatsMapFromFixturePlayersResponse(json?.response || []);
+  const fresh = buildPlayerStatsMapFromFixturePlayersResponse(json?.response || [], fixtureMeta);
 
   // Sometimes the API returns 204/empty even when a fixture should have stats.
   // Do NOT overwrite a previously cached non-empty map with an empty one.
@@ -1937,12 +2161,17 @@ async function getFixtureStatusMap({ fixtureIds, timezone, apiKey }) {
       const short = f?.fixture?.status?.short ?? null;
       if (!fixtureId || !short) continue;
 
+      const homeTeamId = f?.teams?.home?.id ?? null;
+      const awayTeamId = f?.teams?.away?.id ?? null;
+      const goalsHome = toNum(f?.goals?.home);
+      const goalsAway = toNum(f?.goals?.away);
+
       out[fixtureId] = short;
 
       const ref = db.doc(`apiCache/fixtureStatus_${fixtureId}`);
       writes.push(
         ref.set(
-          { short, updatedAtMs: now },
+          { short, updatedAtMs: now, homeTeamId, awayTeamId, goalsHome, goalsAway },
           { merge: true }
         )
       );
@@ -2225,7 +2454,7 @@ async function computeAndWriteLiveWeek({ roomId, weekIndex, apiKey }) {
     const ko = kickoffMsByFixtureId[fid] ?? null;
 
     const ttlMs = inPlay ? LIVE_TTL_MS : (isFinished(short) ? FINISHED_TTL_MS : LIVE_TTL_MS);
-    const map = await getFixturePlayersStatsMapCached({ fixtureId: fid, apiKey, ttlMs });
+    const map = await getFixturePlayersStatsMapCached({ fixtureId: fid, apiKey, ttlMs, timeZone });
 
     for (const [pidRaw, st] of Object.entries(map || {})) {
       const pid = String(pidRaw);
@@ -2502,7 +2731,7 @@ async function computeAndWriteLiveWeek({ roomId, weekIndex, apiKey }) {
   }
 }
 
-async function autoAdvanceWeekIfFinal({ roomId, room, currentWeekIndex }) {
+async function autoAdvanceWeekIfFinal({ roomId, room, currentWeekIndex, apiKey }) {
   const nowMs = Date.now();
 
   // Load current week (must be final to advance)
@@ -2524,6 +2753,24 @@ async function autoAdvanceWeekIfFinal({ roomId, room, currentWeekIndex }) {
 
   const endAtMs = Number(curWeek.endAtMs || 0);
 
+  // Determine competition + total rounds
+  const competition = room.competition;
+  if (!competition?.league || !competition?.season) {
+    console.warn(`[autoAdvanceWeekIfFinal] Missing room.competition for room ${roomId}`);
+    return null; // or throw, depending on your preference
+  }
+
+  const totalRounds = await ensureRoomTotalRounds({ roomId, room, competition, apiKey });
+  const curRound = parseRoundNumber(curWeek.roundLabel);
+
+  // If this was the LAST matchday, finalize season instead of creating next week
+  // If this was the LAST matchday, finalize season instead of creating next week
+  if (Number.isFinite(totalRounds) && Number.isFinite(curRound) && curRound >= totalRounds) {
+    await writeFinalResultsSnapshot({ roomId });
+    await db.doc(`rooms/${roomId}`).set({ seasonPhase: "COMPLETE", currentWeekIndex: null }, { merge: true });
+    return null;
+  }
+
   // If a future week already exists, move to the next one instead of creating a new one
   const weeksSnap = await db.collection(`rooms/${roomId}/weeks`).get();
   const indices = weeksSnap.docs
@@ -2543,13 +2790,6 @@ async function autoAdvanceWeekIfFinal({ roomId, room, currentWeekIndex }) {
   if (memberUids.length < 2 || memberUids.length % 2 !== 0) return null;
 
   const nextWeekIndex = (indices.length ? Math.max(...indices) : Number(currentWeekIndex)) + 1;
-
-  const competition = room.competition || {
-    provider: "api-football",
-    league: 2,
-    season: 2025,
-    timezone: "America/Los_Angeles",
-  };
 
   const fallbackDate = room?.seedFilter?.fixtureDate || null;
 
@@ -2631,12 +2871,11 @@ async function ensureCurrentWeekIfMissing({ roomId, room, apiKey }) {
   }
   const weekIndex = maxIdx + 1;
 
-  const competition = room.competition || {
-    provider: "api-football",
-    league: 2,
-    season: 2025,
-    timezone: "America/Los_Angeles",
-  };
+  const competition = room.competition;
+  if (!competition?.league || !competition?.season) {
+    console.warn(`[autoAdvanceWeekIfFinal] Missing room.competition for room ${roomId}`);
+    return null; // or throw, depending on your preference
+  }
 
   const fallbackDate = room?.seedFilter?.fixtureDate || null;
   const window = await fetchNextRoundWindow(competition, { fallbackDate });
@@ -2709,7 +2948,8 @@ async function fetchAggregatedStats(fixtureIds, apiKey) {
     const map = await getFixturePlayersStatsMapCached({ 
         fixtureId: fId, 
         apiKey, 
-        ttlMs: 60 * 1000 
+        ttlMs: 60 * 1000,
+        timeZone
     });
 
     // We need the fixture status. Since your cache function returns a map of players, 
@@ -2914,6 +3154,143 @@ exports.debugForceUpdateWeek = onCall(
   }
 );
 
+// Host tool: fetch & save totalRounds on the room (competitionMeta.totalRounds)
+exports.debugSyncTotalRounds = onCall(
+  { region: "us-west2", secrets: [APIFOOTBALL_KEY] },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) throw new HttpsError("unauthenticated", "Sign in required.");
+
+    const roomId = request.data?.roomId;
+    if (!roomId) throw new HttpsError("invalid-argument", "roomId is required.");
+
+    const roomRef = db.doc(`rooms/${roomId}`);
+    const roomSnap = await roomRef.get();
+    if (!roomSnap.exists) throw new HttpsError("not-found", "Room not found.");
+
+    const room = roomSnap.data() || {};
+    if (!isHost(room, uid)) throw new HttpsError("permission-denied", "Host only.");
+
+    const comp = room.competition;
+    if (!comp?.league || !comp?.season) {
+      throw new HttpsError("failed-precondition", "room.competition missing league/season.");
+    }
+
+    const apiKey = APIFOOTBALL_KEY.value();
+    const totalRounds = await fetchTotalRoundsFromApi(competition, apiKey);
+
+    if (!totalRounds) throw new HttpsError("failed-precondition", "Could not determine total rounds.");
+
+    await roomRef.set({ "competitionMeta.totalRounds": totalRounds }, { merge: true });
+    return { ok: true, totalRounds };
+  }
+);
+
+exports.debugForceFinalizeSeason = onCall(
+  { region: "us-west2" },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) throw new HttpsError("unauthenticated", "Sign in required.");
+
+    const roomId = request.data?.roomId;
+    if (!roomId) throw new HttpsError("invalid-argument", "roomId is required.");
+
+    const roomRef = db.doc(`rooms/${roomId}`);
+    const roomSnap = await roomRef.get();
+    if (!roomSnap.exists) throw new HttpsError("not-found", "Room not found.");
+
+    const room = roomSnap.data() || {};
+    if (!isHost(room, uid)) throw new HttpsError("permission-denied", "Host only.");
+
+    const currentIdx = room.currentWeekIndex;
+
+    // 1. Force finalize the current active week so it can move to history
+    if (currentIdx) {
+      await db.doc(`rooms/${roomId}/weeks/${currentIdx}`).set(
+        { status: "final", finalizedAt: admin.firestore.FieldValue.serverTimestamp() },
+        { merge: true }
+      );
+      await db.doc(`rooms/${roomId}/weekResults/${currentIdx}`).set(
+        { status: "final" },
+        { merge: true }
+      );
+    }
+
+    // 2. Build final podium from standings
+    const standSnap = await db.doc(`rooms/${roomId}/standings/current`).get();
+    const standings = standSnap.exists ? (standSnap.data()?.standings || []) : [];
+    const top3 = top3FromStandings(standings);
+
+    const finalRef = db.doc(`rooms/${roomId}/finalResults/current`);
+    await finalRef.set(
+      {
+        roomId,
+        computedAt: admin.firestore.FieldValue.serverTimestamp(),
+        computedAtMs: Date.now(),
+        championUserId: top3?.[0]?.userId || null,
+        top3,
+        standingsSnapshot: standings,
+        preview: true,
+      },
+      { merge: true }
+    );
+
+    // 3. Mark the room complete and clear current week so UI switches to post-season
+    await roomRef.set(
+      { seasonPhase: "COMPLETE", currentWeekIndex: null },
+      { merge: true }
+    );
+
+    return { ok: true, top3Count: top3.length };
+  }
+);
+
+exports.debugClearFinalResults = onCall(
+  { region: "us-west2" },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) throw new HttpsError("unauthenticated", "Sign in required.");
+
+    const roomId = request.data?.roomId;
+    if (!roomId) throw new HttpsError("invalid-argument", "roomId is required.");
+
+    const roomSnap = await db.doc(`rooms/${roomId}`).get();
+    if (!roomSnap.exists) throw new HttpsError("not-found", "Room not found.");
+
+    const room = roomSnap.data() || {};
+    if (!isHost(room, uid)) throw new HttpsError("permission-denied", "Host only.");
+
+    await db.doc(`rooms/${roomId}/finalResults/current`).delete();
+    return { ok: true };
+  }
+);
+
+exports.debugSyncTotalRounds = onCall(
+  { region: "us-west2", secrets: [APIFOOTBALL_KEY] },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) throw new HttpsError("unauthenticated", "Sign in required.");
+
+    const roomId = request.data?.roomId;
+    if (!roomId) throw new HttpsError("invalid-argument", "roomId is required.");
+
+    const roomRef = db.doc(`rooms/${roomId}`);
+    const roomSnap = await roomRef.get();
+    if (!roomSnap.exists) throw new HttpsError("not-found", "Room not found.");
+
+    const room = roomSnap.data() || {};
+    if (!isHost(room, uid)) throw new HttpsError("permission-denied", "Host only.");
+
+    const competition = room.competition || {};
+    const apiKey = APIFOOTBALL_KEY.value();
+
+    const totalRounds = await fetchTotalRoundsFromApi(competition, apiKey);
+    if (!totalRounds) throw new HttpsError("failed-precondition", "Could not determine total rounds.");
+
+    await roomRef.set({ "competitionMeta.totalRounds": totalRounds }, { merge: true });
+    return { ok: true, totalRounds };
+  }
+);
 
 exports.repairWeekFixtures = onCall(
   { region: "us-west2", secrets: [APIFOOTBALL_KEY] },
@@ -3022,7 +3399,7 @@ exports.pollLiveTournamentWeeks = onSchedule(
 
         // ✅ AUTO-ADVANCE: if current is FINAL, move to next week
         if (week.status === "final") {
-          const nextIdx = await autoAdvanceWeekIfFinal({ roomId, room, currentWeekIndex: weekIndex });
+          const nextIdx = await autoAdvanceWeekIfFinal({ roomId, room, currentWeekIndex: weekIndex, apiKey });
           if (!nextIdx) continue;
 
           weekIndex = Number(nextIdx);

@@ -10,6 +10,7 @@ import "./TournamentPage.css";
 import { Avatar, AvatarImage, AvatarFallback } from "../../components/ui/avatar";
 import { httpsCallable } from "firebase/functions"; 
 import { functions } from "../../firebase";
+import FinalResultsCard from "../../components/ui/FinalResultsCard";
 
 //Labels for stats
 const STAT_LABELS = {
@@ -140,6 +141,22 @@ function getBenchList(activeResults, uid, userObj) {
   return [];
 }
 
+function getStartersList(activeResults, uid, userObj) {
+  const key = uid == null ? null : String(uid);
+  const fromResults = key ? activeResults?.startersByUserId?.[key] : null;
+
+  // trust backend if it has players
+  if (Array.isArray(fromResults) && fromResults.length > 0) return fromResults;
+
+  // fallback to hook-loaded lineup
+  if (Array.isArray(userObj?.starters) && userObj.starters.length > 0) return userObj.starters;
+
+  // if backend explicitly provided [] and no fallback, return []
+  if (Array.isArray(fromResults)) return fromResults;
+
+  return [];
+}
+
 function pointsFromEntry(entry) {
   if (typeof entry === "number") return entry;
   if (entry && typeof entry === "object") return Number(entry.points ?? 0) || 0;
@@ -212,6 +229,7 @@ export default function TournamentPage() {
   const { loading, error, data } = useTournament(roomId);
   const [myUid, setMyUid] = useState(auth.currentUser?.uid || null);
   const [nowMs, setNowMs] = useState(() => Date.now());
+  
 
 
   //const myUid = auth.currentUser?.uid;
@@ -248,7 +266,30 @@ export default function TournamentPage() {
   const [historyWeekDoc, setHistoryWeekDoc] = useState(null);
   const [historyWeekResults, setHistoryWeekResults] = useState(null);
   const [openBreakdownKey, setOpenBreakdownKey] = useState(null);
+  //Ending Draft
+  const [finalResultsDoc, setFinalResultsDoc] = useState(null);
+  const [syncingRounds, setSyncingRounds] = useState(false);
+  const [forcingFinalize, setForcingFinalize] = useState(false);
+  const [clearingFinalize, setClearingFinalize] = useState(false);
+  const [totalRounds, setTotalRounds] = useState(null);
 
+  //Test
+  
+  // 1. Add the fake toggle and mock podium data
+  const [devPreviewComplete, setDevPreviewComplete] = useState(false);
+
+  const fakePodiumData = {
+    computedAtMs: Date.now(),
+    top3: [
+      // Use myUid instead of me! The UI will automatically grab your real name/avatar.
+      { userId: myUid || "1", name: "You (Champion)", wins: 15, tablePoints: 45, totalFantasyPoints: 1200 },
+      { userId: "2", name: "Silver Manager", wins: 12, tablePoints: 36, totalFantasyPoints: 1050 },
+      { userId: "3", name: "Bronze Manager", wins: 10, tablePoints: 30, totalFantasyPoints: 980 }
+    ]
+  };
+
+  // 2. Update this line so it listens to the toggle OR the database
+  const showFinalPodium = devPreviewComplete || Boolean(finalResultsDoc);
 
   // Other Matchups expand/collapse (separate from main matchup player expand)
   const [expandedOtherMatchupKey, setExpandedOtherMatchupKey] = useState(null);
@@ -273,8 +314,22 @@ export default function TournamentPage() {
   };
 
   const createNextWeekFn = httpsCallable(functions, "createNextWeek");
+  const syncTotalRoundsFn = httpsCallable(functions, "debugSyncTotalRounds");
+  const forceFinalizeSeasonFn = httpsCallable(functions, "debugForceFinalizeSeason");
+  const clearFinalResultsFn = httpsCallable(functions, "debugClearFinalResults");
   const scoringRef = useRef(null);
 
+  const totalRoundsDisplay =
+    totalRounds ??
+    (() => {
+      // Check both the nested path and the literal string key path
+      const trNested = data?.room?.competitionMeta?.totalRounds;
+      const trLiteral = data?.room?.["competitionMeta.totalRounds"];
+      const trComp = data?.room?.competition?.totalRounds;
+      
+      const val = Number(trNested || trLiteral || trComp || 0);
+      return val > 0 ? val : null;
+    })();
 
   //Add previous weeeks 
   const [repairing, setRepairing] = useState(false);
@@ -300,6 +355,7 @@ export default function TournamentPage() {
     }
 
 
+
   async function forceUpdateThisWeek() {
     if (!isHost) return;
     if (currentWeekIndex == null) return alert("No current weekIndex yet.");
@@ -317,6 +373,31 @@ export default function TournamentPage() {
     } finally {
       setForcingUpdate(false);
     }
+  }
+  async function syncTotalRounds() {
+    if (!isHost) return;
+    try {
+      setSyncingRounds(true);
+      const res = await syncTotalRoundsFn({ roomId });
+      const total = res?.data?.totalRounds;
+      setTotalRounds(Number(total) > 0 ? Number(total) : null);
+      alert(`Saved total rounds: ${total ?? "OK"}`);
+    } catch (e) {
+      console.error(e);
+      alert("Error: " + (e?.message || "Unknown error"));
+    } finally {
+      setSyncingRounds(false);
+    }
+  }
+
+ function forceFinalizeSeason() {
+    // Just toggle the UI, don't touch the database!
+    setDevPreviewComplete(true);
+  }
+
+  function clearFinalResults() {
+    // Revert the UI back to normal
+    setDevPreviewComplete(false);
   }
 
   async function createNextWeekNow() {
@@ -343,6 +424,16 @@ export default function TournamentPage() {
       alert("Could not copy. Room code: " + String(roomId));
     }
   }
+
+  //FInal results
+  useEffect(() => {
+    if (!roomId) return;
+    return onSnapshot(
+      doc(db, "rooms", roomId, "finalResults", "current"),
+      (snap) => setFinalResultsDoc(snap.exists() ? snap.data() : null),
+      () => setFinalResultsDoc(null)
+    );
+  }, [roomId]);
 
   //History Matches
   useEffect(() => {
@@ -424,23 +515,60 @@ export default function TournamentPage() {
       document.removeEventListener("keydown", onKeyDown);
     };
   }, [showScoring]);
+
+  useEffect(() => {
+    if (!roomId) {
+      setFinalResultsDoc(null);
+      return;
+    }
+    const unsub = onSnapshot(
+      doc(db, "rooms", roomId, "finalResults", "current"),
+      (snap) => setFinalResultsDoc(snap.exists() ? snap.data() : null),
+      () => setFinalResultsDoc(null)
+    );
+    return unsub;
+  }, [roomId]);
+
   // Always run hooks (no conditional hooks)
   useEffect(() => {
     if (!roomId) {
       setCurrentWeekIndex(null);
+      setTotalRounds(null);
       return;
     }
+
     const unsub = onSnapshot(
       doc(db, "rooms", roomId),
       (snap) => {
         const r = snap.exists() ? snap.data() : null;
+
         const idx = Number(r?.currentWeekIndex);
         setCurrentWeekIndex(Number.isFinite(idx) ? idx : null);
+
+        // Target league rounds ONLY, ignoring the draft's root totalRounds
+        const savedTotal = r?.competitionMeta?.totalRounds 
+                        || r?.["competitionMeta.totalRounds"]
+                        || r?.competition?.totalRounds;
+
+        const tr = Number(savedTotal || 0);
+        setTotalRounds(Number.isFinite(tr) && tr > 0 ? tr : null);
       },
-      () => setCurrentWeekIndex(null)
+      (err) => {
+        console.error("rooms/{roomId} onSnapshot error:", err);
+      }
     );
+
     return unsub;
   }, [roomId]);
+
+  useEffect(() => {
+    const savedTotal = data?.room?.competitionMeta?.totalRounds 
+                    || data?.room?.["competitionMeta.totalRounds"]
+                    || data?.room?.competition?.totalRounds;
+
+    const tr = Number(savedTotal || 0);
+    if (Number.isFinite(tr) && tr > 0) setTotalRounds(tr);
+  }, [data?.room]); // Keeping dependency broad to catch all nested/literal changes
 
   useEffect(() => {
       if (!roomId || currentWeekIndex == null) {
@@ -575,7 +703,6 @@ export default function TournamentPage() {
   const users = data?.users || [];
   const userById = Object.fromEntries(users.map((u) => [u.userId, u]));
 
-
   // Prefer week results if present; fallback to old results (Option A)
   const activeResults = stableWeekResults || weekResults || null;
 
@@ -592,10 +719,16 @@ export default function TournamentPage() {
   const nextUpdateInSec = lastUpdateMs ? Math.max(0, 60 - (ageSec % 60)) : null;
   const lastUpdateLabel = lastUpdateMs ? fmtDT(lastUpdateMs) : "—";
 
-  if (!activeResults) {
+  // Add this variable right above the if statement
+  // Update to listen to devPreviewComplete
+  const isSeasonComplete = devPreviewComplete || Boolean(finalResultsDoc) || data?.room?.seasonPhase === "COMPLETE";
+
+  // Update the if statement to ONLY catch brand new drafts, not finished ones
+  if (!isSeasonComplete && !activeResults) {
     const baseRows = (data?.users || []).map((u) => ({
       userId: u.userId,
       name: u.name || u.displayName || u.userId,
+      wins: 0, draws: 0, losses: 0, tablePoints: 0, totalFantasyPoints: 0
     }));
 
     return (
@@ -622,6 +755,7 @@ export default function TournamentPage() {
                     <>
                       {" "}
                       • Round: <b>{weekDoc.roundLabel}</b>
+                      {totalRoundsDisplay ? <> / <b>{totalRoundsDisplay}</b></> : null}
                     </>
                   ) : null}
                 </p>
@@ -657,7 +791,18 @@ export default function TournamentPage() {
           </div>
 
           <div className="tpGrid">
-            <div className="tpCard tpFull">
+            {showFinalPodium && (
+              <div className="tpCard tpFull">
+                <FinalResultsCard
+                  finalResults={devPreviewComplete ? fakePodiumData : finalResultsDoc}
+                  formatDate={fmtDT}
+                  renderUser={(uid, fallbackName) => (
+                    <UserChip user={userById?.[uid] || { userId: uid, name: fallbackName }} />
+                  )}
+                />
+              </div>
+            )}
+             <div className="tpCard tpFull">
               <h3 className="tpCardTitle">Leaderboard</h3>
 
               <div className="tpBoard">
@@ -747,7 +892,7 @@ export default function TournamentPage() {
       (m) => m.homeUserId !== me?.userId && m.awayUserId !== me?.userId
     ) || [];
 
-  const boardRows = activeResults.weekLeaderboard || activeResults.leaderboard || [];
+  const boardRows = activeResults?.weekLeaderboard || activeResults?.leaderboard || [];
   const standingsRows = standingsDoc?.standings || [];
   const wrStatus = String(weekResults?.status || "").toUpperCase();
   const historyOptions = (weekHistory || [])
@@ -792,6 +937,7 @@ export default function TournamentPage() {
                 <>
                   {" "}
                   • Round: <b>{weekDoc.roundLabel}</b>
+                  {totalRoundsDisplay ? <> / <b>{totalRoundsDisplay}</b></> : null}
                 </>
               ) : null}
             </p>
@@ -855,6 +1001,22 @@ export default function TournamentPage() {
                     {forcingUpdate ? "Updating..." : "Refresh Stats"}
                   </button>
 
+                  <button
+                    type="button"
+                    className="tpToolsItem"
+                    onClick={syncTotalRounds}
+                    disabled={syncingRounds || forcingUpdate || creatingNextWeek || repairing}
+                  >
+                    {syncingRounds ? "Syncing..." : "Sync Total Rounds"}
+                  </button>
+
+                  <button className="tpToolsItem" onClick={forceFinalizeSeason} disabled={forcingFinalize}>
+                    {forcingFinalize ? "Finalizing..." : "DEV: Force Final Podium"}
+                  </button>
+
+                  <button className="tpToolsItem" onClick={clearFinalResults} disabled={clearingFinalize}>
+                    {clearingFinalize ? "Clearing..." : "DEV: Clear Final Podium"}
+                  </button>
 
                   <button
                     type="button"
@@ -903,6 +1065,18 @@ export default function TournamentPage() {
     </div>
 
 <div className="tpGrid">
+   {showFinalPodium && (
+      <div className="tpCard tpFull">
+        <FinalResultsCard
+          //finalResults={finalResultsDoc}
+          finalResults={devPreviewComplete ? fakePodiumData : finalResultsDoc}
+          formatDate={fmtDT}
+          renderUser={(uid, fallbackName) => (
+            <UserChip user={userById?.[uid] || { userId: uid, name: fallbackName }} />
+          )}
+        />
+      </div>
+    )}
 <div className="tpCard tpFull">
   <h3 className="tpCardTitle">Leaderboard</h3>
   <div className="tpBoard">
@@ -935,6 +1109,7 @@ export default function TournamentPage() {
  
 </div>
 
+{!showFinalPodium && (
 <div className="tpCard tpFull">
   <h3 className="tpCardTitle">Your Matchup</h3>
   {!myMatchup ? (
@@ -970,7 +1145,7 @@ export default function TournamentPage() {
           </div>
           <div className="tpSectionLabel">Starters</div>
           <ul className="tpList">
-            {(me?.starters || []).map((p) => {
+            { getStartersList(activeResults, me?.userId, me).map((p) => {
               const entry = myBreakdown?.perPlayer?.[p.id];
               const pts = typeof entry === "number" ? entry : entry?.points ?? 0;
               const breakdown = typeof entry === "object" ? entry?.breakdown : {};
@@ -1082,7 +1257,7 @@ export default function TournamentPage() {
           </div>
           <div className="tpSectionLabel">Starters</div>
           <ul className="tpList">
-            {(opponent?.starters || []).map((p) => {
+            { getStartersList(activeResults, opponentUid, opponent).map((p) => {
               const entry = oppBreakdown?.perPlayer?.[p.id];
               const pts = typeof entry === "number" ? entry : entry?.points ?? 0;
               const breakdown = typeof entry === "object" ? entry?.breakdown : {};
@@ -1186,8 +1361,10 @@ export default function TournamentPage() {
       </div>
     </>
   )}
-</div>
+</div> 
+)}
 
+{!showFinalPodium && (
   <div className="tpCard tpFull">
   <h3 className="tpCardTitle">Other Matchups</h3>
 
@@ -1488,7 +1665,7 @@ export default function TournamentPage() {
     </div>
   )}
 
-  </div>
+  </div> )}
   {/*Week History*/}
   <div className="tpCard tpFull">
     <div className="tpHistoryHeader">
@@ -1530,7 +1707,9 @@ export default function TournamentPage() {
         <p className="tpText tpHistoryMeta">
           Window: <b>{fmtDT(histWeek.startAtMs)}</b> → <b>{fmtDT(histWeek.endAtMs)}</b>
           {histWeek.roundLabel ? (
-            <> • Round: <b>{histWeek.roundLabel}</b></>
+            <> • Round: <b>{histWeek.roundLabel}</b>
+            {totalRoundsDisplay ? <> / <b>{totalRoundsDisplay}</b></> : null}
+            </>
           ) : null}
           {histResults?.status ? (
             <> • Status: <b>{String(histResults.status).toUpperCase()}</b></>
@@ -1541,193 +1720,192 @@ export default function TournamentPage() {
           <p className="tpText">No matchups found for this week.</p>
         ) : (
           <div className="tpHistoryList">
-            
+            {histMatchups.map((m) => {
+              const matchupKey = `hist-${historyWeekIndex}-${m.homeUserId}-${m.awayUserId}`;
+              const bdKey = `histbd-${historyWeekIndex}-${m.homeUserId}-${m.awayUserId}`;
+              const isOpen = openBreakdownKey === bdKey;
+
+              const homeUid = String(m.homeUserId);
+              const awayUid = String(m.awayUserId);
+
+              const homeUser = userById[m.homeUserId] || {
+                userId: m.homeUserId,
+                displayName: nameById[m.homeUserId] || m.homeUserId,
+                teamName: "",
+                photoURL: "",
+              };
+
+              const awayUser = userById[m.awayUserId] || {
+                userId: m.awayUserId,
+                displayName: nameById[m.awayUserId] || m.awayUserId,
+                teamName: "",
+                photoURL: "",
+              };
+
+              // ---- Breakdown helpers (local to this matchup) ----
+              // NOTE:
+              // - per-player breakdown is in breakdownByUserId[uid].perPlayer
+              // - bench list is in benchByUserId[uid]
+              // - starters list will only be in startersByUserId[uid] if you add it in functions;
+              //   otherwise we fallback to current lineup in userById[uid].starters
+              const getBD = (uid) => {
+                const u = userById?.[uid] || null;
+
+                const starters =
+                  histResults?.startersByUserId?.[uid] || u?.starters || [];
+
+                const bench =
+                  histResults?.benchByUserId?.[uid] || u?.bench || [];
+
+                const perPlayer =
+                  histResults?.breakdownByUserId?.[uid]?.perPlayer || {};
+
+                return { starters, bench, perPlayer };
+              };
+
+              const pidOf = (p) => String(p?.id ?? p?.playerId ?? p?.pid ?? "");
+              const nameOf = (p) => p?.name ?? p?.playerName ?? p?.fullName ?? "Player";
+              const posOf = (p) => p?.position ?? p?.pos ?? "";
+
+              const normalizeParts = (entry) => {
+                if (!entry || typeof entry !== "object") return null;
+                // most common: entry.breakdown (what your backend stores)
+                if (entry.breakdown && typeof entry.breakdown === "object") return entry.breakdown;
+                // sometimes: entry.parts
+                if (entry.parts && typeof entry.parts === "object") return entry.parts;
+                // sometimes: entry.stats (still useful)
+                if (entry.stats && typeof entry.stats === "object") return entry.stats;
+                return null;
+              };
+
+              const renderSide = (title, bd) => (
+                <div className="tpBreakdownCol">
+                  <div className="tpBreakdownColTitle">{title}</div>
+
+                  <div className="tpBreakdownSectionTitle">Starters</div>
+                  {(bd.starters || []).length ? (
+                    (bd.starters || []).map((p) => {
+                      const pid = pidOf(p);
+                      const entry = bd.perPlayer?.[pid] || bd.perPlayer?.[String(pid)] || null;
+                      const totalPts = Number(entry?.points ?? p?.pts ?? p?.points ?? p?.total ?? 0);
+                      const parts = normalizeParts(entry);
+
+                      return (
+                        <details key={`s-${title}-${pid}`} className="tpBreakdownPlayer">
+                          <summary className="tpBreakdownSummary">
+                            <span className="tpBreakdownName">{nameOf(p)}</span>
+                            <span className="tpBreakdownMeta">
+                              {posOf(p)} • {totalPts} pts
+                            </span>
+                          </summary>
+
+                          {parts ? (
+                            <div className="tpBreakdownParts">
+                              {Object.entries(parts)
+                                .filter(([, v]) => v != null && Number(v) !== 0)
+                                .map(([k, v]) => (
+                                  <div key={k} className="tpBreakdownPartRow">
+                                    <span className="tpBreakdownPartKey">{prettyStatLabel(k)}</span>
+                                    <span className="tpBreakdownPartVal">{String(v)}</span>
+                                  </div>
+                                ))}
+                            </div>
+                          ) : (
+                            <div className="tpBreakdownParts tpMuted">No stat breakdown saved</div>
+                          )}
+                        </details>
+                      );
+                    })
+                  ) : (
+                    <div className="tpMuted">No starters saved for this week</div>
+                  )}
+
+                  <div className="tpBreakdownSectionTitle">Bench (not counted)</div>
+                  {(bd.bench || []).length ? (
+                    (bd.bench || []).map((p) => {
+                      const pid = pidOf(p);
+                      const entry = bd.perPlayer?.[pid] || bd.perPlayer?.[String(pid)] || null;
+                      const totalPts = Number(entry?.points ?? p?.pts ?? p?.points ?? p?.total ?? 0);
+
+                      return (
+                        <details key={`b-${title}-${pid}`} className="tpBreakdownPlayer">
+                          <summary className="tpBreakdownSummary">
+                            <span className="tpBreakdownName">{nameOf(p)}</span>
+                            <span className="tpBreakdownMeta">
+                              {posOf(p)} • {totalPts} pts
+                            </span>
+                          </summary>
+
+                          {normalizeParts(entry) ? (
+                            <div className="tpBreakdownParts">
+                              {Object.entries(normalizeParts(entry))
+                                .filter(([, v]) => v != null && Number(v) !== 0)
+                                .map(([k, v]) => (
+                                  <div key={k} className="tpBreakdownPartRow">
+                                    <span className="tpBreakdownPartKey">{prettyStatLabel(k)}</span>
+                                    <span className="tpBreakdownPartVal">{String(v)}</span>
+                                  </div>
+                                ))}
+                            </div>
+                          ) : (
+                            <div className="tpBreakdownParts tpMuted">No stat breakdown saved</div>
+                          )}
+                        </details>
+                      );
+                    })
+                  ) : (
+                    <div className="tpMuted">No bench saved for this week</div>
+                  )}
+                </div>
+              );
+
+              const homeBD = getBD(homeUid);
+              const awayBD = getBD(awayUid);
+
+              return (
+                <div key={matchupKey} className="tpHistoryRowWrap">
+                  <div className="tpHistoryRow">
+                    <div className="tpHistoryTeams">
+                      <UserChip user={homeUser} />
+                      <span className="tpVs">vs</span>
+                      <UserChip user={awayUser} />
+                    </div>
+
+                    <div className="tpHistoryScore">
+                      <span className="tpMatchScore">
+                        {Number(m.homeTotal ?? 0)} — {Number(m.awayTotal ?? 0)}
+                      </span>
+                      <span className="tpHistoryResult">
+                        {m.homeResult}/{m.awayResult}
+                      </span>
+
+                      <button
+                        type="button"
+                        className="tpMiniBtn"
+                        onClick={() => setOpenBreakdownKey(isOpen ? null : bdKey)}
+                        style={{ marginLeft: 10 }}
+                      >
+                        {isOpen ? "Hide" : "Breakdown"}
+                      </button>
+                    </div>
+                  </div>
+
+                  {isOpen && (
+                    <div className="tpBreakdownWrap">
+                      <div className="tpBreakdownCols">
+                        {renderSide("Home", homeBD)}
+                        {renderSide("Away", awayBD)}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
           </div>
         )}
       </>
     )}
   </div>
-    {histMatchups.map((m) => {
-      const matchupKey = `hist-${historyWeekIndex}-${m.homeUserId}-${m.awayUserId}`;
-      const bdKey = `histbd-${historyWeekIndex}-${m.homeUserId}-${m.awayUserId}`;
-      const isOpen = openBreakdownKey === bdKey;
-
-      const homeUid = String(m.homeUserId);
-      const awayUid = String(m.awayUserId);
-
-      const homeUser = userById[m.homeUserId] || {
-        userId: m.homeUserId,
-        displayName: nameById[m.homeUserId] || m.homeUserId,
-        teamName: "",
-        photoURL: "",
-      };
-
-      const awayUser = userById[m.awayUserId] || {
-        userId: m.awayUserId,
-        displayName: nameById[m.awayUserId] || m.awayUserId,
-        teamName: "",
-        photoURL: "",
-      };
-
-      // ---- Breakdown helpers (local to this matchup) ----
-      // NOTE:
-      // - per-player breakdown is in breakdownByUserId[uid].perPlayer
-      // - bench list is in benchByUserId[uid]
-      // - starters list will only be in startersByUserId[uid] if you add it in functions;
-      //   otherwise we fallback to current lineup in userById[uid].starters
-      const getBD = (uid) => {
-        const u = userById?.[uid] || null;
-
-        const starters =
-          histResults?.startersByUserId?.[uid] || u?.starters || [];
-
-        const bench =
-          histResults?.benchByUserId?.[uid] || u?.bench || [];
-
-        const perPlayer =
-          histResults?.breakdownByUserId?.[uid]?.perPlayer || {};
-
-        return { starters, bench, perPlayer };
-      };
-
-      const pidOf = (p) => String(p?.id ?? p?.playerId ?? p?.pid ?? "");
-      const nameOf = (p) => p?.name ?? p?.playerName ?? p?.fullName ?? "Player";
-      const posOf = (p) => p?.position ?? p?.pos ?? "";
-
-      const normalizeParts = (entry) => {
-        if (!entry || typeof entry !== "object") return null;
-        // most common: entry.breakdown (what your backend stores)
-        if (entry.breakdown && typeof entry.breakdown === "object") return entry.breakdown;
-        // sometimes: entry.parts
-        if (entry.parts && typeof entry.parts === "object") return entry.parts;
-        // sometimes: entry.stats (still useful)
-        if (entry.stats && typeof entry.stats === "object") return entry.stats;
-        return null;
-      };
-
-      const renderSide = (title, bd) => (
-        <div className="tpBreakdownCol">
-          <div className="tpBreakdownColTitle">{title}</div>
-
-          <div className="tpBreakdownSectionTitle">Starters</div>
-          {(bd.starters || []).length ? (
-            (bd.starters || []).map((p) => {
-              const pid = pidOf(p);
-              const entry = bd.perPlayer?.[pid] || bd.perPlayer?.[String(pid)] || null;
-              const totalPts = Number(entry?.points ?? p?.pts ?? p?.points ?? p?.total ?? 0);
-              const parts = normalizeParts(entry);
-
-              return (
-                <details key={`s-${title}-${pid}`} className="tpBreakdownPlayer">
-                  <summary className="tpBreakdownSummary">
-                    <span className="tpBreakdownName">{nameOf(p)}</span>
-                    <span className="tpBreakdownMeta">
-                      {posOf(p)} • {totalPts} pts
-                    </span>
-                  </summary>
-
-                  {parts ? (
-                    <div className="tpBreakdownParts">
-                      {Object.entries(parts)
-                        .filter(([, v]) => v != null && Number(v) !== 0)
-                        .map(([k, v]) => (
-                          <div key={k} className="tpBreakdownPartRow">
-                            <span className="tpBreakdownPartKey">{prettyStatLabel(k)}</span>
-                            <span className="tpBreakdownPartVal">{String(v)}</span>
-                          </div>
-                        ))}
-                    </div>
-                  ) : (
-                    <div className="tpBreakdownParts tpMuted">No stat breakdown saved</div>
-                  )}
-                </details>
-              );
-            })
-          ) : (
-            <div className="tpMuted">No starters saved for this week</div>
-          )}
-
-          <div className="tpBreakdownSectionTitle">Bench (not counted)</div>
-          {(bd.bench || []).length ? (
-            (bd.bench || []).map((p) => {
-              const pid = pidOf(p);
-              const entry = bd.perPlayer?.[pid] || bd.perPlayer?.[String(pid)] || null;
-              const totalPts = Number(entry?.points ?? p?.pts ?? p?.points ?? p?.total ?? 0);
-
-              return (
-                <details key={`b-${title}-${pid}`} className="tpBreakdownPlayer">
-                  <summary className="tpBreakdownSummary">
-                    <span className="tpBreakdownName">{nameOf(p)}</span>
-                    <span className="tpBreakdownMeta">
-                      {posOf(p)} • {totalPts} pts
-                    </span>
-                  </summary>
-
-                  {normalizeParts(entry) ? (
-                    <div className="tpBreakdownParts">
-                      {Object.entries(normalizeParts(entry))
-                        .filter(([, v]) => v != null && Number(v) !== 0)
-                        .map(([k, v]) => (
-                          <div key={k} className="tpBreakdownPartRow">
-                            <span className="tpBreakdownPartKey">{prettyStatLabel(k)}</span>
-                            <span className="tpBreakdownPartVal">{String(v)}</span>
-                          </div>
-                        ))}
-                    </div>
-                  ) : (
-                    <div className="tpBreakdownParts tpMuted">No stat breakdown saved</div>
-                  )}
-                </details>
-              );
-            })
-          ) : (
-            <div className="tpMuted">No bench saved for this week</div>
-          )}
-        </div>
-      );
-
-      const homeBD = getBD(homeUid);
-      const awayBD = getBD(awayUid);
-
-      return (
-        <div key={matchupKey} className="tpHistoryRowWrap">
-          <div className="tpHistoryRow">
-            <div className="tpHistoryTeams">
-              <UserChip user={homeUser} />
-              <span className="tpVs">vs</span>
-              <UserChip user={awayUser} />
-            </div>
-
-            <div className="tpHistoryScore">
-              <span className="tpMatchScore">
-                {Number(m.homeTotal ?? 0)} — {Number(m.awayTotal ?? 0)}
-              </span>
-              <span className="tpHistoryResult">
-                {m.homeResult}/{m.awayResult}
-              </span>
-
-              <button
-                type="button"
-                className="tpMiniBtn"
-                onClick={() => setOpenBreakdownKey(isOpen ? null : bdKey)}
-                style={{ marginLeft: 10 }}
-              >
-                {isOpen ? "Hide" : "Breakdown"}
-              </button>
-            </div>
-          </div>
-
-          {isOpen && (
-            <div className="tpBreakdownWrap">
-              <div className="tpBreakdownCols">
-                {renderSide("Home", homeBD)}
-                {renderSide("Away", awayBD)}
-              </div>
-            </div>
-          )}
-        </div>
-      );
-    })}
 
   </div>
     </div>
@@ -1780,7 +1958,7 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
           <span className="tpStatsHead">Points</span>
           {Object.entries(breakdown || {}).map(([k, v]) => (
             <div key={k} className="tpStatRow">
-              <span>{labels[k] || k}</span>
+              <span>{prettyStatLabel(k)}</span>
               <span className={v > 0 ? "tpPos" : "tpNeg"}>
                 {v > 0 ? "+" : ""}{v}
               </span>

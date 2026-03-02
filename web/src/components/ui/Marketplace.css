@@ -403,3 +403,44 @@
   font-size: 12px;
   opacity: 0.75;
 }
+/* Keep inputs inside the card on mobile (padding/border included in width) */
+.marketCard,
+.marketCard * ,
+.marketCard *::before,
+.marketCard *::after {
+  box-sizing: border-box;
+}
+
+/* Grid children MUST be allowed to shrink and NEVER expand past 100% */
+.marketHostGrid > div {
+  min-width: 0;
+  max-width: 100%; 
+}
+
+/* On desktop, make the 1fr columns shrinkable */
+@media (min-width: 768px) {
+  .marketHostGrid {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  }
+}
+
+/* ---------------------------------------------------- */
+/* MOBILE OVERFLOW FIX FOR INPUTS                       */
+/* ---------------------------------------------------- */
+
+/* Force all inputs to strictly respect the border-box model */
+.marketCard .marketInput,
+.marketCard .marketSelect,
+.marketCard .marketNum {
+  max-width: 100%;
+  box-sizing: border-box !important;
+}
+
+/* Extra safety specifically for datetime-local mobile stretching */
+.marketInputDate {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box !important;
+}

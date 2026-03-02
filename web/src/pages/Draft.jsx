@@ -97,6 +97,7 @@ function displayNameOf(m, fallback = "User") {
   return m?.displayName || m?.uid || fallback;
 }
 
+
 function formatWhen(ms) {
   if (!ms) return "";
   return new Date(ms).toLocaleString([], {
@@ -237,6 +238,65 @@ export default function DraftWithPresence() {
   const [search, setSearch] = useState("");
   const [allPicksPos, setAllPicksPos] = useState("ALL");
   const [allPicksQuery, setAllPicksQuery] = useState("");
+  const [memberLabelByUid, setMemberLabelByUid] = useState({});
+  const managerLabel = (uid, fallback = "Someone") => {
+    const key = String(uid || "");
+    return memberLabelByUid[key] || fallback;
+  };
+
+  const membersKey = useMemo(() => (members || []).join("|"), [members]);
+
+useEffect(() => {
+  if (!roomId || !members?.length) {
+    setMemberLabelByUid({});
+    return;
+  }
+
+  const unsubs = [];
+  const nameBy = {};
+  const teamBy = {};
+
+  const recompute = () => {
+    const out = {};
+    for (const uid of members) {
+      const base = (nameBy[uid] || uid).trim();
+      const team = (teamBy[uid] || "").trim();
+      out[uid] = team ? `${base} — ${team}` : base;
+    }
+    setMemberLabelByUid(out);
+  };
+
+  for (const uid of members) {
+    // chosen display name (your app) -> fallback to google name -> uid
+    unsubs.push(
+      onSnapshot(
+        doc(db, "users", uid),
+        (snap) => {
+          const d = snap.exists() ? snap.data() : {};
+          nameBy[uid] = (d.displayName || d.name || d.fullName || "").trim() || uid;
+          recompute();
+        },
+        () => {}
+      )
+    );
+
+    // optional: team name doc (since you already use team names elsewhere)
+    unsubs.push(
+      onSnapshot(
+        doc(db, "rooms", roomId, "teamNames", uid),
+        (snap) => {
+          const d = snap.exists() ? snap.data() : {};
+          teamBy[uid] = (d.teamName || "").trim();
+          recompute();
+        },
+        () => {}
+      )
+    );
+  }
+
+  recompute();
+  return () => unsubs.forEach((fn) => fn && fn());
+}, [roomId, membersKey]);
 
   // Countdown + auto-pick
   const [timeLeft, setTimeLeft] = useState(TURN_SECONDS);
@@ -275,7 +335,14 @@ export default function DraftWithPresence() {
 
     const unsubRoom = watchRoom(roomId, (data) => {
       setRoom(data);
-      setMembers(Array.isArray(data?.members) ? data.members : []);
+      setMembers(
+        Array.isArray(data?.members)
+          ? data.members
+              .map((m) => (typeof m === "string" ? m : m?.uid ?? m?.userId ?? m?.id))
+              .filter(Boolean)
+              .map(String)
+          : []
+      );
     });
 
     // Auto-join when signed-in & roomId present
@@ -510,7 +577,7 @@ export default function DraftWithPresence() {
     for (const p of picks || []) {
       // adapt if your pick object uses a different key than playerId
       map.set(String(p.playerId), {
-        managerName: p.displayName || "Someone",
+        managerName: managerLabel(p.uid, p.displayName || "Someone"),
         turn: p.turn,
         round: p.round,
       });
@@ -519,8 +586,6 @@ export default function DraftWithPresence() {
   }, [picks]);
 
   const isPlayerDrafted = (playerId) => draftedByPlayerId.has(String(playerId));
-
-
 
   // Who is on the clock (snake)
   const currentPicker = useMemo(() => {
@@ -582,7 +647,7 @@ export default function DraftWithPresence() {
       if (!q) return true;
 
       const player = String(p.playerName || "").toLowerCase();
-      const manager = String(p.displayName || "").toLowerCase();
+      const manager = String(managerLabel(p.uid, p.displayName || "")).toLowerCase();
 
       return player.includes(q) || manager.includes(q);
     });
@@ -596,7 +661,7 @@ export default function DraftWithPresence() {
 
     for (const p of picks || []) {
       const player = String(p.playerName || "");
-      const manager = String(p.displayName || "");
+      const manager = String(managerLabel(p.uid, p.displayName || ""));
 
       if (player.toLowerCase().includes(q)) set.add(player);
       if (manager.toLowerCase().includes(q)) set.add(manager);
@@ -1167,6 +1232,7 @@ export default function DraftWithPresence() {
                 <ol className="text-sm space-y-1 max-h-[40vh] overflow-auto">
                   {filteredPicks.map((p) => {
                     const isMine = p.uid === user?.uid;
+                    const mgr = managerLabel(p.uid, p.displayName || "Someone");
 
                     return (
                       <li
@@ -1178,9 +1244,9 @@ export default function DraftWithPresence() {
                           <span
                             className="pickManagerPill"
                             style={managerPillStyle(p.uid, isMine)}
-                            title={isMine ? "Your pick" : p.displayName}
+                            title={isMine ? "Your pick" : mgr}
                           >
-                            {p.displayName}
+                            {mgr}
                           </span>{" "}
                           picked <b>{p.playerName}</b>{" "}
                           <span className="opacity-70">({p.position})</span>

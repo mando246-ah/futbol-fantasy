@@ -1,0 +1,131 @@
+/* src/components/ui/FinalResultsCard/FinalResultsCard.css */
+
+.ffFinalCard {
+  width: 100%;
+}
+
+/* top row */
+.ffFinalTop {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 24px; 
+}
+
+.ffFinalTitle {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 900;
+  letter-spacing: 0.02em;
+}
+
+.ffFinalSub {
+  margin-top: 4px;
+  font-size: 13px;
+  opacity: 0.75;
+}
+
+.ffFinalBadge {
+  font-size: 30px;
+  line-height: 1;
+  padding: 10px 12px;
+  border-radius: 16px;
+  border: 1px solid rgba(255,255,255,0.14);
+  background: rgba(0,0,0,0.18);
+}
+
+/* podium layout */
+.ffPodium {
+  display: grid;
+  grid-template-columns: 1fr 1.1fr 1fr;
+  gap: 16px;
+  align-items: end;
+}
+
+@media (max-width: 900px) {
+  .ffPodium {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* podium spot base */
+.ffPodiumSpot {
+  border-radius: 16px;
+  padding: 16px;
+  min-height: 140px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  position: relative;
+  overflow: hidden;
+  transition: transform 0.2s ease;
+}
+
+
+/* --- METALLIC GOLD --- */
+.ffPodiumSpot.gold {
+  transform: translateY(-15px);
+  border: 2px solid #ffd700;
+  background: linear-gradient(135deg, rgba(255, 215, 0, 0.25) 0%, rgba(218, 165, 32, 0.1) 100%);
+  box-shadow: 0 8px 20px rgba(255, 215, 0, 0.25), inset 0 0 15px rgba(255, 215, 0, 0.15);
+}
+
+.ffPodiumSpot.gold .ffPodiumPlace {
+  background: linear-gradient(135deg, #ffd700, #daa520);
+  color: #000;
+  border: none;
+  box-shadow: 0 2px 8px rgba(218, 165, 32, 0.6);
+}
+
+/* --- METALLIC SILVER --- */
+.ffPodiumSpot.silver {
+  border: 2px solid #e2e8f0;
+  background: linear-gradient(135deg, rgba(226, 232, 240, 0.25) 0%, rgba(148, 163, 184, 0.1) 100%);
+  box-shadow: 0 8px 20px rgba(148, 163, 184, 0.2), inset 0 0 15px rgba(226, 232, 240, 0.1);
+}
+.ffPodiumSpot.silver .ffPodiumPlace {
+  background: linear-gradient(135deg, #ffffff, #94a3b8);
+  color: #000;
+  border: none;
+  box-shadow: 0 2px 8px rgba(148, 163, 184, 0.6);
+}
+
+/* --- METALLIC BRONZE --- */
+.ffPodiumSpot.bronze {
+  border: 2px solid #cd7f32;
+  background: linear-gradient(135deg, rgba(205, 127, 50, 0.25) 0%, rgba(139, 69, 19, 0.1) 100%);
+  box-shadow: 0 8px 20px rgba(205, 127, 50, 0.25), inset 0 0 15px rgba(205, 127, 50, 0.15);
+}
+.ffPodiumSpot.bronze .ffPodiumPlace {
+  background: linear-gradient(135deg, #fcd0aa, #cd7f32);
+  color: #000;
+  border: none;
+  box-shadow: 0 2px 8px rgba(139, 69, 19, 0.6);
+}
+
+/* Typography */
+.ffPodiumPlace {
+  align-self: flex-start;
+  font-size: 13px;
+  font-weight: 900;
+  letter-spacing: 0.10em;
+  text-transform: uppercase;
+  padding: 6px 12px;
+  border-radius: 999px;
+}
+
+.ffPodiumName {
+  font-size: 16px;
+  font-weight: 900;
+  margin-top: 4px;
+}
+
+.ffPodiumMeta {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  opacity: 0.9;
+  margin-top: auto;
+}

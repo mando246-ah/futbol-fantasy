@@ -1,6 +1,6 @@
-# Football Fantasy
+# Fútball Fantasy
 
-A fantasy football web app with real-time rooms/leagues, drafting, and a marketplace built with React + Firebase. App will similar to NFL Draft but with soccer in mind. 
+A fantasy fútball web app with real-time rooms/leagues, drafting, and a marketplace built with React + Firebase. App will similar to NFL Draft but with soccer in mind. 
 This is a work in progress app with mock stats and players
 
 ## Live Demo

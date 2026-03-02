@@ -85,6 +85,56 @@ export default function Home() {
             </div>
           </div>
 
+          {/* Regular Season vs Cup */}
+          <div className="homeModeArea">
+            <div className="homeModeHeaderRow">
+              <h3 className="homeModeHeader">Regular Season vs Cup</h3>
+              <p className="homeModeHeaderHint">Two formats. Two vibes.</p>
+            </div>
+
+            <div className="homeModeWrap">
+              <div className="homeModeGrid">
+                <div className="homeModeCard">
+                  <div className="homeModeTopRow">
+                    <h4 className="homeModeTitle">Regular Season</h4>
+                    <span className="homeModePill">Head-to-Head</span>
+                  </div>
+                  <p className="homeModeText">
+                    Weekly matchups where you face a new opponent each week.
+                    Build your Starting XI, manage your bench, and climb the standings.
+                  </p>
+                  <ul className="homeModeList">
+                    <li>1v1 round-robin style matchups</li>
+                    <li>Wins &amp; tie-breakers tracked on a leaderboard</li>
+                    <li>Only the Starting XI scores</li>
+                    <li>Host controls Transfer Market</li>
+                    <li>Most win weeks wins</li>
+                  </ul>
+                </div>
+
+                <div className="homeModeCard">
+                  <div className="homeModeTopRow">
+                    <h4 className="homeModeTitle">Cups</h4>
+                    <span className="homeModePill">Everyone vs Everyone</span>
+                  </div>
+                  <p className="homeModeText">
+                    Fast-paced scoring windows where everyone competes at once.
+                    Build your Starting XI, bigger bench, your strategy matters more than ever.
+                  </p>
+                  <ul className="homeModeList">
+                    <li>Daily / short-window leaderboards</li>
+                    <li>Top 3 earn bonus points per window</li>
+                    <li>More picks, more decisions</li>
+                    <li>Host controls Transfer Market</li>
+                    <li>Most Fantasy points wins</li>
+                  </ul>
+                </div>
+              </div>
+
+              <div className="homeModeVs" aria-hidden="true">VS</div>
+            </div>
+          </div>
+
           <div className="homeSectionCtaRow">
             <button
               className="homeBtn homeBtnPrimary"
