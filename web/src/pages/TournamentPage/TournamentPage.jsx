@@ -11,6 +11,7 @@ import { Avatar, AvatarImage, AvatarFallback } from "../../components/ui/avatar"
 import { httpsCallable } from "firebase/functions"; 
 import { functions } from "../../firebase";
 import FinalResultsCard from "../../components/ui/FinalResultsCard";
+import FlagIcon from "../../components/FlagIcon";
 
 //Labels for stats
 const STAT_LABELS = {
@@ -155,6 +156,35 @@ function getStartersList(activeResults, uid, userObj) {
   if (Array.isArray(fromResults)) return fromResults;
 
   return [];
+}
+
+const DISPLAY_POS_ORDER = {
+  ATT: 0,
+  MID: 1,
+  DEF: 2,
+  GK: 3,
+};
+
+function normalizeDisplayPos(pos) {
+  const p = String(pos || "").toUpperCase().trim();
+
+  if (["ATT", "ATK", "FWD", "FW", "ST", "CF", "LW", "RW"].includes(p)) return "ATT";
+  if (["MID", "CM", "CDM", "CAM", "LM", "RM"].includes(p)) return "MID";
+  if (["DEF", "CB", "LB", "RB", "LWB", "RWB"].includes(p)) return "DEF";
+  if (["GK", "G"].includes(p)) return "GK";
+
+  return p;
+}
+
+function sortPlayersForDisplay(list = []) {
+  return [...list].sort((a, b) => {
+    const aRank = DISPLAY_POS_ORDER[normalizeDisplayPos(playerPosOf(a))] ?? 99;
+    const bRank = DISPLAY_POS_ORDER[normalizeDisplayPos(playerPosOf(b))] ?? 99;
+
+    if (aRank !== bRank) return aRank - bRank;
+
+    return playerNameOf(a).localeCompare(playerNameOf(b));
+  });
 }
 
 function pointsFromEntry(entry) {
@@ -330,6 +360,22 @@ export default function TournamentPage() {
       const val = Number(trNested || trLiteral || trComp || 0);
       return val > 0 ? val : null;
     })();
+
+  const competitionName =
+    data?.room?.competitionMeta?.name ||
+    data?.room?.competition?.name ||
+    "";
+
+  const competitionSeason =
+    data?.room?.competition?.season ||
+    data?.room?.competitionMeta?.season ||
+    "";
+
+  const competitionLabel = [competitionSeason, competitionName]
+    .filter(Boolean)
+    .join(" ");
+
+  
 
   //Add previous weeeks 
   const [repairing, setRepairing] = useState(false);
@@ -737,7 +783,11 @@ export default function TournamentPage() {
           <div className="tpHeaderRow">
             <div className="tpHeaderLeft">
               <h2 className="tpTitle">Tournament</h2>
-
+              {competitionLabel ? (
+                <div className="tpRoomMeta">
+                  Competition: <b>{competitionLabel}</b>
+                </div>
+              ) : null}
               <p className="tpText">
                 Room: <b>{roomId}</b>
                 {currentWeekIndex != null ? (
@@ -929,22 +979,34 @@ export default function TournamentPage() {
       <div className="tpHeaderRow">
         <div className="tpHeaderLeft">
           <h2 className="tpTitle">Tournament</h2>
-
-          {weekDoc && (
-            <p className="tpText">
-              Window: <b>{fmtDT(weekDoc.startAtMs)}</b> → <b>{fmtDT(weekDoc.endAtMs)}</b>
-              {weekDoc.roundLabel ? (
-                <>
-                  {" "}
-                  • Round: <b>{weekDoc.roundLabel}</b>
-                  {totalRoundsDisplay ? <> / <b>{totalRoundsDisplay}</b></> : null}
-                </>
-              ) : null}
-            </p>
-          )}
-
-          {/* ✅ MOVE THIS UNDER WINDOW */}
           <div className="tpHeaderMetaBlock">
+            {competitionLabel ? (
+              <div className="tpRoomMeta">
+                Competition:{" "}
+                <b className="tpCompetitionLabel">
+                  <FlagIcon
+                    country={data?.room?.competitionMeta?.country}
+                    size={16}
+                    title={data?.room?.competitionMeta?.country}
+                  />{" "}
+                  {competitionLabel}
+                </b>
+              </div>
+            ) : null}
+
+            {weekDoc && (
+              <div className="tpRoomMeta">
+                Window: <b>{fmtDT(weekDoc.startAtMs)}</b> → <b>{fmtDT(weekDoc.endAtMs)}</b>
+                {weekDoc.roundLabel ? (
+                  <>
+                    {" "}
+                    • Round: <b>{weekDoc.roundLabel}</b>
+                    {totalRoundsDisplay ? <> / <b>{totalRoundsDisplay}</b></> : null}
+                  </>
+                ) : null}
+              </div>
+            )}
+
             <div className="tpRoomMeta">
               Room: <b>{roomId}</b>
               {currentWeekIndex != null ? (
@@ -953,7 +1015,6 @@ export default function TournamentPage() {
                   • Week: <b>{currentWeekIndex}</b>
                 </>
               ) : null}{" "}
-              • Your Total: <b>{myTotal}</b>
             </div>
 
             <div className="tpLiveHeaderLine">
@@ -971,6 +1032,7 @@ export default function TournamentPage() {
               )}
             </div>
           </div>
+          
         </div>
 
         {/* ✅ RIGHT SIDE = ONLY BUTTONS */}
@@ -1145,7 +1207,7 @@ export default function TournamentPage() {
           </div>
           <div className="tpSectionLabel">Starters</div>
           <ul className="tpList">
-            { getStartersList(activeResults, me?.userId, me).map((p) => {
+            { sortPlayersForDisplay(getStartersList(activeResults, me?.userId, me)).map((p) => {
               const entry = myBreakdown?.perPlayer?.[p.id];
               const pts = typeof entry === "number" ? entry : entry?.points ?? 0;
               const breakdown = typeof entry === "object" ? entry?.breakdown : {};
@@ -1166,7 +1228,7 @@ export default function TournamentPage() {
 
                     {/* COLUMN 2: Position + Status Badges (MERGED INTO ONE DIV) */}
                     <div className="tpMeta">
-                      {p.position}
+                      {normalizeDisplayPos(p.position)}
                       <span className={`tpLivePill ${stats?.isLive ? "live" : "idle"}`}>
                         {stats?.isLive ? "LIVE" : "IDLE"}
                       </span>
@@ -1223,7 +1285,7 @@ export default function TournamentPage() {
                         </div>
 
                         <div className="tpMeta">
-                          {p.position}
+                          {normalizeDisplayPos(p.position)}
                           <span className={`tpLivePill ${stats?.isLive ? "live" : "idle"}`}>
                             {stats?.isLive ? "LIVE" : "IDLE"}
                           </span>
@@ -1257,7 +1319,7 @@ export default function TournamentPage() {
           </div>
           <div className="tpSectionLabel">Starters</div>
           <ul className="tpList">
-            { getStartersList(activeResults, opponentUid, opponent).map((p) => {
+            { sortPlayersForDisplay(getStartersList(activeResults, opponentUid, opponent)).map((p) => {
               const entry = oppBreakdown?.perPlayer?.[p.id];
               const pts = typeof entry === "number" ? entry : entry?.points ?? 0;
               const breakdown = typeof entry === "object" ? entry?.breakdown : {};
@@ -1278,7 +1340,7 @@ export default function TournamentPage() {
 
                     {/* 2. Position Pill */}
                     <div className="tpMeta">
-                      {p.position}
+                      {normalizeDisplayPos(p.position)}
                       <span className={`tpLivePill ${stats?.isLive ? "live" : "idle"}`}>
                         {stats?.isLive ? "LIVE" : "IDLE"}
                       </span>
@@ -1334,7 +1396,7 @@ export default function TournamentPage() {
                         </div>
 
                         <div className="tpMeta">
-                          {p.position}
+                          {normalizeDisplayPos(p.position)}
                           <span className={`tpLivePill ${stats?.isLive ? "live" : "idle"}`}>
                             {stats?.isLive ? "LIVE" : "IDLE"}
                           </span>
@@ -1448,7 +1510,7 @@ export default function TournamentPage() {
                     </div>
                     <div className="tpSectionLabel">Starters</div>
                     <ul className="tpList">
-                      {(homeUserFull?.starters || []).map((p) => {
+                      {sortPlayersForDisplay(homeUserFull?.starters || []).map((p) => {
                         const entry = homeBreakdown?.perPlayer?.[p.id];
                         const pts = typeof entry === "number" ? entry : entry?.points ?? 0;
                         const breakdown = typeof entry === "object" ? entry?.breakdown : {};
@@ -1468,7 +1530,7 @@ export default function TournamentPage() {
                               </div>
 
                               <div className="tpMeta">
-                                {p.position}
+                                {normalizeDisplayPos(p.position)}
                                 <span className={`tpLivePill ${stats?.isLive ? "live" : "idle"}`}>
                                   {stats?.isLive ? "LIVE" : "IDLE"}
                                 </span>
@@ -1522,7 +1584,7 @@ export default function TournamentPage() {
                                   </div>
 
                                   <div className="tpMeta">
-                                    {p.position}
+                                    {normalizeDisplayPos(p.position)}
                                     <span className={`tpLivePill ${stats?.isLive ? "live" : "idle"}`}>
                                       {stats?.isLive ? "LIVE" : "IDLE"}
                                     </span>
@@ -1557,7 +1619,7 @@ export default function TournamentPage() {
                     </div>
                     <div className="tpSectionLabel">Starters</div>
                     <ul className="tpList">
-                      {(awayUserFull?.starters || []).map((p) => {
+                      {sortPlayersForDisplay(awayUserFull?.starters || []).map((p) => {
                         const entry = awayBreakdown?.perPlayer?.[p.id];
                         const pts = typeof entry === "number" ? entry : entry?.points ?? 0;
                         const breakdown = typeof entry === "object" ? entry?.breakdown : {};
@@ -1577,7 +1639,7 @@ export default function TournamentPage() {
                               </div>
 
                               <div className="tpMeta">
-                                {p.position}
+                                {normalizeDisplayPos(p.position)}
                                 <span className={`tpLivePill ${stats?.isLive ? "live" : "idle"}`}>
                                   {stats?.isLive ? "LIVE" : "IDLE"}
                                 </span>
@@ -1632,7 +1694,7 @@ export default function TournamentPage() {
                                   </div>
 
                                   <div className="tpMeta">
-                                    {p.position}
+                                    {normalizeDisplayPos(p.position)}
                                     <span className={`tpLivePill ${stats?.isLive ? "live" : "idle"}`}>
                                       {stats?.isLive ? "LIVE" : "IDLE"}
                                     </span>

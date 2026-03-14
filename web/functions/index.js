@@ -510,14 +510,14 @@ function extractStarters(lineupData) {
   if (!lineupData) return [];
 
   const candidates = [
-    lineupData.starters,
     lineupData.startingXI,
     lineupData.starting11,
+    lineupData.starters,
     lineupData.starterIds,
     lineupData.startingIds,
-    lineupData.lineup?.starters,
     lineupData.lineup?.startingXI,
     lineupData.lineup?.starting11,
+    lineupData.lineup?.starters,
   ];
 
   for (const c of candidates) {
@@ -1190,15 +1190,17 @@ exports.getUserLockStatus = onCall(
     const timezone = String(competition.timezone || "America/Los_Angeles");
 
     // 2) Get THIS user's STARTING XI (lock only if starters are live)
+    // 2) Get THIS user's ENTIRE ROSTER
     const lineupSnap = await db.doc(`rooms/${roomId}/lineups/${uid}`).get();
     const lineup = lineupSnap.exists ? (lineupSnap.data() || null) : null;
 
-    // uses your helper above
     const starters = extractStarters(lineup);
+    const bench = extractBench(lineup);
+    const allRoster = [...starters, ...bench]; // COMBINE THEM
 
-    // collect starter teamIds (prefer apiTeamId/teamId)
+    // collect teamIds from the whole roster
     const myTeamIds = new Set(
-      starters
+      allRoster
         .map((p) => p.apiTeamId ?? p.teamId ?? null)
         .filter((x) => x != null)
         .map((x) => Number(x))
@@ -1211,15 +1213,10 @@ exports.getUserLockStatus = onCall(
         locked: false,
         nowMs,
         livePlayers: [],
-        checkedPlayers: starters.length,
+        checkedPlayers: allRoster.length,
         provider: "api-football",
-        note: "No starter teamIds found yet (startingXI missing teamId/apiTeamId).",
       };
     }
-
-
-    
-
 
     // 3) Cached live fixtures for competition
     async function getLiveFixturesCached() {
@@ -1280,7 +1277,7 @@ exports.getUserLockStatus = onCall(
     }
 
     // 5) Build a "livePlayers" list for UI (players whose team is currently live)
-    const livePlayers = starters
+    const livePlayers = allRoster // <- USE allRoster HERE
       .filter((p) => {
         const tid = Number(p.apiTeamId ?? p.teamId ?? NaN);
         return Number.isFinite(tid) && liveTeamIds.has(tid);
@@ -2454,7 +2451,7 @@ async function computeAndWriteLiveWeek({ roomId, weekIndex, apiKey }) {
     const ko = kickoffMsByFixtureId[fid] ?? null;
 
     const ttlMs = inPlay ? LIVE_TTL_MS : (isFinished(short) ? FINISHED_TTL_MS : LIVE_TTL_MS);
-    const map = await getFixturePlayersStatsMapCached({ fixtureId: fid, apiKey, ttlMs, timeZone });
+    const map = await getFixturePlayersStatsMapCached({ fixtureId: fid, apiKey, ttlMs, timeZone: timezone });
 
     for (const [pidRaw, st] of Object.entries(map || {})) {
       const pid = String(pidRaw);
@@ -2540,22 +2537,74 @@ async function computeAndWriteLiveWeek({ roomId, weekIndex, apiKey }) {
   }
 
   // 4) Score users (starters count; bench shows points but does NOT add to totals)
+  // 4) Score users (Accumulator Logic)
   const totalsByUid = {};
   const breakdownByUserId = {};
+  const newActiveScorers = {};
+  const finalStartersByUserId = {};
+  const finalBenchByUserId = {};
 
   for (const u of users) {
-    const starterStats = {};
+    // 1. Get previously locked-in scorers from this week
+    const activeSet = new Set(prevResults.activeScorers?.[u.userId] || []);
+
+    // 2. Lock in any CURRENT starters whose match has officially started
     for (const p of (u.starters || [])) {
+      const pid = String(p.id);
+      const st = aggStatsByPlayerId[pid];
+      // If we have stats and the match is not "Not Started", lock them!
+      const hasStarted = st && st.fixtureStatus && st.fixtureStatus !== "NS";
+      
+      if (hasStarted) {
+        activeSet.add(pid);
+      }
+    }
+    newActiveScorers[u.userId] = Array.from(activeSet);
+
+    // 3. Build Effective Starters (Locked-in scorers + Current valid starters)
+    const effectiveStarters = [];
+    const addedIds = new Set();
+
+    // First, add everyone who is locked in to score
+    for (const pid of activeSet) {
+      // playersById is defined earlier in your compute function
+      const pObj = playersById.get(pid) || { id: pid, name: "Unknown", position: "MID" };
+      effectiveStarters.push(pObj);
+      addedIds.add(pid);
+    }
+
+    // Next, add current starters whose games haven't started yet
+    for (const p of (u.starters || [])) {
+      const pid = String(p.id);
+      if (!addedIds.has(pid)) {
+        effectiveStarters.push(p);
+        addedIds.add(pid);
+      }
+    }
+    finalStartersByUserId[u.userId] = effectiveStarters;
+
+    // 4. Build Effective Bench (Remove anyone who was upgraded to an Effective Starter)
+    const effectiveBench = [];
+    for (const p of (u.bench || [])) {
+      if (!addedIds.has(String(p.id))) {
+        effectiveBench.push(p);
+      }
+    }
+    finalBenchByUserId[u.userId] = effectiveBench;
+
+    // 5. Extract Stats and Score!
+    const starterStats = {};
+    for (const p of effectiveStarters) {
       starterStats[String(p.id)] = aggStatsByPlayerId[String(p.id)] || {};
     }
 
     const benchStats = {};
-    for (const p of (u.bench || [])) {
+    for (const p of effectiveBench) {
       benchStats[String(p.id)] = aggStatsByPlayerId[String(p.id)] || {};
     }
 
-    const starterScored = scoreTeam(u.starters || [], starterStats);
-    const benchScored = scoreTeam(u.bench || [], benchStats);
+    const starterScored = scoreTeam(effectiveStarters, starterStats);
+    const benchScored = scoreTeam(effectiveBench, benchStats);
 
     totalsByUid[u.userId] = starterScored.total;
 
@@ -2565,7 +2614,6 @@ async function computeAndWriteLiveWeek({ roomId, weekIndex, apiKey }) {
       benchTotal: benchScored.total,
     };
   }
-
 
   // Guard (per-user): never drop an individual user's total from >0 to 0 mid-week due to a partial API payload.
   // This happens when the API returns stats for some fixtures/players but not others on a given poll.
@@ -2588,19 +2636,35 @@ async function computeAndWriteLiveWeek({ roomId, weekIndex, apiKey }) {
   // Fantasy points can fluctuate up/down slightly (cards, etc.), but a full drop to 0 after having points is almost always wrong.
   const computedHadPoints = Object.values(totalsByUid).some((v) => Number(v) > 0);
   if (!forceRecompute && prevHadPoints && !computedHadPoints && !shouldFinalize) {
+    // 7) Write weekResults (+ keep points stable)
     await weekResultsRef.set(
       {
+        roomId,
+        weekIndex: Number(weekIndex),
+        startAtMs: startAtMs || null,
+        endAtMs: endAtMs || null,
+        roundLabel: week.roundLabel || null,
         status: statusValue,
         nextKickoffMs: nextKickoffMs ?? null,
         fixtureStatusById: statusByFixtureId,
+        teamScoresByUserId: totalsByUid,
+        breakdownByUserId,
+        matchups,
+        weekLeaderboard,
         updatedAtMs: Date.now(),
         computedAt: admin.firestore.FieldValue.serverTimestamp(),
+        
+        // NEW ACCUMULATOR DATA:
+        activeScorers: newActiveScorers,
+        benchByUserId: finalBenchByUserId,
+        startersByUserId: finalStartersByUserId,
       },
       { merge: true }
     );
     return;
   }
 
+  
   // 5) Matchups + leaderboard
   const matchupPairs = Array.isArray(week.matchups) && week.matchups.length
     ? week.matchups
@@ -2699,8 +2763,10 @@ async function computeAndWriteLiveWeek({ roomId, weekIndex, apiKey }) {
       weekLeaderboard,
       updatedAtMs: Date.now(),
       computedAt: admin.firestore.FieldValue.serverTimestamp(),
-      benchByUserId,
-      startersByUserId,
+
+      activeScorers: newActiveScorers,
+      benchByUserId: finalBenchByUserId,
+      startersByUserId: finalStartersByUserId,
     },
     { merge: true }
   );
@@ -2949,7 +3015,7 @@ async function fetchAggregatedStats(fixtureIds, apiKey) {
         fixtureId: fId, 
         apiKey, 
         ttlMs: 60 * 1000,
-        timeZone
+        timeZone: timezone
     });
 
     // We need the fixture status. Since your cache function returns a map of players, 

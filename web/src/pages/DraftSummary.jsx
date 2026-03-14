@@ -15,6 +15,7 @@ import useTeamNames from "../lib/useTeamNames";
 import { doc, setDoc, serverTimestamp } from "firebase/firestore";
 import { httpsCallable } from "firebase/functions";
 import "./DraftSummary.css";
+import FlagIcon from "@/components/FlagIcon";
 
 
 const DEFAULT_DRAFT_PLAN = ["ATT", "ATT", "MID", "MID", "DEF", "DEF", "GK", "SUB", "SUB"];
@@ -227,6 +228,21 @@ export default function DraftSummary() {
   const turnIndex = Number.isFinite(room?.turnIndex) ? room.turnIndex : 0;
   const roundNumber = Math.floor(turnIndex / n) + 1;
   const requiredSlot = perRoundPlan[roundNumber - 1] || null;
+  const competitionName =
+    room?.competitionMeta?.name ||
+    room?.competition?.name ||
+    "";
+
+  const competitionSeason =
+    room?.competition?.season ||
+    room?.competitionMeta?.season ||
+    "";
+
+  const competitionCountry = room?.competitionMeta?.country || "";
+
+  const competitionLabel = [competitionSeason, competitionName]
+    .filter(Boolean)
+    .join(" ");
 
   return (
     <div className="vrPage min-h-screen w-full p-4 md:p-6">
@@ -280,6 +296,20 @@ export default function DraftSummary() {
             </select>
           </div>
         </div>
+
+        {competitionLabel ? (
+          <div className="mt-3">
+            <div className="text-sm text-gray-600 mb-1">Competition</div>
+            <div className="flex items-center gap-2 text-sm">
+              <FlagIcon
+                country={competitionCountry}
+                size={16}
+                title={competitionCountry}
+              />
+              <span className="font-medium">{competitionLabel}</span>
+            </div>
+          </div>
+        ) : null}
 
         {/* Members */}
         <div className="mt-3">
@@ -467,6 +497,7 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, teamName, ro
   const [lineupDoc, setLineupDoc] = useState(null);
   const [pendingIn, setPendingIn] = useState(null); // bench player picked to sub in
   const didInitLineup = useRef(false);
+  const didRepairLineup = useRef(false);
 
   useEffect(() => {
     if (!lineupRoomId || !manager?.uid) return;
@@ -545,6 +576,9 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, teamName, ro
 
     return out.slice(0, STARTING_CAP);
   };
+
+  const sameKeyOrder = (a = [], b = []) =>
+  a.length === b.length && a.every((v, i) => v === b[i]);
 
   const starters = useMemo(() => {
     const saved = Array.isArray(lineupDoc?.starters) ? lineupDoc.starters : null;
@@ -649,10 +683,44 @@ async function saveStarters(next) {
     if (!allKeys.length) return;
 
     didInitLineup.current = true;
-    saveStarters(allKeys.slice(0, STARTING_CAP)); // writes the default XI/IX to Firestore
+    saveStarters(buildDefaultXI(allKeys));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isMe, lockedNow, lineupDoc, allKeys]);
 
+  useEffect(() => {
+    if (!isMe || lockedNow) return;
+    if (!lineupDoc) return;
+    if (didRepairLineup.current) return;
+
+    // only auto-repair once roster is complete
+    if ((picks?.length || 0) < totalRounds) return;
+    if (allKeys.length < STARTING_CAP) return;
+
+    const rosterSet = new Set(allKeys);
+
+    // current saved starters, but only keep players still on this roster
+    const saved = Array.isArray(lineupDoc?.starters)
+      ? lineupDoc.starters.filter((k) => rosterSet.has(k)).slice(0, STARTING_CAP)
+      : [];
+
+    const savedIsValid =
+      saved.length === STARTING_CAP && validateStarters(saved).ok;
+
+    if (savedIsValid) return;
+
+    const repaired = buildDefaultXI(allKeys);
+
+    // safety check: only save if the repaired XI is truly valid
+    if (repaired.length !== STARTING_CAP) return;
+    if (!validateStarters(repaired).ok) return;
+
+    // avoid pointless rewrite
+    if (sameKeyOrder(saved, repaired)) return;
+
+    didRepairLineup.current = true;
+    saveStarters(repaired);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isMe, lockedNow, lineupDoc, picks, totalRounds, allKeys]);
 
   function onSubInClick(benchKey) {
     if (!isMe || lockedNow) return;
@@ -687,10 +755,7 @@ async function saveStarters(next) {
     const starterPick = pickByKey.get(starterKey);
     const benchPick = pickByKey.get(pendingIn);
 
-    if (isPickLive(starterPick)) {
-      alert("You can’t SUB OUT a starter that is LIVE.");
-      return;
-    }
+  
     if (isPickLive(benchPick)) {
       alert("You can’t SUB IN a bench player that is LIVE.");
       return;
@@ -880,8 +945,7 @@ function StarterBlock({ title, list, pendingIn, locked, onPick, keyOf, isLivePic
             locked ||
             !pendingIn ||
             pendingInPickLive ||
-            illegalByFormation ||
-            (isLivePick?.(p) ?? false);
+            illegalByFormation;
 
           return (
             <li

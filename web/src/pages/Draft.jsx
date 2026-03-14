@@ -38,6 +38,7 @@ import { app, functions } from "../firebase";
 import "./Draft.css";
 import useUserProfiles from "../lib/useUserProfiles";
 import { Avatar, AvatarImage, AvatarFallback } from "../components/ui/avatar";
+import FlagIcon from "@/components/FlagIcon";
 
 
 // ----- Config -----
@@ -245,6 +246,15 @@ export default function DraftWithPresence() {
   };
 
   const membersKey = useMemo(() => (members || []).join("|"), [members]);
+
+  //Flags
+  const competitionName = room?.competitionMeta?.name || "";
+  const competitionSeason = room?.competition?.season || "";
+  const competitionCountry = room?.competitionMeta?.country || "";
+
+  const competitionLabel = [competitionSeason, competitionName]
+    .filter(Boolean)
+    .join(" ");
 
 useEffect(() => {
   if (!roomId || !members?.length) {
@@ -1027,6 +1037,20 @@ useEffect(() => {
                   <CardTitle className="font-sporty text-2xl">📊 Draft Status</CardTitle>
                 </CardHeader>
                 <CardContent>
+                  {competitionLabel ? (
+                    <div className="draftCompetitionMeta">
+                      <span className="draftCompetitionHead">Competition:</span>
+                      <span className="draftCompetitionLabel">
+                        <FlagIcon
+                          country={competitionCountry}
+                          size={16}
+                          title={competitionCountry}
+                        />
+                        <b>{competitionLabel}</b>
+                      </span>
+                    </div>
+                  ) : null}
+
                   <div className="mt-6">
                   
                   <LeagueSelector
@@ -1093,6 +1117,19 @@ useEffect(() => {
                 <div className="text-sm opacity-70">
                   Round: <b>{Math.floor((room.turnIndex ?? 0) / (room.members?.length || 1)) + 1}</b> / {room.totalRounds ?? DRAFT_SIZE_LEAGUE}
                 </div>
+                {competitionLabel ? (
+                  <div className="draftCompetitionMeta">
+                    <span className="draftCompetitionHead">Competition:</span>
+                    <span className="draftCompetitionLabel">
+                      <FlagIcon
+                        country={competitionCountry}
+                        size={16}
+                        title={competitionCountry}
+                      />
+                      <b>{competitionLabel}</b>
+                    </span>
+                  </div>
+                ) : null}
                 <DraftFormationRules />
                 <div className="draftTurnBanner">
                   <div className="draftTurnMain">

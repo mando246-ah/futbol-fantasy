@@ -497,3 +497,23 @@
   color: var(--ff-muted);
   opacity: 0.95;
 }
+
+.draftCompetitionMeta {
+  margin: 10px 0 12px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.draftCompetitionHead {
+  font-size: 0.9rem;
+  opacity: 0.8;
+}
+
+.draftCompetitionLabel {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 0.95rem;
+}

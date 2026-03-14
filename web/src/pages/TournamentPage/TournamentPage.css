@@ -1401,3 +1401,9 @@
   .tpScoringPopover{ width: 360px; }
   .tpScoringList{ grid-template-columns: 1fr; }
 }
+
+.tpCompetitionLabel {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
