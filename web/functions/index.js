@@ -6,6 +6,9 @@ const logger = require("firebase-functions/logger"); // optional but nice
 if (!admin.apps.length) admin.initializeApp();
 const db = admin.firestore();
 const { FieldValue } = admin.firestore;
+const { scorePlayer, scoreTeam, SCORING } = require("./shared/scoringCore");
+const { runCupEngine } = require("./cup/cupEngine");
+const { detectPhaseFromRoundLabel } = require("./shared/phaseDetect");
 
 //Serve Resolve Market Helpers
 async function loadStandingsByUid(roomRef) {
@@ -476,16 +479,42 @@ exports.seedPlayersFromCompetition = onCall(
     await commitIfNeeded(true);
 
     // Store competition choice + seeding filter on room
+    const competition = {
+      provider: "api-football",
+      league,
+      season,
+      timezone,
+    };
+
+    // Ask API: what round are we in?
+    let window = null;
+    try {
+      window = await fetchNextRoundWindow(competition, { fallbackDate: fixtureDate });
+    } catch (e) {
+      console.warn(`[seedPlayersFromCompetition] fetchNextRoundWindow failed`, e);
+    }
+
+    const roundLabel = window?.roundLabel || null;
+    const phaseLabel = detectPhaseFromRoundLabel(roundLabel);
+
+    // Only RegularSeason needs competitionMeta.totalRounds
+    if (phaseLabel === "RegularSeason") {
+      await ensureRoomTotalRounds({ roomId, room, competition, apiKey });
+    }
+
     await roomRef.set(
       {
-        competition: {
-          provider: "api-football",
-          league,
-          season,
-          timezone,
-        },
+        competition,
         seedFilter: fixtureDate ? { fixtureDate } : admin.firestore.FieldValue.delete(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+
+        competitionState: {
+          phaseLabel: phaseLabel,
+          currentLabel: roundLabel,
+          isDone: false,
+          weekStatus: "scheduled",
+        }
+        
       },
       { merge: true }
     );
@@ -501,6 +530,10 @@ exports.seedPlayersFromCompetition = onCall(
       maxPlayers,
       hitCap: written >= maxPlayers,
       teamCount: fixtureDate ? teamMeta.size : null,
+
+      // helpful for debugging in the client
+      phaseLabel,
+      roundLabel,
     };
   }
 );
@@ -567,243 +600,6 @@ function extractBench(lineupData) {
   return [];
 }
 
-const SCORING = {
-  appearance: { anyMinutes: 1, sixtyPlus: 1 },
-  assists: 3,
-  goals: { GK: 6, DEF: 6, MID: 5, FWD: 4 },
-  cleanSheet: { GK: 4, DEF: 4, MID: 1, FWD: 0, minMinutes: 60 },
-  goalsConceded: { GK: -1, DEF: -1, per: 2 },
-  saves: { GK: 1, per: 2 },
-  cards: { yellow: -1, red: -3 },
-  pens: { saved: 5, missed: -2, committed: -1 },
-  rating: { threshold: 8.5, points: 3 },
-
-  passesCompleted: {
-    enabled: true,
-    perByPos: { GK: 30, DEF: 25, MID: 25, FWD: 20 },
-    pointsPerChunk: 1,
-  },
-
-  // ✅ advanced stats
-  tackles: { per: 2, pointsPerChunk: 1 },
-  duelsWon: { per: 4, pointsPerChunk: 1 },        
-  dribblesSuccess: { per: 2, pointsPerChunk: 1 },
-  foulsCommitted: { per: 2, pointsPerChunk: -1 },
-  offsides: { per: 3, pointsPerChunk: -1 },
-  shotsOnTarget: { per: 1, pointsPerChunk: 1 },
-};
-
-
-function scorePlayer(stats, pos) {
-  const s = {
-    minutes: Number(stats?.minutes ?? 0),
-
-    goals: Number(stats?.goals ?? 0),
-    assists: Number(stats?.assists ?? 0),
-
-    // Passing Total
-    passesCompleted: Number(stats?.passesCompleted ?? 0),
-
-    cleanSheet: Boolean(stats?.cleanSheet),
-
-    goalsConceded: Number(stats?.goalsConceded ?? 0),
-    saves: Number(stats?.saves ?? 0),
-
-    yellow: Number(stats?.yellow ?? 0),
-    red: Number(stats?.red ?? 0),
-
-    pensSaved: Number(stats?.pensSaved ?? 0),
-    pensMissed: Number(stats?.pensMissed ?? 0),
-    pensCommitted: Number(stats?.pensCommitted ?? 0),
-
-    rating: Number(stats?.rating ?? 0),
-
-    tackles: Number(stats?.tackles ?? 0),
-    duelsWon: Number(stats?.duelsWon ?? 0),
-    dribblesSuccess: Number(stats?.dribblesSuccess ?? 0),
-    foulsCommitted: Number(stats?.foulsCommitted ?? 0),
-    offsides: Number(stats?.offsides ?? 0),
-    shotsOnTarget: Number(stats?.shotsOnTarget ?? 0),
-
-    ownGoals: Number(stats?.ownGoals ?? 0),
-  };
-
-  // --- CRITICAL FIX: If player has stats but 0 mins, give them 1 min ---
-  const hasActivity = s.goals > 0 || s.assists > 0 || s.passesCompleted > 0 || s.yellow > 0 || s.red > 0 || s.saves > 0;
-  if (s.minutes <= 0 && hasActivity) {
-      s.minutes = 1; 
-  }
-  if (s.minutes <= 0) return { points: 0, breakdown: {} };
-  // -------------------------------------------------------------------
-
-  // Points Calculation
-  let points = 0;
-  const breakdown = {};
-
-  // 1. Appearance
-  if (s.minutes > 0) {
-    points += SCORING.appearance.anyMinutes;
-    breakdown.appearance = SCORING.appearance.anyMinutes;
-    if (s.minutes >= 60) {
-      points += SCORING.appearance.sixtyPlus;
-      breakdown.sixtyPlus = SCORING.appearance.sixtyPlus;
-    }
-  }
-
-  // 2. Goals
-  if (s.goals > 0) {
-    const pts = (SCORING.goals[pos] || 4) * s.goals;
-    points += pts;
-    breakdown.goals = pts;
-  }
-
-  // 3. Assists
-  if (s.assists > 0) {
-    const pts = SCORING.assists * s.assists;
-    points += pts;
-    breakdown.assists = pts;
-  }
-
-  // 4. Clean Sheet (GK/DEF/MID only)
-  if (s.cleanSheet) {
-    const rule = SCORING.cleanSheet[pos];
-    if (rule !== undefined && s.minutes >= (SCORING.cleanSheet.minMinutes || 60)) {
-      points += rule;
-      breakdown.cleanSheet = rule;
-    }
-  }
-
-  // 5. Saves (GK)
-  if (pos === "GK" && s.saves > 0) {
-    const chunk = SCORING.saves.per || 3;
-    const pts = Math.floor(s.saves / chunk) * (SCORING.saves[pos] || 1);
-    if (pts > 0) {
-      points += pts;
-      breakdown.saves = pts;
-    }
-  }
-
-  // 6. Goals Conceded (GK/DEF)
-  if ((pos === "GK" || pos === "DEF") && s.goalsConceded > 0) {
-    const chunk = SCORING.goalsConceded.per || 2;
-    const pts = Math.floor(s.goalsConceded / chunk) * (SCORING.goalsConceded[pos] || -1);
-    if (pts !== 0) {
-      points += pts;
-      breakdown.goalsConceded = pts;
-    }
-  }
-
-  // 7. Penalties
-  if (s.pensSaved > 0) {
-    const pts = (SCORING.pens.saved || 5) * s.pensSaved;
-    points += pts;
-    breakdown.pensSaved = pts;
-  }
-  if (s.pensMissed > 0) {
-    const pts = (SCORING.pens.missed || -2) * s.pensMissed;
-    points += pts;
-    breakdown.pensMissed = pts;
-  }
-  if (s.pensCommitted > 0) {
-    const pts = (SCORING.pens.committed || -1) * s.pensCommitted;
-    points += pts;
-    breakdown.pensCommitted = pts;
-  }
-
-  // 8. Cards
-  if (s.yellow > 0) {
-    const pts = (SCORING.cards.yellow || -1) * s.yellow;
-    points += pts;
-    breakdown.yellow = pts;
-  }
-  if (s.red > 0) {
-    const pts = (SCORING.cards.red || -3) * s.red;
-    points += pts;
-    breakdown.red = pts;
-  }
-
-  // Rating (8.5+)
-  if (s.rating >= (SCORING.rating.threshold || 8.5)) {
-    points += SCORING.rating.points || 3;
-    breakdown.rating85 = SCORING.rating.points || 3;
-  }
-
-  // Tackles (+1 per 2)
-  if (s.tackles > 0) {
-    const chunk = SCORING.tackles.per || 2;
-    const pts = Math.floor(s.tackles / chunk) * (SCORING.tackles.pointsPerChunk || 1);
-    if (pts) { points += pts; breakdown.tackles = pts; }
-  }
-
-  // Duels won (+1 per 4)
-  if (s.duelsWon > 0) {
-    const chunk = SCORING.duelsWon.per || 4;
-    const pts = Math.floor(s.duelsWon / chunk) * (SCORING.duelsWon.pointsPerChunk || 1);
-    if (pts) { points += pts; breakdown.duelsWon = pts; }
-  }
-
-  // Dribbles success (+1 per 2)
-  if (s.dribblesSuccess > 0) {
-    const chunk = SCORING.dribblesSuccess.per || 2;
-    const pts = Math.floor(s.dribblesSuccess / chunk) * (SCORING.dribblesSuccess.pointsPerChunk || 1);
-    if (pts) { points += pts; breakdown.dribblesSuccess = pts; }
-  }
-
-  // Fouls committed (-1 per 2)
-  if (s.foulsCommitted > 0) {
-    const chunk = SCORING.foulsCommitted.per || 2;
-    const pts = Math.floor(s.foulsCommitted / chunk) * (SCORING.foulsCommitted.pointsPerChunk || -1);
-    if (pts) { points += pts; breakdown.foulsCommitted = pts; }
-  }
-
-  // Offsides (-1 per 3)
-  if (s.offsides > 0) {
-    const chunk = SCORING.offsides.per || 3;
-    const pts = Math.floor(s.offsides / chunk) * (SCORING.offsides.pointsPerChunk || -1);
-    if (pts) { points += pts; breakdown.offsides = pts; }
-  }
-
-  // Shots on target (+1 each)
-  if (s.shotsOnTarget > 0) {
-    const pts = s.shotsOnTarget * (SCORING.shotsOnTarget.pointsPerChunk || 1);
-    if (pts) { points += pts; breakdown.shotsOnTarget = pts; }
-  }
-
-  // 9. Passes (Total)
-  if (SCORING.passesCompleted.enabled && s.passesCompleted > 0) {
-    const threshold = SCORING.passesCompleted.perByPos[pos] || 25; 
-    const pts = Math.floor(s.passesCompleted / threshold) * SCORING.passesCompleted.pointsPerChunk;
-    if (pts > 0) {
-        points += pts;
-        breakdown.passesCompleted = pts;
-    }
-  }
-
-
-  return { points, breakdown };
-}
-
-function scoreTeam(starters, statsByPlayerId) {
-  let total = 0;
-  const perPlayer = {};
-
-  for (const p of starters) {
-    const st = statsByPlayerId[p.id] || {};
-    const pos = toPos(p.position || st.position || st.pos || st.role);
-    const r = scorePlayer(st, pos);
-    
-    perPlayer[p.id] = {
-      points: r.points,
-      breakdown: r.breakdown,
-      stats: st,
-      realTeamName: st.teamName || "",       // Saved here
-      opponentName: st.opponentName || ""    // Saved here
-    };
-    total += r.points;
-  }
-
-  return { total, perPlayer };
-}
 
 // deterministic mock stats (same idea as your client mock)
 function hashToUint32(str) {
@@ -996,7 +792,7 @@ exports.computeRoundResults = onCall({ region: "us-west2" }, async (request) => 
     }
     statsByPlayerIdByUserId[u.userId] = statsByPlayerId;
 
-    const scored = scoreTeam(u.starters, statsByPlayerId);
+    const scored = scoreTeam(u.starters, statsByPlayerId, toPos);
     totalsByUid[u.userId] = scored.total;
     breakdownByUserId[u.userId] = scored;
   }
@@ -1778,7 +1574,7 @@ exports.computeWeekResults = onCall({ region: "us-west2" }, async (request) => {
       statsByPlayerId[p.id] = agg;
     }
 
-    const scored = scoreTeam(u.starters, statsByPlayerId);
+    const scored = scoreTeam(u.starters, statsByPlayerId, toPos);
     totalsByUid[u.userId] = scored.total;
     breakdownByUserId[u.userId] = scored;
   }
@@ -1925,13 +1721,6 @@ function buildPlayerStatsMapFromFixturePlayersResponse(responseArr, fixtureMeta)
     // Find Opponent
     const opponent = teams.find(x => x.team?.id !== teamId);
     const opponentName = opponent?.team?.name || "";
-
-    // --- NEW: CAPTURE MATCH STATUS ---
-    // The structure usually passed here needs to have access to the fixture data.
-    // NOTE: In the 'fixtures/players' endpoint, the status is not always deep inside.
-    // However, in your 'computeAndWriteLiveWeek' function, you have access to the 'fixture' object.
-    // We will pass the status IN via the loop in 'computeAndWriteLiveWeek' instead.
-    // See Step 2 below.
     
     const players = Array.isArray(t?.players) ? t.players : [];
     
@@ -2297,49 +2086,26 @@ async function computeAndWriteLiveWeek({ roomId, weekIndex, apiKey }) {
   // Build rosterByUid from room players (so bench can be roster - starters)
   // Build playersById map (id -> {id,name,position})
   const playersById = new Map();
-  const playersSnap = await db.collection(`rooms/${roomId}/players`).get();
-  for (const pd of playersSnap.docs) {
-    const d = pd.data() || {};
-    const pid = String(d.id ?? d.playerId ?? d.apiPlayerId ?? d.pid ?? pd.id);
-    if (!pid) continue;
-
-    playersById.set(pid, {
-      id: pid,
-      name: d.name || d.fullName || d.displayName || "Unknown",
-      position: toPos(d.position || d.pos || d.role),
-      teamName: d.teamName || "",
-      teamLogo: d.teamLogo || "",
-    });
-  }
-
-  // Build rosterByUid from picks (this is the reliable ownership source)
   const pickDocToPlayer = new Map(); 
   const rosterByUid = {};
   const picksSnap = await db.collection(`rooms/${roomId}/picks`).get();
 
   for (const pk of picksSnap.docs) {
     const d = pk.data() || {};
-
-    const owner = inferOwnerUid(d); // uses userId/uid/ownerUid/etc
-    const pid = String(
-      d.playerId ??
-      d.pid ??
-      d.apiPlayerId ??
-      d.player?.id ??
-      d.player?.playerId ??
-      ""
-    );
+    const owner = inferOwnerUid(d); 
+    const pid = String(d.playerId ?? d.pid ?? d.apiPlayerId ?? d.player?.id ?? d.player?.playerId ?? "");
 
     if (!owner || !pid) continue;
 
-    const p =
-      playersById.get(pid) ||
-      {
-        id: pid,
-        name: d.playerName || d.name || "Unknown",
-        position: toPos(d.position || d.pos || d.role),
-      };
-
+    // Build our player object directly from the pick document!
+    const p = {
+      id: pid,
+      name: d.playerName || d.name || "Unknown",
+      position: toPos(d.position || d.pos || d.role),
+      teamName: d.teamName || "",
+    };
+    
+    playersById.set(pid, p); // Save it to the map for the lineup resolver
     (rosterByUid[String(owner)] ||= []).push(p);
     pickDocToPlayer.set(pk.id, p);
   }
@@ -2603,8 +2369,8 @@ async function computeAndWriteLiveWeek({ roomId, weekIndex, apiKey }) {
       benchStats[String(p.id)] = aggStatsByPlayerId[String(p.id)] || {};
     }
 
-    const starterScored = scoreTeam(effectiveStarters, starterStats);
-    const benchScored = scoreTeam(effectiveBench, benchStats);
+    const starterScored = scoreTeam(effectiveStarters, starterStats, toPos);
+    const benchScored = scoreTeam(effectiveBench, benchStats, toPos);
 
     totalsByUid[u.userId] = starterScored.total;
 
@@ -2693,58 +2459,6 @@ async function computeAndWriteLiveWeek({ roomId, weekIndex, apiKey }) {
 
   const weekLeaderboard = buildLeaderboard(users, matchups, totalsByUid);
 
-  // 6) Recompute cumulative standings from all weekResults (idempotent)
-  const resultsSnap = await db.collection(`rooms/${roomId}/weekResults`).get();
-  const agg = {}; // uid -> row
-  function ensure(uid, name) {
-    if (!agg[uid]) agg[uid] = { userId: uid, name: name || uid, played: 0, wins: 0, draws: 0, losses: 0, tablePoints: 0, totalFantasyPoints: 0 };
-    if (name) agg[uid].name = name;
-    return agg[uid];
-  }
-
-  const allWeeks = resultsSnap.docs
-    .map((d) => d.data())
-    .filter(Boolean)
-    .filter((d) => Number(d.weekIndex) !== Number(weekIndex));
-
-  allWeeks.push({ weekIndex: Number(weekIndex), matchups, teamScoresByUserId: totalsByUid });
-
-  for (const w of allWeeks) {
-    const ms = Array.isArray(w.matchups) ? w.matchups : [];
-    for (const m of ms) {
-      const home = ensure(m.homeUserId);
-      const away = ensure(m.awayUserId);
-
-      home.played += 1;
-      away.played += 1;
-
-      const homePts = m.homeResult === "W" ? 3 : m.homeResult === "D" ? 1 : 0;
-      const awayPts = m.awayResult === "W" ? 3 : m.awayResult === "D" ? 1 : 0;
-
-      home.tablePoints += homePts;
-      away.tablePoints += awayPts;
-
-      if (m.homeResult === "W") home.wins += 1;
-      else if (m.homeResult === "D") home.draws += 1;
-      else home.losses += 1;
-
-      if (m.awayResult === "W") away.wins += 1;
-      else if (m.awayResult === "D") away.draws += 1;
-      else away.losses += 1;
-    }
-
-    const scores = w.teamScoresByUserId || {};
-    for (const uid2 of Object.keys(scores)) {
-      const row = ensure(uid2);
-      row.totalFantasyPoints += Number(scores[uid2] || 0);
-    }
-  }
-
-  for (const u of users) ensure(u.userId, u.name);
-
-  const standings = Object.values(agg).sort(
-    (a, b) => (b.tablePoints - a.tablePoints) || (b.totalFantasyPoints - a.totalFantasyPoints)
-  );
 
   // 7) Write weekResults (+ keep points stable)
   await weekResultsRef.set(
@@ -2771,14 +2485,6 @@ async function computeAndWriteLiveWeek({ roomId, weekIndex, apiKey }) {
     { merge: true }
   );
 
-  await db.doc(`rooms/${roomId}/standings/current`).set(
-    {
-      roomId,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      standings,
-    },
-    { merge: true }
-  );
 
   if (shouldFinalize) {
     await weekRef.set(
@@ -3089,11 +2795,12 @@ async function fetchUsersAndLineups(roomId, room) {
   const uids = membersSnap.docs.map(d => d.id);
   
   // Fetch Real Positions to fix "FWD marked as MID" issues
-  const playersSnap = await db.collection(`rooms/${roomId}/players`).get();
+  const picksSnap = await db.collection(`rooms/${roomId}/picks`).get();
   const posMap = {};
-  playersSnap.forEach(doc => {
-      const d = doc.data();
-      if (d.id && d.position) posMap[String(d.id)] = d.position;
+  picksSnap.forEach(doc => {
+      const d = doc.data() || {};
+      const pid = String(d.playerId || d.pid || d.apiPlayerId || "");
+      if (pid && d.position) posMap[pid] = toPos(d.position);
   });
 
   const users = [];
@@ -3220,37 +2927,6 @@ exports.debugForceUpdateWeek = onCall(
   }
 );
 
-// Host tool: fetch & save totalRounds on the room (competitionMeta.totalRounds)
-exports.debugSyncTotalRounds = onCall(
-  { region: "us-west2", secrets: [APIFOOTBALL_KEY] },
-  async (request) => {
-    const uid = request.auth?.uid;
-    if (!uid) throw new HttpsError("unauthenticated", "Sign in required.");
-
-    const roomId = request.data?.roomId;
-    if (!roomId) throw new HttpsError("invalid-argument", "roomId is required.");
-
-    const roomRef = db.doc(`rooms/${roomId}`);
-    const roomSnap = await roomRef.get();
-    if (!roomSnap.exists) throw new HttpsError("not-found", "Room not found.");
-
-    const room = roomSnap.data() || {};
-    if (!isHost(room, uid)) throw new HttpsError("permission-denied", "Host only.");
-
-    const comp = room.competition;
-    if (!comp?.league || !comp?.season) {
-      throw new HttpsError("failed-precondition", "room.competition missing league/season.");
-    }
-
-    const apiKey = APIFOOTBALL_KEY.value();
-    const totalRounds = await fetchTotalRoundsFromApi(competition, apiKey);
-
-    if (!totalRounds) throw new HttpsError("failed-precondition", "Could not determine total rounds.");
-
-    await roomRef.set({ "competitionMeta.totalRounds": totalRounds }, { merge: true });
-    return { ok: true, totalRounds };
-  }
-);
 
 exports.debugForceFinalizeSeason = onCall(
   { region: "us-west2" },
@@ -3438,19 +3114,50 @@ await weekRef.set(
 );
 
 exports.pollLiveTournamentWeeks = onSchedule(
-  { schedule: "*/1 * * * *", timeZone: "America/Los_Angeles", region: "us-west2", secrets: [APIFOOTBALL_KEY] },
+  { schedule: "*/3 * * * *", timeZone: "America/Los_Angeles", region: "us-west2", secrets: [APIFOOTBALL_KEY] },
   async () => {
     const apiKey = APIFOOTBALL_KEY.value();
     const nowMs = Date.now();
 
     // Get all rooms (you can add filters later if you store an "active" flag)
-    const roomsSnap = await db.collection("rooms").get();
+    const roomsSnap = await db.collection("rooms")
+    .where("competitionState.weekStatus", "in", ["scheduled", "live", "resolving"])
+    .get();
 
     for (const roomDoc of roomsSnap.docs) {
       const roomId = roomDoc.id;
       const room = roomDoc.data() || {};
 
       try {
+        // Check if this room is in a tournament phase (e.g. "Cup") that requires special handling
+        const phase =
+          room?.competitionState?.phaseLabel ??
+          room?.["competitionState.phaseLabel"] ??
+          room?.competitionState?.phaseLable ??
+          room?.["competitionState.phaseLable"] ??
+          null;
+
+        if (phase === "Cup") {
+          await db.doc(`rooms/${roomId}`).set(
+            { "competitionState.lastCupPollAtMs": nowMs },
+            { merge: true }
+          );
+
+          await runCupEngine({
+            db,
+            roomId,
+            room,
+            nowMs,
+            apiKey,
+            apiFootballGet,
+            getFixtureStatusMap,
+            getFixturePlayersStatsMapCached,
+          });
+
+          continue;
+        }
+
+        // For regular season rooms, we run the normal live week logic
         let weekIndex = Number(room.currentWeekIndex);
         if (!Number.isFinite(weekIndex)) {
           const created = await ensureCurrentWeekIfMissing({ roomId, room, apiKey });
@@ -3499,18 +3206,6 @@ exports.pollLiveTournamentWeeks = onSchedule(
           // If we're past the post-window and not final yet, run compute once to finalize + advance
           if (week.status !== "final" && Number.isFinite(endAtMs) && nowMs >= endAtMs + POST_MS) {
             await computeAndWriteLiveWeek({ roomId, weekIndex: Number(weekIndex), apiKey });
-          } else {
-            // Mark idle for UI (do not overwrite points)
-            await db.doc(`rooms/${roomId}/weekResults/${String(weekIndex)}`).set(
-              {
-                roomId,
-                weekIndex: Number(weekIndex),
-                status: "idle",
-                updatedAtMs: Date.now(),
-                computedAt: admin.firestore.FieldValue.serverTimestamp(),
-              },
-              { merge: true }
-            );
           }
           continue;
         }
@@ -3780,16 +3475,17 @@ exports.processMarketSchedule = onSchedule(
   { schedule: "*/1 * * * *", timeZone: "America/Los_Angeles", region: "us-west2" },
   async () => {
     const now = Date.now();
-    const roomsSnap = await db.collection("rooms").get();
+    const activeMarketsSnap = await db.collectionGroup("market")
+      .where("status", "in", ["scheduled", "open", "resolving"])
+      .get();
 
-    for (const roomDoc of roomsSnap.docs) {
-      const roomId = roomDoc.id;
-      const marketRef = db.doc(`rooms/${roomId}/market/current`);
-      const marketSnap = await marketRef.get();
-      if (!marketSnap.exists) continue;
-
+    for (const marketSnap of activeMarketsSnap.docs) {
       const m = marketSnap.data() || {};
+      const marketRef = db.doc(`rooms/${roomId}/market/current`);
+      const roomId = marketRef.parent.parent.id; 
       const status = m.status || "idle";
+
+      if (!marketSnap.exists) continue;
 
       const scheduledAt = Number(m.scheduledAt);
       const durationMs = Number(m.durationMs || 0);

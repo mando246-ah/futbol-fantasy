@@ -982,9 +982,7 @@ useEffect(() => {
                       </span>
                     </div>
                   </CardTitle>
-                  <p className="text-sm/relaxed opacity-90">
-                    Host: {members.find((m) => m.uid === room.hostUid)?.displayName || room.hostUid}
-                  </p>
+                  
                 </CardHeader>
                 <CardContent>
                   <h3 className="font-semibold mb-2">⚽ Managers in Room</h3>

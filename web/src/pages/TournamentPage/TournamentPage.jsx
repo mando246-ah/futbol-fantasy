@@ -221,7 +221,6 @@ function UserChip({ user }) {
   );
 }
 
-// --- PASTE THIS AT THE TOP OF THE FILE (Outside the component) ---
 const SCORING_DISPLAY = [
   { label: "Appearance", detail: "+1 (any minutes)" },
   { label: "Played 60+ mins", detail: "+1 (60+ minutes)" },
@@ -943,7 +942,60 @@ export default function TournamentPage() {
     ) || [];
 
   const boardRows = activeResults?.weekLeaderboard || activeResults?.leaderboard || [];
-  const standingsRows = standingsDoc?.standings || [];
+
+  // --- NEW LIVE STANDINGS LOGIC ---
+  const baseStandings = standingsDoc?.standings || [];
+  let liveStandings = [...baseStandings];
+
+  // If there is an active week that is NOT final yet, project the live points onto the base standings
+  if (activeResults && activeResults.status !== "final") {
+    const map = {};
+    
+    // 1. Copy the base standings into a map
+    baseStandings.forEach(row => {
+      map[row.userId] = { ...row };
+    });
+
+    // 2. Ensure every user in the room has a row
+    (users || []).forEach(u => {
+      if (!map[u.userId]) {
+        map[u.userId] = { userId: u.userId, name: u.name, played: 0, wins: 0, draws: 0, losses: 0, tablePoints: 0, totalFantasyPoints: 0 };
+      }
+    });
+
+    // 3. Add live fantasy points
+    const liveScores = activeResults.teamScoresByUserId || {};
+    Object.entries(liveScores).forEach(([uid, score]) => {
+      if (map[uid]) map[uid].totalFantasyPoints += Number(score || 0);
+    });
+
+    // 4. Add projected live match points
+    const liveMatchups = activeResults.matchups || [];
+    liveMatchups.forEach(m => {
+      if (!map[m.homeUserId] || !map[m.awayUserId]) return;
+      
+      if (m.homeResult === "W") {
+        map[m.homeUserId].wins += 1; map[m.homeUserId].tablePoints += 3;
+        map[m.awayUserId].losses += 1;
+      } else if (m.homeResult === "D") {
+        map[m.homeUserId].draws += 1; map[m.homeUserId].tablePoints += 1;
+        map[m.awayUserId].draws += 1; map[m.awayUserId].tablePoints += 1;
+      } else if (m.homeResult === "L") {
+        map[m.homeUserId].losses += 1;
+        map[m.awayUserId].wins += 1; map[m.awayUserId].tablePoints += 3;
+      }
+    });
+
+    // Convert back to array
+    liveStandings = Object.values(map);
+  }
+
+  // Sort the final table
+  liveStandings.sort((a, b) => (b.tablePoints - a.tablePoints) || (b.totalFantasyPoints - a.totalFantasyPoints));
+  
+  const standingsRows = liveStandings;
+  // --- END LIVE STANDINGS LOGIC ---
+
   const wrStatus = String(weekResults?.status || "").toUpperCase();
   const historyOptions = (weekHistory || [])
     .map((w) => ({

@@ -1407,3 +1407,19 @@
   align-items: center;
   gap: 7px;
 }
+
+/* ---- CUP: Single lineup centered ---- */
+.tpLineups.tpLineupsSingle{
+  grid-template-columns: 1fr;
+  justify-items: center;  /* centers the single column */
+}
+
+.tpLineups.tpLineupsSingle .tpSideSolo{
+  width: min(720px, 100%);
+  border-right: none !important;
+}
+
+.tpLivePill.resolving{
+  color: rgba(251, 191, 36, 0.95);
+  text-shadow: 0 0 10px rgba(251, 191, 36, 0.35);
+}

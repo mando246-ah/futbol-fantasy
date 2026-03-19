@@ -13,7 +13,8 @@ import Draft from "./pages/Draft";
 import Profile from "./pages/Profile";
 import DraftSummary from "./pages/DraftSummary";
 import Home from "./pages/Home";
-
+//import TournamentPage from "./pages/TournamentPage/TournamentPage";
+import TournamentRouter from "./pages/TournamentPage/TournamentRouter";
 import {
   watchAuth,
   signOutNow,
@@ -29,7 +30,7 @@ import {
   logPageView,
   logAnalyticsEvent,
 } from "./firebase";
-import TournamentPage from "./pages/TournamentPage/TournamentPage";
+
 import { Avatar, AvatarImage, AvatarFallback } from "./components/ui/avatar";
 import logo from "./assets/logo.png";
 import { useLocation, Outlet } from "react-router-dom";
@@ -461,11 +462,17 @@ export default function App() {
             </RequireAuth>
           } />
 
-          <Route path="/tournament" element={
+          {/*<Route path="/tournament" element={
             <RequireAuth user={user}><TournamentPage /></RequireAuth>
           } />
           <Route path="/tournament/:roomId" element={
             <RequireAuth user={user}><TournamentPage /></RequireAuth>
+          } /> */}
+          <Route path="/tournament" element={
+            <RequireAuth user={user}><TournamentRouter /></RequireAuth>
+          } />
+          <Route path="/tournament/:roomId" element={
+            <RequireAuth user={user}><TournamentRouter /></RequireAuth>
           } />
         </Route>
       </Routes>
