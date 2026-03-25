@@ -1423,3 +1423,22 @@
   color: rgba(251, 191, 36, 0.95);
   text-shadow: 0 0 10px rgba(251, 191, 36, 0.35);
 }
+
+/* History for Cup */ 
+.tpHistoryTitle {
+  margin-bottom: 0;
+}
+
+.tpHistoryTableWrap {
+  margin-top: 10px;
+}
+
+.tpHistoryTable th:last-child,
+.tpHistoryTable td:last-child {
+  text-align: right;
+}
+
+.tpHistoryTable th:nth-child(3),
+.tpHistoryTable td:nth-child(3) {
+  text-align: right;
+}

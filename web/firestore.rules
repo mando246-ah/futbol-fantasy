@@ -82,6 +82,28 @@ service cloud.firestore {
           allow read: if authed();
           allow write: if false; // (Cloud Functions can still write via Admin SDK)
         }
+        // Cup docs
+        match /cup/{docId} {
+          allow read: if isRoomMember(roomId);
+          allow write: if false; // Cloud Functions/Admin SDK can still write
+        }
+
+        // Cup fixture ledger
+        match /cup/{docId}/fixtures/{fixtureId} {
+          allow read: if isRoomMember(roomId);
+          allow write: if false; // Cloud Functions/Admin SDK can still write
+        }
+
+        // Final results snapshot
+        match /finalResults/{docId} {
+          allow read: if isRoomMember(roomId);
+          allow write: if false; // Cloud Functions/Admin SDK can still write
+        }
+
+        match /cupHistory/{docId} {
+          allow read: if isRoomMember(roomId);
+          allow write: if false;
+        }
 
 
 

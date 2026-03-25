@@ -41,6 +41,8 @@ function pickCupWindow(candidates, { nowMs, gapHours = 12 } = {}) {
     windowId: `${label}:${minKo}-${maxKo}`,
     label,
     fixtureIds,
+    startAtMs: minKo,
+    endAtMs: maxKo,
   };
 }
 

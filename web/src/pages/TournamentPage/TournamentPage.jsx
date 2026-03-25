@@ -844,7 +844,12 @@ export default function TournamentPage() {
               <div className="tpCard tpFull">
                 <FinalResultsCard
                   finalResults={devPreviewComplete ? fakePodiumData : finalResultsDoc}
-                  formatDate={fmtDT}
+                  title="Season Complete"
+                  subtitle="Top 3"
+                  badge="🏆"
+                  showWdl={true}
+                  matchLabel="Match"
+                  fantasyLabel="Fantasy"
                   renderUser={(uid, fallbackName) => (
                     <UserChip user={userById?.[uid] || { userId: uid, name: fallbackName }} />
                   )}
@@ -1182,9 +1187,13 @@ export default function TournamentPage() {
    {showFinalPodium && (
       <div className="tpCard tpFull">
         <FinalResultsCard
-          //finalResults={finalResultsDoc}
           finalResults={devPreviewComplete ? fakePodiumData : finalResultsDoc}
-          formatDate={fmtDT}
+          title="Season Complete"
+          subtitle="Top 3"
+          badge="🏆"
+          showWdl={true}
+          matchLabel="Match"
+          fantasyLabel="Fantasy"
           renderUser={(uid, fallbackName) => (
             <UserChip user={userById?.[uid] || { userId: uid, name: fallbackName }} />
           )}

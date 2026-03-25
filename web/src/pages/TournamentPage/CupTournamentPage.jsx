@@ -1,7 +1,7 @@
 // src/pages/TournamentPage/CupTournamentPage.jsx
 import { useEffect, useState, useRef } from "react";
 import { useParams, Link } from "react-router-dom";
-import { doc, onSnapshot, collection } from "firebase/firestore";
+import { doc, onSnapshot, collection, query, orderBy } from "firebase/firestore";
 
 import { useTournament } from "../../tournament/hooks/useTournament";
 import { auth, db } from "../../firebase";
@@ -10,6 +10,8 @@ import "./TournamentPage.css";
 import { Avatar, AvatarImage, AvatarFallback } from "../../components/ui/avatar";
 import FlagIcon from "../../components/FlagIcon";
 import FinalResultsCard from "../../components/ui/FinalResultsCard";
+import { getApp } from "firebase/app";
+import { getFunctions, httpsCallable } from "firebase/functions";
 
 const SCORING_DISPLAY = [
   { label: "Appearance", detail: "+1 (any minutes)" },
@@ -227,6 +229,22 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
   );
 }
 
+function parseCupWindowId(windowId) {
+  const s = String(windowId || "");
+  const colon = s.lastIndexOf(":");
+  if (colon < 0) return null;
+
+  const range = s.slice(colon + 1); // "min-max"
+  const dash = range.indexOf("-");
+  if (dash < 0) return null;
+
+  const startAtMs = Number(range.slice(0, dash));
+  const endAtMs = Number(range.slice(dash + 1));
+
+  if (!Number.isFinite(startAtMs) || !Number.isFinite(endAtMs)) return null;
+  return { startAtMs, endAtMs };
+}
+
 export default function CupTournamentPage() {
   const { roomId } = useParams();
   const { loading, error, data } = useTournament(roomId);
@@ -237,6 +255,10 @@ export default function CupTournamentPage() {
   const [cupDoc, setCupDoc] = useState(null);
   const [lineups, setLineups] = useState({});
   const [picksMap, setPicksMap] = useState({});
+  const [finalResultsDoc, setFinalResultsDoc] = useState(null);
+  //History 
+  const [historyRounds, setHistoryRounds] = useState([]);
+  const [selectedHistoryId, setSelectedHistoryId] = useState("");
   const [devPreviewComplete, setDevPreviewComplete] = useState(false);
   
   // Accordion State
@@ -244,6 +266,19 @@ export default function CupTournamentPage() {
   const [expandedOtherUser, setExpandedOtherUser] = useState(null);
   const [showScoring, setShowScoring] = useState(false);
   const scoringRef = useRef(null);
+
+  const [devBusy, setDevBusy] = useState(false);
+  
+
+  useEffect(() => {
+    if (!roomId) return;
+
+    return onSnapshot(
+      doc(db, "rooms", roomId, "finalResults", "current"),
+      (snap) => setFinalResultsDoc(snap.exists() ? snap.data() : null),
+      () => setFinalResultsDoc(null)
+    );
+  }, [roomId]);
 
   useEffect(() => {
     if (!showScoring) return;
@@ -270,25 +305,55 @@ export default function CupTournamentPage() {
   // Listen to Cup, Lineups, and Picks
   useEffect(() => {
     if (!roomId) return;
-    const unsubCup = onSnapshot(doc(db, "rooms", roomId, "cup", "current"), (snap) => setCupDoc(snap.exists() ? snap.data() : null));
-    
-    const unsubLineups = onSnapshot(collection(db, "rooms", roomId, "lineups"), (snap) => {
-      const m = {};
-      snap.forEach(d => m[d.id] = d.data());
-      setLineups(m);
-    });
 
-    const unsubPicks = onSnapshot(collection(db, "rooms", roomId, "picks"), (snap) => {
-      const m = {};
-      snap.forEach(d => {
-        const val = d.data();
-        const pid = String(val.playerId || val.pid || val.apiPlayerId || "");
-        if (pid) m[pid] = val;
+    const unsubCup = onSnapshot(
+      doc(db, "rooms", roomId, "cup", "current"),
+      (snap) => setCupDoc(snap.exists() ? snap.data() : null)
+    );
+
+    const unsubLineups = onSnapshot(
+      collection(db, "rooms", roomId, "lineups"),
+      (snap) => {
+        const m = {};
+        snap.forEach((d) => (m[d.id] = d.data()));
+        setLineups(m);
+      }
+    );
+
+    const unsubPicks = onSnapshot(
+      collection(db, "rooms", roomId, "picks"),
+      (snap) => {
+        const m = {};
+        snap.forEach((d) => {
+          const val = d.data();
+          const pid = String(val.playerId || val.pid || val.apiPlayerId || "");
+          if (pid) m[pid] = val;
+        });
+        setPicksMap(m);
+      }
+    );
+
+    const historyQ = query(
+      collection(db, "rooms", roomId, "cupHistory"),
+      orderBy("closedAtMs", "desc")
+    );
+
+    const unsubHistory = onSnapshot(historyQ, (snap) => {
+      const rows = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      setHistoryRounds(rows);
+
+      setSelectedHistoryId((prev) => {
+        if (prev && rows.some((r) => r.id === prev)) return prev;
+        return "";
       });
-      setPicksMap(m);
     });
 
-    return () => { unsubCup(); unsubLineups(); unsubPicks(); };
+    return () => {
+      unsubCup();
+      unsubLineups();
+      unsubPicks();
+      unsubHistory();
+    };
   }, [roomId]);
 
   if (!roomId) return null;
@@ -317,8 +382,6 @@ export default function CupTournamentPage() {
     const statusLower = String(statusRaw).toLowerCase();
 
     const currentWindowLabel = cupDoc?.currentWindowLabel || "Waiting for next round";
-    const cupTotals = cupDoc?.cupTotalsByUid || {};
-    const windowPoints = cupDoc?.windowPointsByUid || {};
     const isFinal = status === "FINAL" || cupDoc?.completed;
 
     // --- Live-style header timing (match TournamentPage feel) ---
@@ -333,46 +396,126 @@ export default function CupTournamentPage() {
     const statusClass = isLive ? "live" : isResolving ? "resolving" : "idle";
     const statusLabel = isLive ? "LIVE" : isResolving ? "RESOLVING" : "IDLE";
 
-  // Build Leaderboard
-  const leaderboard = users.map((u) => ({
-    userId: u.userId,
-    name: u.name || u.displayName,
-    totalPoints: Number(cupTotals[u.userId] || 0),
-  })).sort((a, b) => b.totalPoints - a.totalPoints);
+    const cupTotals = cupDoc?.cupTotalsByUid || {};
+    const livePoints = cupDoc?.livePointsByUid || {}; // NEW
+    const windowPoints = cupDoc?.windowPointsByUid || {};
+
+    // Build Leaderboard (Base + Live)
+    const leaderboard = users.map((u) => {
+      const base = Number(cupTotals[u.userId] || 0);
+      const live = Number(livePoints[u.userId] || 0);
+      return {
+        userId: u.userId,
+        name: u.name || u.displayName,
+        totalPoints: base + live,
+      };
+    }).sort((a, b) => b.totalPoints - a.totalPoints);
 
   const fakePodiumData = {
     computedAtMs: Date.now(),
-    top3: leaderboard.slice(0, 3).map((u, i) => ({ ...u, rank: i + 1, totalFantasyPoints: u.totalPoints }))
+    top3: leaderboard.slice(0, 3).map((u, i) => ({
+      userId: u.userId,
+      uid: u.userId,
+      name: u.name,
+      rank: i + 1,
+      wins: 0,
+      draws: 0,
+      losses: 0,
+      tablePoints: u.totalPoints,
+      totalFantasyPoints: u.totalPoints,
+    })),
   };
-  const showFinalPodium = devPreviewComplete || isFinal;
+  const showFinalPodium = devPreviewComplete || Boolean(finalResultsDoc) || isFinal;
 
   // Resolve Rosters Helper
+  function firstNonEmptyArray(...candidates) {
+    for (const arr of candidates) {
+      if (Array.isArray(arr) && arr.length) return arr;
+    }
+    return [];
+  }
+
+  function getLineupIds(lineup, type) {
+    if (!lineup) return [];
+
+    const source =
+      type === "starters"
+        ? firstNonEmptyArray(
+            lineup.starters,
+            lineup.startingXI,
+            lineup.starting11,
+            lineup.starterIds,
+            lineup.startingIds,
+            lineup.lineup?.startingXI,
+            lineup.lineup?.starting11,
+            lineup.lineup?.starters
+          )
+        : firstNonEmptyArray(
+            lineup.bench,
+            lineup.subs,
+            lineup.substitutes,
+            lineup.benchIds,
+            lineup.subIds,
+            lineup.benchPlayers,
+            lineup.benchPlayerIds,
+            lineup.lineup?.bench,
+            lineup.lineup?.subs,
+            lineup.currentLineup?.bench,
+            lineup.currentLineup?.subs
+          );
+
+    return extractIds(source);
+  }
+
+  const selectedHistory =
+    selectedHistoryId
+      ? historyRounds.find((r) => r.id === selectedHistoryId) || null
+      : null;
+
+  const selectedHistoryRows = Array.isArray(selectedHistory?.rows)
+    ? selectedHistory.rows
+    : [];
+
+  const selectedHistoryLabel = selectedHistory?.label || "—";
+  const selectedHistoryRange =
+    selectedHistory?.startAtMs && selectedHistory?.endAtMs
+      ? `${fmtDT(selectedHistory.startAtMs)} → ${fmtDT(selectedHistory.endAtMs)}`
+      : "—";
+
+  const activeBreakdownByUserId =
+    selectedHistory?.breakdownByUserId ||
+    cupDoc?.breakdownByUserId ||
+    {};
+
   function getResolvedRoster(uid, type) {
     const lineup = lineups[uid] || {};
-    let ids = [];
-    if (type === 'starters') {
-       ids = extractIds(lineup.starters || lineup.startingXI || lineup.starting11);
-    } else {
-       ids = extractIds(lineup.bench || lineup.subs);
-    }
-    return ids.map(pid => {
-       const pick = picksMap[pid] || {};
-       return {
-            id: pid,
-            name: pick.playerName || pick.name || "Unknown",
-            position: pick.position || pick.pos || "MID",
-            points: pick.lastDelta || 0, // shows points from the last processed window
-            teamName: pick.teamName || "",
-            stats: pick.lastStats || pick.stats || null,
-            breakdown: pick.lastBreakdown || pick.breakdown || null,
-            teamName: pick.lastRealTeamName || pick.teamName || "",
-            opponentName: pick.lastOpponentName || pick.opponentName || "",
-        };
+    const ids = getLineupIds(lineup, type);
+
+    const cupUserBreakdown = activeBreakdownByUserId?.[uid] || {};
+    const perPlayer = cupUserBreakdown?.perPlayer || {};
+
+    return ids.map((pid) => {
+      const pick = picksMap[pid] || {};
+      const live = perPlayer[pid] || {};
+
+      return {
+        id: pid,
+        name: live.name || pick.playerName || pick.name || "Unknown",
+        position: live.position || pick.position || pick.pos || "MID",
+        points: Number(live.points ?? pick.lastDelta ?? 0),
+        counted: live.counted ?? (pick.lastCounted !== false),
+        stats: live.stats || pick.lastStats || pick.stats || null,
+        breakdown: live.breakdown || pick.lastBreakdown || pick.breakdown || null,
+        teamName: live.teamName || pick.lastRealTeamName || pick.teamName || "",
+        opponentName: live.opponentName || pick.lastOpponentName || pick.opponentName || "",
+      };
     });
   }
 
   const myStarters = sortPlayersForDisplay(getResolvedRoster(myUid, 'starters'));
   const myBench = sortPlayersForDisplay(getResolvedRoster(myUid, 'bench'));
+  const myRoundTotal = Number(activeBreakdownByUserId?.[myUid]?.total || 0);
+  const myBenchTotal = Number(activeBreakdownByUserId?.[myUid]?.benchTotal || 0);
   const otherUsers = users.filter(u => u.userId !== myUid);
 
   async function copyRoomCode() {
@@ -384,6 +527,24 @@ export default function CupTournamentPage() {
     }
   }
 
+  async function forceRunCup() {
+    try {
+      setDevBusy(true);
+
+      const functions = getFunctions(getApp(), "us-west2");
+      const callForceRunCup = httpsCallable(functions, "debugForceRunCup");
+      const res = await callForceRunCup({ roomId });
+
+      console.log("debugForceRunCup:", res.data);
+      alert(res.data?.message || "Cup sync complete.");
+    } catch (e) {
+      console.error("debugForceRunCup failed", e);
+      alert(e?.message || "Cup sync failed.");
+    } finally {
+      setDevBusy(false);
+    }
+  }
+
     const roomNextLabel =
         data?.room?.competitionState?.currentLabel ||
         data?.room?.["competitionState.currentLabel"] ||
@@ -391,24 +552,29 @@ export default function CupTournamentPage() {
 
     const nextGameLabel = roomNextLabel || currentWindowLabel || "—";
 
-    const nextLabel =
+  const parsedWindow = parseCupWindowId(cupDoc?.currentWindowId);
+
+  const nextLabel =
+    cupDoc?.currentWindowLabel ||
     data?.room?.competitionState?.currentLabel ||
     data?.room?.["competitionState.currentLabel"] ||
-    cupDoc?.currentWindowLabel ||
     "—";
 
-    const winStartMs =
+  const winStartMs =
     cupDoc?.currentWindowStartAtMs ??
     cupDoc?.startAtMs ??
+    parsedWindow?.startAtMs ??
     null;
 
-    const winEndMs =
+  const winEndMs =
     cupDoc?.currentWindowEndAtMs ??
     cupDoc?.endAtMs ??
+    parsedWindow?.endAtMs ??
     null;
 
-    const winText =
+  const winText =
     winStartMs && winEndMs ? `${fmtDT(winStartMs)} → ${fmtDT(winEndMs)}` : "—";
+
 
   return (
     <div className="tpPage">
@@ -424,7 +590,7 @@ export default function CupTournamentPage() {
                 </div>
               )}
                 <div className="tpRoomMeta">
-                    Next Game: <b>{winText}</b> • Round: <b style={{ color: "var(--color-primary)" }}>{nextLabel}</b>
+                    Next Games: <b>{winText}</b> • Round: <b style={{ color: "var(--color-primary)" }}>{nextLabel}</b>
                 </div>
               <div className="tpRoomMeta">Room: <b>{roomId}</b></div>
               <div className="tpLiveHeaderLine">
@@ -466,6 +632,15 @@ export default function CupTournamentPage() {
                         {devPreviewComplete ? "Hide Podium" : "DEV: Preview Final Podium"}
                     </button>
 
+                    <button
+                      type="button"
+                      className="tpToolsItem"
+                      onClick={forceRunCup}
+                      disabled={devBusy}
+                    >
+                      {devBusy ? "Running Cup Sync..." : "DEV: Fix Cup Fixtures / Points"}
+                    </button>
+
                     <button type="button" className="tpToolsItem" onClick={copyRoomCode}>
                         Copy Room Code
                     </button>
@@ -495,8 +670,13 @@ export default function CupTournamentPage() {
           {showFinalPodium && (
             <div className="tpCard tpFull">
               <FinalResultsCard
-                finalResults={fakePodiumData}
-                formatDate={fmtDT}
+                finalResults={devPreviewComplete ? fakePodiumData : finalResultsDoc}
+                title="Cup Complete"
+                subtitle="Final Podium"
+                badge="🏆"
+                showWdl={false}
+                matchLabel="Competition"
+                fantasyLabel="Fantasy"
                 renderUser={(uid, fallbackName) => (
                   <UserChip user={userById?.[uid] || { userId: uid, name: fallbackName }} />
                 )}
@@ -531,7 +711,7 @@ export default function CupTournamentPage() {
                 <div className="tpSide tpSideMe tpSideSolo">
                   <div className="tpLineupHead">
                     <span className="tpLineupName"><UserChip user={userById[myUid] || { userId: myUid, name: "You" }} /></span>
-                    <span className="tpLineupTotal">{cupTotals[myUid] || 0} pts</span>
+                    <span className="tpLineupTotal">{myRoundTotal} pts</span>
                   </div>
                   
                   <div className="tpSectionLabel">Starters</div>
@@ -561,11 +741,16 @@ export default function CupTournamentPage() {
                     })}
                   </ul>
 
-                  {myBench.length > 0 && (
                     <details className="tpBenchDetails">
                       <summary className="tpBenchSummary">
-                        <div className="tpBenchLeft"><span className="tpBenchTitle">Bench</span></div>
-                        <div className="tpBenchRight"><span className="tpBenchCaret">▾</span></div>
+                        <div className="tpBenchLeft">
+                          <span className="tpBenchTitle">Bench</span>
+                          <span className="tpBenchNote">Not counted</span>
+                        </div>
+                        <div className="tpBenchRight">
+                          <span className="tpLineupTotal">{myBenchTotal} pts</span>
+                          <span className="tpBenchCaret">▾</span>
+                        </div>
                       </summary>
                       <ul className="tpList tpBenchList">
                         {myBench.map((p) => {
@@ -593,7 +778,7 @@ export default function CupTournamentPage() {
                         })}
                       </ul>
                     </details>
-                  )}
+                
                 </div>
               </div>
             </div>
@@ -612,6 +797,9 @@ export default function CupTournamentPage() {
                     const oppStarters = sortPlayersForDisplay(getResolvedRoster(u.userId, 'starters'));
                     const oppBench = sortPlayersForDisplay(getResolvedRoster(u.userId, 'bench'));
 
+                    const oppRoundTotal = Number(activeBreakdownByUserId?.[u.userId]?.total || 0);
+                    const oppBenchTotal = Number(activeBreakdownByUserId?.[u.userId]?.benchTotal || 0);
+
                     return (
                       <div key={u.userId} className={`tpOtherMatchupItem ${isOpen ? "open" : ""}`}>
                         <button
@@ -621,7 +809,7 @@ export default function CupTournamentPage() {
                         >
                           <div className="tpMatchTeams"><UserChip user={u} /></div>
                           <div className="tpOtherScore">
-                            <span className="tpMatchScore">{cupTotals[u.userId] || 0} pts</span>
+                            <span className="tpPts">{oppRoundTotal} pts</span>
                             <span className={`tpCaret ${isOpen ? "open" : ""}`}>▾</span>
                           </div>
                         </button>
@@ -655,11 +843,17 @@ export default function CupTournamentPage() {
                                   })}
                                 </ul>
 
-                                {oppBench.length > 0 && (
+                                
                                   <details className="tpBenchDetails">
                                     <summary className="tpBenchSummary">
-                                      <div className="tpBenchLeft"><span className="tpBenchTitle">Bench</span></div>
-                                      <div className="tpBenchRight"><span className="tpBenchCaret">▾</span></div>
+                                      <div className="tpBenchLeft">
+                                        <span className="tpBenchTitle">Bench</span>
+                                        <span className="tpBenchNote">Not counted</span>
+                                      </div>
+                                      <div className="tpBenchRight">
+                                        <span className="tpLineupTotal">{oppBenchTotal} pts</span>
+                                        <span className="tpBenchCaret">▾</span>
+                                      </div>
                                     </summary>
                                     <ul className="tpList tpBenchList">
                                       {oppBench.map((p) => {
@@ -674,13 +868,20 @@ export default function CupTournamentPage() {
                                             </div>
                                               <div className="tpPts">{p.points} pts</div>
                                             </div>
-                                            {isPlayerOpen && <PlayerStatsCard teamName={p.teamName} />}
+                                            {isPlayerOpen && (
+                                              <PlayerStatsCard
+                                                stats={p.stats}
+                                                breakdown={p.breakdown}
+                                                teamName={p.teamName}
+                                                opponentName={p.opponentName}
+                                              />
+                                            )}
                                           </li>
                                         );
                                       })}
                                     </ul>
                                   </details>
-                                )}
+                                
                               </div>
                             </div>
                           </div>
@@ -692,6 +893,75 @@ export default function CupTournamentPage() {
               )}
             </div>
           )}
+          
+          {/* ROUND HISTORY */}
+          <div className="tpCard tpFull">
+            <div className="tpHistoryHeader">
+              <h3 className="tpCardTitle tpHistoryTitle">Round History</h3>
+
+              <div className="tpHistoryControls">
+                <select
+                  className="tpHistorySelect"
+                  value={selectedHistoryId}
+                  onChange={(e) => setSelectedHistoryId(e.target.value)}
+                  disabled={historyRounds.length === 0}
+                >
+                  <option value="">
+                    {historyRounds.length === 0 ? "No completed rounds yet" : "Select a previous round…"}
+                  </option>
+
+                  {historyRounds.map((h) => (
+                    <option key={h.id} value={h.id}>
+                      {h.label || "Cup"}
+                      {h.startAtMs && h.endAtMs ? ` — ${fmtDT(h.startAtMs)} → ${fmtDT(h.endAtMs)}` : ""}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            {selectedHistory == null ? (
+              <p className="tpText">Pick a previous round to view final scores.</p>
+            ) : (
+              <>
+                <p className="tpText tpHistoryMeta">
+                  Window: <b>{selectedHistoryRange}</b>
+                  {selectedHistoryLabel ? (
+                    <>
+                      {" "}• Round: <b>{selectedHistoryLabel}</b>
+                    </>
+                  ) : null}
+                </p>
+
+                {selectedHistoryRows.length > 0 ? (
+                  <div className="tpHistoryTableWrap">
+                    <table className="tpHistoryTable">
+                      <thead>
+                        <tr>
+                          <th>#</th>
+                          <th>Manager</th>
+                          <th>This Round</th>
+                          <th>Total After</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {selectedHistoryRows.map((row) => (
+                          <tr key={row.userId || row.uid}>
+                            <td>{row.rank}</td>
+                            <td>{row.name || "Unknown"}</td>
+                            <td>{Number(row.roundPoints || 0)}</td>
+                            <td>{Number(row.totalAfter || 0)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                ) : (
+                  <p className="tpText">No scores saved for this round yet.</p>
+                )}
+              </>
+            )}
+          </div>
 
         </div>
       </div>

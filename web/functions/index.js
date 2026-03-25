@@ -2927,6 +2927,101 @@ exports.debugForceUpdateWeek = onCall(
   }
 );
 
+exports.debugForceRunCup = onCall(
+  { region: "us-west2", secrets: [APIFOOTBALL_KEY] },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) throw new HttpsError("unauthenticated", "Sign in required.");
+
+    const roomId = request.data?.roomId;
+    if (!roomId) throw new HttpsError("invalid-argument", "roomId is required.");
+
+    const roomRef = db.doc(`rooms/${roomId}`);
+    const roomSnap = await roomRef.get();
+    if (!roomSnap.exists) throw new HttpsError("not-found", "Room not found.");
+
+    const room = roomSnap.data() || {};
+    if (!isHost(room, uid)) throw new HttpsError("permission-denied", "Host only.");
+
+    const phase =
+      room?.competitionState?.phaseLabel ??
+      room?.["competitionState.phaseLabel"] ??
+      room?.competitionState?.phaseLable ??
+      room?.["competitionState.phaseLable"] ??
+      null;
+
+    if (phase !== "Cup") {
+      throw new HttpsError("failed-precondition", "Room is not in Cup phase.");
+    }
+
+    const apiKey = APIFOOTBALL_KEY.value();
+    const nowMs = Date.now();
+
+    await roomRef.set(
+      {
+        "competitionState.weekStatus": "scheduled",
+        "competitionState.updatedAtMs": nowMs,
+        "competitionState.isDone": false,
+      },
+      { merge: true }
+    );
+
+    await db.doc(`rooms/${roomId}/cup/current`).set(
+      {
+        status: "scheduled",
+        completed: false,
+        updatedAtMs: nowMs,
+        lastManualDebugAtMs: nowMs,
+        lastError: FieldValue.delete(),
+        lastErrorAtMs: FieldValue.delete(),
+
+        // clear stale active window so engine re-arms the real next round
+        currentWindowId: FieldValue.delete(),
+        currentWindowLabel: FieldValue.delete(),
+        currentWindowStartAtMs: FieldValue.delete(),
+        currentWindowEndAtMs: FieldValue.delete(),
+        currentWindowFixtureIds: [],
+        windowPointsByUid: {},
+        creditedFixtures: {},
+        livePointsByUid: {},
+        breakdownByUserId: {},
+      },
+      { merge: true }
+    );
+    await runCupEngine({
+      db,
+      roomId,
+      room: {
+        ...room,
+        competitionState: {
+          ...(room.competitionState || {}),
+          weekStatus: "scheduled",
+          isDone: false,
+        },
+      },
+      nowMs,
+      apiKey,
+      apiFootballGet,
+      getFixtureStatusMap,
+      getFixturePlayersStatsMapCached,
+    });
+
+    const [cupSnap, freshRoomSnap] = await Promise.all([
+      db.doc(`rooms/${roomId}/cup/current`).get(),
+      roomRef.get(),
+    ]);
+
+    return {
+      ok: true,
+      message: "Cup sync ran successfully.",
+      cup: cupSnap.exists ? cupSnap.data() : null,
+      competitionState: freshRoomSnap.exists
+        ? (freshRoomSnap.data()?.competitionState || null)
+        : null,
+    };
+  }
+);
+
 
 exports.debugForceFinalizeSeason = onCall(
   { region: "us-west2" },
