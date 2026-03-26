@@ -57,6 +57,15 @@ function extractStarterIdsOrInline(lineupData) {
     lineupData.currentLineup?.starters,
     lineupData.currentLineup?.startingXI,
     lineupData.currentLineup?.starting11,
+    lineupData.benchXI,
+    lineupData.benchPlayers,
+    lineupData.benchPlayerIds,
+    lineupData.lineup?.benchXI,
+    lineupData.lineup?.benchPlayers,
+    lineupData.lineup?.benchPlayerIds,
+    lineupData.currentLineup?.benchXI,
+    lineupData.currentLineup?.benchPlayers,
+    lineupData.currentLineup?.benchPlayerIds,
   ];
 
   for (const c of candidates) {
@@ -104,6 +113,22 @@ function extractBenchIdsOrInline(lineupData) {
   return { inline: [], ids: [] };
 }
 
+async function fetchRoomPicks(roomId) {
+  const snap = await getDocs(collection(db, "rooms", roomId, "picks"));
+  return snap.docs.map((d) => ({ id: d.id, ...(d.data() || {}) }));
+}
+
+function inferOwnerUidFromPick(d) {
+  const v =
+    d?.ownerUid ?? d?.ownerId ?? d?.ownedBy ?? d?.managerUid ??
+    d?.userId ?? d?.uid ?? d?.pickedByUid ?? d?.pickedBy ??
+    d?.owner?.uid ?? d?.owner?.id;
+
+  if (!v) return null;
+  if (typeof v === "string") return v;
+  if (typeof v === "object") return v.uid || v.id || null;
+  return null;
+}
 
 async function fetchUserDoc(uid) {
   const snap = await getDoc(doc(db, "users", uid));
@@ -190,9 +215,33 @@ export function useTournament(roomId) {
         const memberUids = memSnap.docs.map((d) => d.id).filter(Boolean);
         if (!memberUids.length) throw new Error("No room members found.");
 
+        // 4) Load picks + infer rosters (your pick model, ideally with playerId and ownerUid fields)
+        const roomPicks = await fetchRoomPicks(roomId);
+
+        const rosterByUid = new Map();
+        const allPlayerIds = [];
+
+        for (const p of roomPicks) {
+          const uid = inferOwnerUidFromPick(p);
+          const pid = String(p.playerId ?? p.pid ?? p.apiPlayerId ?? p.player?.id ?? "");
+          if (!uid || !pid) continue;
+
+          const playerObj = {
+            id: pid,
+            name: p.playerName || p.name || p.player?.name || "Unknown",
+            position: toPos(p.position || p.pos || p.role || p.player?.position),
+          };
+
+          const arr = rosterByUid.get(uid) || [];
+          arr.push(playerObj);
+          rosterByUid.set(uid, arr);
+
+          allPlayerIds.push(pid);
+        }
+
         // 4) Load lineup docs + collect starter IDs that need resolving
         const usersDraft = [];
-        const allStarterIds = [];
+        
 
         for (const uid of memberUids) {
           const [profile, tnDoc, lineup] = await Promise.all([
@@ -209,8 +258,8 @@ export function useTournament(roomId) {
           const { inline, ids } = extractStarterIdsOrInline(lineup);
           const { inline: benchInline, ids: benchIds } = extractBenchIdsOrInline(lineup);
 
-          if (ids.length) allStarterIds.push(...ids);
-          if (benchIds.length) allStarterIds.push(...benchIds);
+          if (ids.length) allPlayerIds.push(...ids);
+          if (benchIds.length) allPlayerIds.push(...benchIds);
 
           usersDraft.push({
             userId: uid,
@@ -226,33 +275,42 @@ export function useTournament(roomId) {
         }
 
         // 5) Resolve starter IDs into player objects using rooms/{roomId}/players/{playerId}
-        const playersById = await fetchPlayersByIds(roomId, allStarterIds);
+        const playersById = await fetchPlayersByIds(roomId, allPlayerIds);
 
         const users = usersDraft.map((u) => {
-          const starters =
-            u.startersInline.length > 0
-              ? u.startersInline
-              : u.starterIds
-                  .map((id) => playersById.get(id) || { id, name: "Unknown", position: "MID" })
-                  .filter(Boolean);
-          
-          const bench =
-            u.benchInline?.length > 0
-              ? u.benchInline
-              : (u.benchIds || [])
-                  .map((id) => playersById.get(id) || { id, name: "Unknown", position: "MID" })
-                  .filter(Boolean);
+        const starters =
+          u.startersInline.length > 0
+            ? u.startersInline
+            : u.starterIds
+                .map((id) => playersById.get(id) || { id, name: "Unknown", position: "MID" })
+                .filter(Boolean);
 
-          return {
+        let bench =
+          u.benchInline?.length > 0
+            ? u.benchInline
+            : (u.benchIds || [])
+                .map((id) => playersById.get(id) || { id, name: "Unknown", position: "MID" })
+                .filter(Boolean);
+
+        if (!bench.length) {
+          const roster = rosterByUid.get(u.userId) || [];
+          const starterSet = new Set(starters.map((p) => String(p.id)));
+          bench = roster.filter((p) => p?.id && !starterSet.has(String(p.id)));
+        } else {
+          const starterSet = new Set(starters.map((p) => String(p.id)));
+          bench = bench.filter((p) => p?.id && !starterSet.has(String(p.id)));
+        }
+
+        return {
           userId: u.userId,
-          name: u.name,               
-          displayName: u.displayName, 
+          name: u.name,
+          displayName: u.displayName,
           teamName: u.teamName,
           photoURL: u.photoURL,
           starters,
           bench,
         };
-        });
+      });
 
         // 6) Stats + LOCAL compute (Option A fallback)
         const provider = getStatsProvider();

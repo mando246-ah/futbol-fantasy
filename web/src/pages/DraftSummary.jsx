@@ -494,7 +494,7 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, teamName, ro
   }, [orderedPicks]);
 
 
-  const [lineupDoc, setLineupDoc] = useState(null);
+  const [lineupDoc, setLineupDoc] = useState(undefined);
   const [pendingIn, setPendingIn] = useState(null); // bench player picked to sub in
   const didInitLineup = useRef(false);
   const didRepairLineup = useRef(false);
@@ -628,57 +628,87 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, teamName, ro
   const pendingPick = pendingIn ? pickByKey.get(pendingIn) : null;
   const pendingIsLive = pendingPick ? isPickLive(pendingPick) : false;
 
+  async function saveStarters(next) {
+    if (!isMe || lockedNow) return;
 
-async function saveStarters(next) {
-  if (!isMe || lockedNow) return;
+    const clean = (next || []).slice(0, STARTING_CAP);
 
-  const clean = (next || []).slice(0, STARTING_CAP);
+    const v = validateStarters(clean);
+    if (!v.ok) {
+      alert(
+        `Invalid starting XI (Rules: GK 1, DEF 3–5, MID 3–5, ATT 1–3)\n\n${v.errors.join("\n")}`
+      );
+      return;
+    }
+    
+    // 1) Build detailed objects for starters
+    const startingXI = clean.map((k) => {
+      const p = pickByKey.get(k);
+      const rawPos = (p?.position || "MID").toUpperCase();
+      const normPos = rawPos === "ATT" ? "FWD" : rawPos;
 
-  const v = validateStarters(clean);
-  if (!v.ok) {
-    alert(
-      `Invalid starting XI (Rules: GK 1, DEF 3–5, MID 3–5, ATT 1–3)\n\n${v.errors.join("\n")}`
-    );
-    return;
+      return {
+        id: k,
+        name: p?.playerName || "",
+        position: normPos,
+        teamId: p?.teamId ?? p?.apiTeamId ?? null,
+        apiPlayerId: p?.apiPlayerId ?? null,
+      };
+    });
+
+    // 2) Build explicit bench lists for BOTH regular season and cup engines
+    const sSet = new Set(clean);
+    const benchKeys = allKeys.filter(k => !sSet.has(k));
+    
+    const benchXI = benchKeys.map((k) => {
+      const p = pickByKey.get(k);
+      const rawPos = (p?.position || "MID").toUpperCase();
+      const normPos = rawPos === "ATT" ? "FWD" : rawPos;
+
+      return {
+        id: k,
+        name: p?.playerName || "",
+        position: normPos,
+        teamId: p?.teamId ?? p?.apiTeamId ?? null,
+        apiPlayerId: p?.apiPlayerId ?? null,
+      };
+    });
+
+    try {
+      // 3) Keep the member mirror update (Crucial for both engines to see you)
+      await setDoc(
+        doc(db, "rooms", lineupRoomId, "members", myUid),
+        { uid: myUid, lastSeenAt: serverTimestamp() },
+        { merge: true }
+      );
+
+      // 4) Write lineup with FULL explicit data for both Matchday & Cup
+      await setDoc(
+        doc(db, "rooms", lineupRoomId, "lineups", myUid),
+        {
+          uid: myUid,
+          starters: clean,       // String IDs
+          startingXI,            // Objects
+          bench: benchKeys,      // String IDs for Bench (Cup/Regular)
+          benchXI,               // Objects for Bench
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+    } catch (error) {
+      console.error("Failed to save substitution:", error);
+      alert("Substitution failed. Check console for details.");
+    }
   }
-  
-  const startingXI = clean.map((k) => {
-    const p = pickByKey.get(k);
-    const rawPos = (p?.position || "MID").toUpperCase();
-    const normPos = rawPos === "ATT" ? "FWD" : rawPos;
 
-    return {
-      id: k,
-      name: p?.playerName || "",
-      position: normPos,
-      teamId: p?.teamId ?? p?.apiTeamId ?? null,
-      apiPlayerId: p?.apiPlayerId ?? null,
-    };
-  });
-
-  // 1) Ensure member mirror exists (helps your rules / membership logic)
-  await setDoc(
-      doc(db, "rooms", lineupRoomId, "members", myUid),
-      { uid: myUid, lastSeenAt: serverTimestamp() },
-      { merge: true }
-    );
-
-    // 2) Write lineup
-    await setDoc(
-      doc(db, "rooms", lineupRoomId, "lineups", myUid),
-      {
-        uid: myUid,
-        starters: clean,       // keep IDs for UI logic
-        startingXI,            // NEW: objects for tournament + API
-        updatedAt: serverTimestamp(),
-      },
-      { merge: true }
-    );
-  }
 
   useEffect(() => {
     if (!isMe || lockedNow) return;
-    if (lineupDoc) return;                 // already saved
+    
+    // CRITICAL FIX: Only auto-initialize if we have explicitly confirmed the DB doc is completely empty (null).
+    // If it is undefined, it means Firebase is still loading, so we must wait!
+    if (lineupDoc !== null) return; 
+    
     if (didInitLineup.current) return;     // prevent double-write
     if (!allKeys.length) return;
 

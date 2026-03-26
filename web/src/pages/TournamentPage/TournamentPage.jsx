@@ -187,6 +187,77 @@ function sortPlayersForDisplay(list = []) {
   });
 }
 
+function firstText(...values) {
+  for (const v of values) {
+    const s = String(v ?? "").trim();
+    if (s) return s;
+  }
+  return "";
+}
+
+function getPlayerCountry(player = {}, entry = null, pick = null) {
+  return firstText(
+    player?.country,
+    player?.nationality,
+    player?.playerCountry,
+    player?.birthCountry,
+
+    pick?.country,
+    pick?.nationality,
+    pick?.playerCountry,
+    pick?.birthCountry,
+
+    entry?.country,
+    entry?.nationality,
+    entry?.playerCountry
+  );
+}
+
+function getPlayerClub(player = {}, entry = null, pick = null) {
+  return firstText(
+    player?.clubName,
+    player?.club,
+    player?.teamName,
+    player?.realTeamName,
+    player?.team?.name,
+
+    pick?.clubName,
+    pick?.club,
+    pick?.teamName,
+    pick?.realTeamName,
+    pick?.team?.name,
+    pick?.lastRealTeamName,
+
+    entry?.clubName,
+    entry?.club,
+    entry?.realTeamName,
+    entry?.teamName
+  );
+}
+
+function PlayerIdentity({ name, country, club }) {
+  return (
+    <div className="tpPlayerInfo">
+      <span className="tpName">{name}</span>
+
+      {(country || club) && (
+        <div className="tpPlayerSubline">
+          {country ? (
+            <span className="tpPlayerSubItem">
+              <FlagIcon country={country} size={14} title={country} />
+              <span>{country}</span>
+            </span>
+          ) : null}
+          •
+          {club ? (
+            <span className="tpPlayerSubItem tpPlayerClub">{club}</span>
+          ) : null}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function pointsFromEntry(entry) {
   if (typeof entry === "number") return entry;
   if (entry && typeof entry === "object") return Number(entry.points ?? 0) || 0;
@@ -258,9 +329,32 @@ export default function TournamentPage() {
   const { loading, error, data } = useTournament(roomId);
   const [myUid, setMyUid] = useState(auth.currentUser?.uid || null);
   const [nowMs, setNowMs] = useState(() => Date.now());
+  const [picksMap, setPicksMap] = useState({});
   
 
 
+  useEffect(() => {
+    if (!roomId) {
+      setPicksMap({});
+      return;
+    }
+
+    const unsub = onSnapshot(
+      collection(db, "rooms", roomId, "picks"),
+      (snap) => {
+        const map = {};
+        snap.forEach((d) => {
+          const val = d.data() || {};
+          const pid = String(val.playerId || val.pid || val.apiPlayerId || "");
+          if (pid) map[pid] = val;
+        });
+        setPicksMap(map);
+      },
+      () => setPicksMap({})
+    );
+
+    return unsub;
+  }, [roomId]);
   //const myUid = auth.currentUser?.uid;
   useEffect(() => {
     const unsub = auth.onAuthStateChanged((u) => setMyUid(u?.uid || null));
@@ -1268,51 +1362,51 @@ export default function TournamentPage() {
           </div>
           <div className="tpSectionLabel">Starters</div>
           <ul className="tpList">
-            { sortPlayersForDisplay(getStartersList(activeResults, me?.userId, me)).map((p) => {
-              const entry = myBreakdown?.perPlayer?.[p.id];
-              const pts = typeof entry === "number" ? entry : entry?.points ?? 0;
-              const breakdown = typeof entry === "object" ? entry?.breakdown : {};
-              const stats = typeof entry === "object" ? entry?.stats : {};
-              const realTeamName = typeof entry === "object" ? entry?.realTeamName : "";
-              const opponentName = typeof entry === "object" ? entry?.opponentName : "";
-              const isOpen = expandedPlayerId === p.id;
-              const isLive = Boolean(stats?.isLive);
-              
-              return (
-                <li key={p.id} className={`tpRowWrap ${isOpen ? "tpRowOpen" : ""}`}>
-                  <div className="tpRow" onClick={() => togglePlayer(p.id)}>
-                    
-                    {/* COLUMN 1: Name */}
-                    <div className="tpPlayerInfo">
-                      <span className="tpName">{p.name}</span>
-                    </div>
+            {sortPlayersForDisplay(getStartersList(activeResults, me?.userId, me)).map((p) => {
+              const pid = playerIdOf(p);
+              const entry = myBreakdown?.perPlayer?.[pid];
+              const entryObj = typeof entry === "object" ? entry : null;
+              const pickObj = picksMap[pid] || null;
 
-                    {/* COLUMN 2: Position + Status Badges (MERGED INTO ONE DIV) */}
+              const pts = typeof entry === "number" ? entry : entry?.points ?? 0;
+              const breakdown = entryObj?.breakdown || {};
+              const stats = entryObj?.stats || {};
+              const realTeamName = entryObj?.realTeamName || "";
+              const opponentName = entryObj?.opponentName || "";
+              const country = getPlayerCountry(p, entryObj, pickObj);
+              const club = getPlayerClub(p, entryObj, pickObj);
+
+              const isOpen = expandedPlayerId === pid;
+
+              return (
+                <li key={pid} className={`tpRowWrap ${isOpen ? "tpRowOpen" : ""}`}>
+                  <div className="tpRow" onClick={() => togglePlayer(pid)}>
+                    <PlayerIdentity
+                      name={playerNameOf(p)}
+                      country={country}
+                      club={club}
+                    />
+
                     <div className="tpMeta">
-                      {normalizeDisplayPos(p.position)}
+                      {normalizeDisplayPos(playerPosOf(p))}
                       <span className={`tpLivePill ${stats?.isLive ? "live" : "idle"}`}>
                         {stats?.isLive ? "LIVE" : "IDLE"}
                       </span>
                     </div>
 
-                    {/* COLUMN 3: Points */}
-                    <div className="tpPts">
-                      {pts} pts
-                    </div>
+                    <div className="tpPts">{pts} pts</div>
                   </div>
-                  
-                  {/* DROPDOWN CARD (With Team Names passed in) */}
+
                   {isOpen && (
-                    <PlayerStatsCard 
-                      stats={stats} 
+                    <PlayerStatsCard
+                      stats={stats}
                       breakdown={breakdown}
-                      teamName={realTeamName}       
-                      opponentName={opponentName}   
+                      teamName={realTeamName}
+                      opponentName={opponentName}
                     />
                   )}
                 </li>
               );
-                          
             })}
           </ul>
           {(myBench?.length || 0) > 0 && (
@@ -1330,23 +1424,32 @@ export default function TournamentPage() {
 
               <ul className="tpList tpBenchList">
                 {myBench.map((p) => {
-                  const entry = myBreakdown?.perPlayer?.[p.id];
+                  const pid = playerIdOf(p);
+                  const entry = myBreakdown?.perPlayer?.[pid];
+                  const entryObj = typeof entry === "object" ? entry : null;
+                  const pickObj = picksMap[pid] || null;
+
                   const pts = pointsFromEntry(entry);
-                  const breakdown = typeof entry === "object" ? entry?.breakdown : {};
-                  const stats = typeof entry === "object" ? entry?.stats : {};
-                  const realTeamName = typeof entry === "object" ? entry?.realTeamName : "";
-                  const opponentName = typeof entry === "object" ? entry?.opponentName : "";
-                  const isOpen = expandedPlayerId === p.id;
+                  const breakdown = entryObj?.breakdown || {};
+                  const stats = entryObj?.stats || {};
+                  const realTeamName = entryObj?.realTeamName || "";
+                  const opponentName = entryObj?.opponentName || "";
+                  const country = getPlayerCountry(p, entryObj, pickObj);
+                  const club = getPlayerClub(p, entryObj, pickObj);
+
+                  const isOpen = expandedPlayerId === pid;
 
                   return (
-                    <li key={p.id} className={`tpRowWrap ${isOpen ? "tpRowOpen" : ""}`}>
-                      <div className="tpRow" onClick={() => togglePlayer(p.id)}>
-                        <div className="tpPlayerInfo">
-                          <span className="tpName">{p.name}</span>
-                        </div>
+                    <li key={pid} className={`tpRowWrap ${isOpen ? "tpRowOpen" : ""}`}>
+                      <div className="tpRow" onClick={() => togglePlayer(pid)}>
+                        <PlayerIdentity
+                          name={playerNameOf(p)}
+                          country={country}
+                          club={club}
+                        />
 
                         <div className="tpMeta">
-                          {normalizeDisplayPos(p.position)}
+                          {normalizeDisplayPos(playerPosOf(p))}
                           <span className={`tpLivePill ${stats?.isLive ? "live" : "idle"}`}>
                             {stats?.isLive ? "LIVE" : "IDLE"}
                           </span>
@@ -1380,46 +1483,47 @@ export default function TournamentPage() {
           </div>
           <div className="tpSectionLabel">Starters</div>
           <ul className="tpList">
-            { sortPlayersForDisplay(getStartersList(activeResults, opponentUid, opponent)).map((p) => {
-              const entry = oppBreakdown?.perPlayer?.[p.id];
+            {sortPlayersForDisplay(getStartersList(activeResults, opponentUid, opponent)).map((p) => {
+              const pid = playerIdOf(p);
+              const entry = oppBreakdown?.perPlayer?.[pid];
+              const entryObj = typeof entry === "object" ? entry : null;
+              const pickObj = picksMap[pid] || null;
+
               const pts = typeof entry === "number" ? entry : entry?.points ?? 0;
-              const breakdown = typeof entry === "object" ? entry?.breakdown : {};
-              const stats = typeof entry === "object" ? entry?.stats : {};
-              const realTeamName = typeof entry === "object" ? entry?.realTeamName : "";
-              const opponentName = typeof entry === "object" ? entry?.opponentName : "";
-              const isOpen = expandedPlayerId === p.id;
-              const isLive = Boolean(stats?.isLive);
+              const breakdown = entryObj?.breakdown || {};
+              const stats = entryObj?.stats || {};
+              const realTeamName = entryObj?.realTeamName || "";
+              const opponentName = entryObj?.opponentName || "";
+              const country = getPlayerCountry(p, entryObj, pickObj);
+              const club = getPlayerClub(p, entryObj, pickObj);
+
+              const isOpen = expandedPlayerId === pid;
 
               return (
-                <li key={p.id} className={`tpRowWrap ${isOpen ? "tpRowOpen" : ""}`}>
-                  <div className="tpRow" onClick={() => togglePlayer(p.id)}>
-                    
-                    {/* 1. CLEAN ROW: Just the Name */}
-                    <div className="tpPlayerInfo">
-                      <span className="tpName">{p.name}</span>
-                    </div>
+                <li key={pid} className={`tpRowWrap ${isOpen ? "tpRowOpen" : ""}`}>
+                  <div className="tpRow" onClick={() => togglePlayer(pid)}>
+                    <PlayerIdentity
+                      name={playerNameOf(p)}
+                      country={country}
+                      club={club}
+                    />
 
-                    {/* 2. Position Pill */}
                     <div className="tpMeta">
-                      {normalizeDisplayPos(p.position)}
+                      {normalizeDisplayPos(playerPosOf(p))}
                       <span className={`tpLivePill ${stats?.isLive ? "live" : "idle"}`}>
                         {stats?.isLive ? "LIVE" : "IDLE"}
                       </span>
                     </div>
 
-                    {/* 3. Points */}
-                    <div className="tpPts">
-                      {pts} pts
-                    </div>
+                    <div className="tpPts">{pts} pts</div>
                   </div>
-                  
-                  {/* 4. PASS DATA TO CARD */}
+
                   {isOpen && (
-                    <PlayerStatsCard 
-                      stats={stats} 
+                    <PlayerStatsCard
+                      stats={stats}
                       breakdown={breakdown}
-                      teamName={realTeamName}       // <--- NEW PROP
-                      opponentName={opponentName}   // <--- NEW PROP
+                      teamName={realTeamName}
+                      opponentName={opponentName}
                     />
                   )}
                 </li>
@@ -1441,23 +1545,32 @@ export default function TournamentPage() {
 
               <ul className="tpList tpBenchList">
                 {oppBench.map((p) => {
-                  const entry = oppBreakdown?.perPlayer?.[p.id];
+                  const pid = playerIdOf(p);
+                  const entry = oppBreakdown?.perPlayer?.[pid];
+                  const entryObj = typeof entry === "object" ? entry : null;
+                  const pickObj = picksMap[pid] || null;
+
                   const pts = pointsFromEntry(entry);
-                  const breakdown = typeof entry === "object" ? entry?.breakdown : {};
-                  const stats = typeof entry === "object" ? entry?.stats : {};
-                  const realTeamName = typeof entry === "object" ? entry?.realTeamName : "";
-                  const opponentName = typeof entry === "object" ? entry?.opponentName : "";
-                  const isOpen = expandedPlayerId === p.id;
+                  const breakdown = entryObj?.breakdown || {};
+                  const stats = entryObj?.stats || {};
+                  const realTeamName = entryObj?.realTeamName || "";
+                  const opponentName = entryObj?.opponentName || "";
+                  const country = getPlayerCountry(p, entryObj, pickObj);
+                  const club = getPlayerClub(p, entryObj, pickObj);
+
+                  const isOpen = expandedPlayerId === pid;
 
                   return (
-                    <li key={p.id} className={`tpRowWrap ${isOpen ? "tpRowOpen" : ""}`}>
-                      <div className="tpRow" onClick={() => togglePlayer(p.id)}>
-                        <div className="tpPlayerInfo">
-                          <span className="tpName">{p.name}</span>
-                        </div>
+                    <li key={pid} className={`tpRowWrap ${isOpen ? "tpRowOpen" : ""}`}>
+                      <div className="tpRow" onClick={() => togglePlayer(pid)}>
+                        <PlayerIdentity
+                          name={playerNameOf(p)}
+                          country={country}
+                          club={club}
+                        />
 
                         <div className="tpMeta">
-                          {normalizeDisplayPos(p.position)}
+                          {normalizeDisplayPos(playerPosOf(p))}
                           <span className={`tpLivePill ${stats?.isLive ? "live" : "idle"}`}>
                             {stats?.isLive ? "LIVE" : "IDLE"}
                           </span>
@@ -1513,6 +1626,9 @@ export default function TournamentPage() {
 
         const homeBench = getBenchList(activeResults, homeUid, homeUserFull);
         const awayBench = getBenchList(activeResults, awayUid, awayUserFull);
+
+        const homeStarters = getStartersList(activeResults, homeUid, homeUserFull);
+        const awayStarters = getStartersList(activeResults, awayUid, awayUserFull);
 
         const homeBenchTotal = homeBreakdown?.benchTotal ?? sumPointsForList(homeBreakdown, homeBench);
         const awayBenchTotal = awayBreakdown?.benchTotal ?? sumPointsForList(awayBreakdown, awayBench);
@@ -1571,8 +1687,9 @@ export default function TournamentPage() {
                     </div>
                     <div className="tpSectionLabel">Starters</div>
                     <ul className="tpList">
-                      {sortPlayersForDisplay(homeUserFull?.starters || []).map((p) => {
-                        const entry = homeBreakdown?.perPlayer?.[p.id];
+                      {sortPlayersForDisplay(homeStarters).map((p) => {
+                        const pid = playerIdOf(p);
+                        const entry = homeBreakdown?.perPlayer?.[pid];
                         const pts = typeof entry === "number" ? entry : entry?.points ?? 0;
                         const breakdown = typeof entry === "object" ? entry?.breakdown : {};
                         const stats = typeof entry === "object" ? entry?.stats : {};
@@ -1581,17 +1698,17 @@ export default function TournamentPage() {
 
                         const isPlayerOpen =
                           expandedOtherPlayer.matchupKey === matchupKey &&
-                          expandedOtherPlayer.playerId === p.id;
+                          expandedOtherPlayer.playerId === pid;
 
                         return (
-                          <li key={p.id} className={`tpRowWrap ${isPlayerOpen ? "tpRowOpen" : ""}`}>
-                            <div className="tpRow" onClick={() => toggleOtherPlayer(matchupKey, p.id)}>
+                          <li key={pid} className={`tpRowWrap ${isPlayerOpen ? "tpRowOpen" : ""}`}>
+                            <div className="tpRow" onClick={() => toggleOtherPlayer(matchupKey, pid)}>
                               <div className="tpPlayerInfo">
-                                <span className="tpName">{p.name}</span>
+                                <span className="tpName">{playerNameOf(p)}</span>
                               </div>
 
                               <div className="tpMeta">
-                                {normalizeDisplayPos(p.position)}
+                                {normalizeDisplayPos(playerPosOf(p))}
                                 <span className={`tpLivePill ${stats?.isLive ? "live" : "idle"}`}>
                                   {stats?.isLive ? "LIVE" : "IDLE"}
                                 </span>
@@ -1627,25 +1744,27 @@ export default function TournamentPage() {
 
                         <ul className="tpList tpBenchList">
                           {homeBench.map((p) => {
-                            const entry = homeBreakdown?.perPlayer?.[p.id];
+                            const pid = playerIdOf(p);
+                            const entry = homeBreakdown?.perPlayer?.[pid];
                             const pts = pointsFromEntry(entry);
                             const breakdown = typeof entry === "object" ? entry?.breakdown : {};
                             const stats = typeof entry === "object" ? entry?.stats : {};
                             const realTeamName = typeof entry === "object" ? entry?.realTeamName : "";
                             const opponentName = typeof entry === "object" ? entry?.opponentName : "";
+
                             const isOpen =
                               expandedOtherPlayer.matchupKey === matchupKey &&
-                              expandedOtherPlayer.playerId === p.id;
+                              expandedOtherPlayer.playerId === pid;
 
                             return (
-                              <li key={p.id} className={`tpRowWrap ${isOpen ? "tpRowOpen" : ""}`}>
-                                <div className="tpRow" onClick={() => toggleOtherPlayer(matchupKey, p.id)}>
+                              <li key={pid} className={`tpRowWrap ${isOpen ? "tpRowOpen" : ""}`}>
+                                <div className="tpRow" onClick={() => toggleOtherPlayer(matchupKey, pid)}>
                                   <div className="tpPlayerInfo">
-                                    <span className="tpName">{p.name}</span>
+                                    <span className="tpName">{playerNameOf(p)}</span>
                                   </div>
 
                                   <div className="tpMeta">
-                                    {normalizeDisplayPos(p.position)}
+                                    {normalizeDisplayPos(playerPosOf(p))}
                                     <span className={`tpLivePill ${stats?.isLive ? "live" : "idle"}`}>
                                       {stats?.isLive ? "LIVE" : "IDLE"}
                                     </span>
@@ -1680,8 +1799,9 @@ export default function TournamentPage() {
                     </div>
                     <div className="tpSectionLabel">Starters</div>
                     <ul className="tpList">
-                      {sortPlayersForDisplay(awayUserFull?.starters || []).map((p) => {
-                        const entry = awayBreakdown?.perPlayer?.[p.id];
+                      {sortPlayersForDisplay(awayStarters).map((p) => {
+                        const pid = playerIdOf(p);
+                        const entry = awayBreakdown?.perPlayer?.[pid];
                         const pts = typeof entry === "number" ? entry : entry?.points ?? 0;
                         const breakdown = typeof entry === "object" ? entry?.breakdown : {};
                         const stats = typeof entry === "object" ? entry?.stats : {};
@@ -1690,17 +1810,17 @@ export default function TournamentPage() {
 
                         const isPlayerOpen =
                           expandedOtherPlayer.matchupKey === matchupKey &&
-                          expandedOtherPlayer.playerId === p.id;
+                          expandedOtherPlayer.playerId === pid;
 
                         return (
-                          <li key={p.id} className={`tpRowWrap ${isPlayerOpen ? "tpRowOpen" : ""}`}>
-                            <div className="tpRow" onClick={() => toggleOtherPlayer(matchupKey, p.id)}>
+                          <li key={pid} className={`tpRowWrap ${isPlayerOpen ? "tpRowOpen" : ""}`}>
+                            <div className="tpRow" onClick={() => toggleOtherPlayer(matchupKey, pid)}>
                               <div className="tpPlayerInfo">
-                                <span className="tpName">{p.name}</span>
+                                <span className="tpName">{playerNameOf(p)}</span>
                               </div>
 
                               <div className="tpMeta">
-                                {normalizeDisplayPos(p.position)}
+                                {normalizeDisplayPos(playerPosOf(p))}
                                 <span className={`tpLivePill ${stats?.isLive ? "live" : "idle"}`}>
                                   {stats?.isLive ? "LIVE" : "IDLE"}
                                 </span>
@@ -1736,26 +1856,27 @@ export default function TournamentPage() {
 
                         <ul className="tpList tpBenchList">
                           {awayBench.map((p) => {
-                            const entry = awayBreakdown?.perPlayer?.[p.id];
+                            const pid = playerIdOf(p);
+                            const entry = awayBreakdown?.perPlayer?.[pid];
                             const pts = pointsFromEntry(entry);
                             const breakdown = typeof entry === "object" ? entry?.breakdown : {};
                             const stats = typeof entry === "object" ? entry?.stats : {};
                             const realTeamName = typeof entry === "object" ? entry?.realTeamName : "";
                             const opponentName = typeof entry === "object" ? entry?.opponentName : "";
+
                             const isOpen =
                               expandedOtherPlayer.matchupKey === matchupKey &&
-                              expandedOtherPlayer.playerId === p.id;
-
+                              expandedOtherPlayer.playerId === pid;
 
                             return (
-                              <li key={p.id} className={`tpRowWrap ${isOpen ? "tpRowOpen" : ""}`}>
-                                <div className="tpRow" onClick={() => toggleOtherPlayer(matchupKey, p.id)}>
+                              <li key={pid} className={`tpRowWrap ${isOpen ? "tpRowOpen" : ""}`}>
+                                <div className="tpRow" onClick={() => toggleOtherPlayer(matchupKey, pid)}>
                                   <div className="tpPlayerInfo">
-                                    <span className="tpName">{p.name}</span>
+                                    <span className="tpName">{playerNameOf(p)}</span>
                                   </div>
 
                                   <div className="tpMeta">
-                                    {normalizeDisplayPos(p.position)}
+                                    {normalizeDisplayPos(playerPosOf(p))}
                                     <span className={`tpLivePill ${stats?.isLive ? "live" : "idle"}`}>
                                       {stats?.isLive ? "LIVE" : "IDLE"}
                                     </span>
@@ -2037,29 +2158,25 @@ export default function TournamentPage() {
 
 function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
   if (!stats) return null;
-  
+
   const labels = {
-    minutes: "Mins", goals: "Goals", assists: "Assists", 
+    minutes: "Mins", goals: "Goals", assists: "Assists",
     passesCompleted: "Passes", saves: "Saves", goalsConceded: "Conceded",
     yellow: "Yellow", red: "Red", cleanSheet: "Clean Sheet", sixtyPlus: "60+ Mins", appearance: "Appearance",
   };
 
+  const showMatchHeader = Boolean(stats?.isLive && (teamName || opponentName));
+
   return (
     <div className="tpStatsCard">
-      
-      {/* --- NEW: MATCH HEADER INSIDE DROPDOWN --- */}
-      {(teamName || opponentName) && (
+      {showMatchHeader && (
         <div className="tpCardHeader">
-          <span className="tpCardTeam">{teamName}</span>
-          {opponentName && (
-             <span className="tpCardVs">vs {opponentName}</span>
-          )}
+          <span className="tpCardTeam">{teamName || "Unknown Team"}</span>
+          {opponentName && <span className="tpCardVs">vs {opponentName}</span>}
         </div>
       )}
-      {/* ----------------------------------------- */}
 
       <div className="tpStatsGrid">
-        {/* RAW STATS COLUMN */}
         <div className="tpStatsCol">
           <span className="tpStatsHead">Raw Stats</span>
           {Object.entries(stats).map(([k, v]) => {
@@ -2076,7 +2193,6 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
           })}
         </div>
 
-        {/* POINTS BREAKDOWN COLUMN */}
         <div className="tpStatsCol">
           <span className="tpStatsHead">Points</span>
           {Object.entries(breakdown || {}).map(([k, v]) => (

@@ -133,6 +133,61 @@ function sortPlayersForDisplay(list = []) {
   });
 }
 
+function firstText(...values) {
+  for (const v of values) {
+    const s = String(v ?? "").trim();
+    if (s) return s;
+  }
+  return "";
+}
+
+function getPlayerCountry(player = {}, entry = null) {
+  return firstText(
+    player?.country,
+    player?.nationality,
+    player?.playerCountry,
+    player?.birthCountry,
+    entry?.country,
+    entry?.nationality,
+    entry?.playerCountry
+  );
+}
+
+function getPlayerClub(player = {}, entry = null) {
+  return firstText(
+    player?.clubName,
+    player?.club,
+    player?.teamName,
+    player?.team?.name,
+    entry?.clubName,
+    entry?.club,
+    entry?.realTeamName,
+    entry?.teamName
+  );
+}
+
+function PlayerIdentity({ name, country, club }) {
+  return (
+    <div className="tpPlayerInfo">
+      <span className="tpName">{name}</span>
+
+      {(country || club) && (
+        <div className="tpPlayerSubline">
+          {country ? (
+            <span className="tpPlayerSubItem">
+              <FlagIcon country={country} size={14} title={country} />
+              <span>{country}</span>
+            </span>
+          ) : null}
+          • {club ? (
+            <span className="tpPlayerSubItem tpPlayerClub">{club}</span>
+          ) : null}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function extractIds(arr) {
   if (!Array.isArray(arr)) return [];
   return arr.map(x => (typeof x === 'string' ? x : (x.id || x.playerId || x.pid))).filter(Boolean);
@@ -161,8 +216,9 @@ function UserChip({ user }) {
 function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
   const hasStats = stats && Object.keys(stats).length > 0;
   const hasBD = breakdown && Object.keys(breakdown).length > 0;
+  const showMatchHeader = Boolean(stats?.isLive && (teamName || opponentName));
 
-  if (!hasStats && !hasBD && !teamName && !opponentName) {
+  if (!hasStats && !hasBD) {
     return (
       <div className="tpStatsCard">
         <div className="tpStatsGrid">
@@ -180,7 +236,7 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
 
   return (
     <div className="tpStatsCard">
-      {(teamName || opponentName) && (
+      {showMatchHeader && (
         <div className="tpCardHeader">
           <span className="tpCardTeam">{teamName || "Unknown Team"}</span>
           {opponentName && <span className="tpCardVs">vs {opponentName}</span>}
@@ -188,7 +244,6 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
       )}
 
       <div className="tpStatsGrid">
-        {/* RAW STATS */}
         <div className="tpStatsCol">
           <span className="tpStatsHead">Raw Stats</span>
           {Object.entries(stats || {}).map(([k, v]) => {
@@ -205,7 +260,6 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
           })}
         </div>
 
-        {/* POINTS */}
         <div className="tpStatsCol">
           <span className="tpStatsHead">Points</span>
           {Object.entries(breakdown || {}).map(([k, v]) => (
@@ -508,6 +562,20 @@ export default function CupTournamentPage() {
         breakdown: live.breakdown || pick.lastBreakdown || pick.breakdown || null,
         teamName: live.teamName || pick.lastRealTeamName || pick.teamName || "",
         opponentName: live.opponentName || pick.lastOpponentName || pick.opponentName || "",
+        country:
+          live.country ||
+          pick.country ||
+          pick.nationality ||
+          pick.playerCountry ||
+          "",
+        clubName:
+          live.clubName ||
+          pick.clubName ||
+          pick.club ||
+          pick.teamName ||
+          pick.team?.name ||
+          live.teamName ||
+          "",
       };
     });
   }
@@ -574,6 +642,8 @@ export default function CupTournamentPage() {
 
   const winText =
     winStartMs && winEndMs ? `${fmtDT(winStartMs)} → ${fmtDT(winEndMs)}` : "—";
+
+  
 
 
   return (
@@ -718,13 +788,21 @@ export default function CupTournamentPage() {
                   <ul className="tpList">
                     {myStarters.map((p) => {
                       const isOpen = expandedPlayerId === p.id;
+                      const isLiveNow = Boolean(p.stats?.isLive);
                       return (
                         <li key={p.id} className={`tpRowWrap ${isOpen ? "tpRowOpen" : ""}`}>
                           <div className="tpRow" onClick={() => setExpandedPlayerId(isOpen ? null : p.id)}>
-                            <div className="tpPlayerInfo"><span className="tpName">{p.name}</span></div>
+                            <PlayerIdentity
+                              name={p.name}
+                              country={p.country}
+                              club={p.clubName || p.teamName}
+                            />
+
                             <div className="tpMeta">
                               {normalizeDisplayPos(p.position)}
-                              <span className={`tpLivePill ${statusClass}`}>{statusLabel}</span>
+                              <span className={`tpLivePill ${isLiveNow ? "live" : "idle"}`}>
+                                {isLiveNow ? "LIVE" : "IDLE"}
+                              </span>
                             </div>
                             <div className="tpPts">{p.points} pts</div>
                           </div>
@@ -755,13 +833,21 @@ export default function CupTournamentPage() {
                       <ul className="tpList tpBenchList">
                         {myBench.map((p) => {
                           const isOpen = expandedPlayerId === p.id;
+                          const isLiveNow = Boolean(p.stats?.isLive);
                           return (
                             <li key={p.id} className={`tpRowWrap ${isOpen ? "tpRowOpen" : ""}`}>
                               <div className="tpRow" onClick={() => setExpandedPlayerId(isOpen ? null : p.id)}>
-                                <div className="tpPlayerInfo"><span className="tpName">{p.name}</span></div>
+                                <PlayerIdentity
+                                  name={p.name}
+                                  country={p.country}
+                                  club={p.clubName || p.teamName}
+                                />
+
                                 <div className="tpMeta">
                                   {normalizeDisplayPos(p.position)}
-                                  <span className={`tpLivePill ${statusClass}`}>{statusLabel}</span>
+                                  <span className={`tpLivePill ${isLiveNow ? "live" : "idle"}`}>
+                                    {isLiveNow ? "LIVE" : "IDLE"}
+                                  </span>
                                 </div>
                                 <div className="tpPts">{p.points} pts</div>
                               </div>
@@ -822,14 +908,22 @@ export default function CupTournamentPage() {
                                 <ul className="tpList">
                                   {oppStarters.map((p) => {
                                     const isPlayerOpen = expandedPlayerId === `opp-${p.id}`;
+                                    const isLiveNow = Boolean(p.stats?.isLive);
                                     return (
                                       <li key={p.id} className={`tpRowWrap ${isPlayerOpen ? "tpRowOpen" : ""}`}>
                                         <div className="tpRow" onClick={() => setExpandedPlayerId(isPlayerOpen ? null : `opp-${p.id}`)}>
-                                            <div className="tpPlayerInfo"><span className="tpName">{p.name}</span></div>
-                                                <div className="tpMeta">
-                                                    {normalizeDisplayPos(p.position)}
-                                                    <span className={`tpLivePill ${statusClass}`}>{statusLabel}</span>
-                                                </div>
+                                            <PlayerIdentity
+                                              name={p.name}
+                                              country={p.country}
+                                              club={p.clubName || p.teamName}
+                                            />
+
+                                            <div className="tpMeta">
+                                              {normalizeDisplayPos(p.position)}
+                                              <span className={`tpLivePill ${isLiveNow ? "live" : "idle"}`}>
+                                                {isLiveNow ? "LIVE" : "IDLE"}
+                                              </span>
+                                            </div>
                                             <div className="tpPts">{p.points} pts</div>
                                         </div>
                                         {isPlayerOpen && <PlayerStatsCard
@@ -858,14 +952,22 @@ export default function CupTournamentPage() {
                                     <ul className="tpList tpBenchList">
                                       {oppBench.map((p) => {
                                         const isPlayerOpen = expandedPlayerId === `opp-${p.id}`;
+                                        const isLiveNow = Boolean(p.stats?.isLive);
                                         return (
                                           <li key={p.id} className={`tpRowWrap ${isPlayerOpen ? "tpRowOpen" : ""}`}>
                                             <div className="tpRow" onClick={() => setExpandedPlayerId(isPlayerOpen ? null : `opp-${p.id}`)}>
-                                              <div className="tpPlayerInfo"><span className="tpName">{p.name}</span></div>
-                                            <div className="tpMeta">
+                                              <PlayerIdentity
+                                                name={p.name}
+                                                country={p.country}
+                                                club={p.clubName || p.teamName}
+                                              />
+
+                                              <div className="tpMeta">
                                                 {normalizeDisplayPos(p.position)}
-                                                <span className={`tpLivePill ${statusClass}`}>{statusLabel}</span>
-                                            </div>
+                                                <span className={`tpLivePill ${isLiveNow ? "live" : "idle"}`}>
+                                                  {isLiveNow ? "LIVE" : "IDLE"}
+                                                </span>
+                                              </div>
                                               <div className="tpPts">{p.points} pts</div>
                                             </div>
                                             {isPlayerOpen && (

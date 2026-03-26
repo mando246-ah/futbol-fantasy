@@ -8,17 +8,34 @@ function detectPhaseFromRoundLabel(roundLabel) {
   const s = String(roundLabel || "").toLowerCase().trim();
   if (!s) return "RegularSeason"; // safe default
 
-  // Knockout-ish keywords
-  const KO = [
-    "round of", "16", "8", "quarter", "semi", "final",
-    "play-off", "playoff", "knockout",
-    "1/8", "1/4", "1/2",
+  // 1. Clear league / non-knockout labels first
+  if (
+    s.includes("regular season") ||
+    s.includes("matchday") ||
+    s.includes("group stage") ||
+    s.includes("league stage") ||
+    s.includes("clausura") ||
+    s.includes("apertura")
+  ) {
+    return "RegularSeason";
+  }
+
+  // 2. Knockout labels (using \b for exact word boundaries, and s? for optional plurals)
+  const koRegexes = [
+    /\bround of\b/,
+    /\bquarter\b/,
+    /\bsemi\b/,
+    /\bfinals?\b/,         // Matches "final" or "finals"
+    /\bplay[- ]?offs?\b/,  // Matches "playoff", "play-off", "playoffs", etc.
+    /\bknockouts?\b/,      // Matches "knockout" or "knockouts"
+    /\b1\/8\b/,
+    /\b1\/4\b/,
+    /\b1\/2\b/,
   ];
 
-  // If any knockout keyword appears, treat as Cup
-  if (KO.some((k) => s.includes(k))) return "Cup";
+  // 3. If any regex matches, it's a Cup!
+  if (koRegexes.some((rx) => rx.test(s))) return "Cup";
 
-  // Everything else (matchday, group stage, league stage, regular season, etc.)
   return "RegularSeason";
 }
 

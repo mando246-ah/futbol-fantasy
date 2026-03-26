@@ -658,8 +658,10 @@ useEffect(() => {
 
       const player = String(p.playerName || "").toLowerCase();
       const manager = String(managerLabel(p.uid, p.displayName || "")).toLowerCase();
+      const team = String(p.teamName || "").toLowerCase();
+      const country = String(p.nationality || "").toLowerCase();
 
-      return player.includes(q) || manager.includes(q);
+      return player.includes(q) || manager.includes(q) || team.includes(q) || country.includes(q);
     });
   }, [picks, allPicksQuery, allPicksPos]);
 
@@ -706,29 +708,35 @@ useEffect(() => {
   }));
 
   const availablePlayers = useMemo(() => {
-  const q = searchState.trim().toLowerCase();
+    const q = searchState.trim().toLowerCase();
 
-  // show nothing until user types
-  if (!q) return [];
+      // show nothing until user types
+      if (!q) return [];
 
-  return ALL_PLAYERS
-    .filter((p) => {
-      if (posFilterState !== "ALL" && p.position !== posFilterState) return false;
-      if (!p.name.toLowerCase().includes(q)) return false;
-      return true;
-    })
-    // push drafted players to the bottom so undrafted show first
-    .sort((a, b) => {
-      const ad = pickedIds.has(a.id) ? 1 : 0;
-      const bd = pickedIds.has(b.id) ? 1 : 0;
-      return ad - bd; 
-    })
-    .slice(0, 10)
-    .map((p) => ({
-      ...p,
-      isDrafted: pickedIds.has(p.id),
-    }));
-}, [ALL_PLAYERS, posFilterState, searchState, pickedIds]);
+      return ALL_PLAYERS
+        .filter((p) => {
+          if (posFilterState !== "ALL" && p.position !== posFilterState) return false;
+          
+          // Multi-field search
+          const matchName = (p.name || "").toLowerCase().includes(q);
+          const matchTeam = (p.teamName || "").toLowerCase().includes(q);
+          const matchCountry = (p.nationality || "").toLowerCase().includes(q);
+
+          if (!matchName && !matchTeam && !matchCountry) return false;
+          return true;
+        })
+        // push drafted players to the bottom so undrafted show first
+        .sort((a, b) => {
+          const ad = pickedIds.has(a.id) ? 1 : 0;
+          const bd = pickedIds.has(b.id) ? 1 : 0;
+          return ad - bd; 
+        })
+        .slice(0, 50) 
+        .map((p) => ({
+          ...p,
+          isDrafted: pickedIds.has(p.id),
+        }));
+  }, [ALL_PLAYERS, posFilterState, searchState, pickedIds]);
 
 
   const canPickNow = room?.started && currentPicker?.uid === user?.uid;
@@ -1162,7 +1170,7 @@ useEffect(() => {
                     <div className="text-sm font-semibold">Time left</div>
                     <div className={`text-2xl font-bold ${timeLeft <= 5 ? "text-red-600" : ""}`}>{timeLeft}s</div>
                     {user?.uid === room.hostUid && (
-                      <div className="text-xs opacity-70 mt-1">Host will auto-pick if timer hits 0.</div>
+                      <div className="text-xs opacity-70 mt-1">Site will auto-pick if timer hits 0.</div>
                     )}
                   </div>
                 )}
@@ -1274,20 +1282,32 @@ useEffect(() => {
                         key={p.playerId}
                         className={`pickRow ${isMine ? "pickRowMine" : ""}`}
                       >
-                        <span className="pickMain">
-                          <b>#{p.turn}</b> —{" "}
+                        <span className="pickMain flex-wrap gap-1 items-center">
+                          <span><b>#{p.turn}</b> — </span>
                           <span
                             className="pickManagerPill"
                             style={managerPillStyle(p.uid, isMine)}
                             title={isMine ? "Your pick" : mgr}
                           >
                             {mgr}
-                          </span>{" "}
-                          picked <b>{p.playerName}</b>{" "}
-                          <span className="opacity-70">({p.position})</span>
+                          </span>
+                          <span> picked <b>{p.playerName}</b> </span>
+                          
+                       
+                          <span className="opacity-70 text-xs inline-flex items-center gap-1">
+                            {p.position}
+                            {p.teamName ? <span> • {p.teamName}</span> : null}
+                            {p.nationality ? (
+                              <>
+                                <span> • </span>
+                                <FlagIcon country={p.nationality} size={12} />
+                                <span>{p.nationality}</span>
+                              </>
+                            ) : null}
+                          </span>
                         </span>
 
-                        <span className="opacity-70">Round {p.round}</span>
+                        <span className="opacity-70 whitespace-nowrap">Round {p.round}</span>
                       </li>
                     );
                   })}
@@ -1426,10 +1446,16 @@ function PlayerPool({
                       {drafted && <span className="draftedBadge">Drafted</span>}
                     </div>
 
-                    <div className="text-xs opacity-70">
-                      {pl.position}
-                      {pl.nationality ? ` • ${pl.nationality}` : ""}
-                      {pl.teamName ? ` • ${pl.teamName}` : ""}
+                    <div className="text-xs opacity-70 flex items-center gap-1 mt-0.5 flex-wrap">
+                      <span>{pl.position}</span>
+                      {pl.teamName ? <span> • {pl.teamName}</span> : null}
+                      {pl.nationality ? (
+                        <span className="flex items-center gap-1">
+                          <span> • </span>
+                          <FlagIcon country={pl.nationality} size={12} />
+                          <span>{pl.nationality}</span>
+                        </span>
+                      ) : null}
                     </div>
                   </div>
 

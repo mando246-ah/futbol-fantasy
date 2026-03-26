@@ -1442,3 +1442,32 @@
 .tpHistoryTable td:nth-child(3) {
   text-align: right;
 }
+
+.tpPlayerInfo {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.tpPlayerSubline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin-top: 2px;
+  font-size: 0.78rem;
+  opacity: 0.82;
+}
+
+.tpPlayerSubItem {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.tpPlayerClub {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 220px;
+}

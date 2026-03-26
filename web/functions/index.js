@@ -1403,11 +1403,14 @@ async function ensureDefaultLineupsForRoom(roomId, memberUids) {
       starters.push(pid);
     }
 
-    // if they somehow have <11, just save what we have
+    const starterSet = new Set(starters.map(String));
+    const bench = uniq.filter((pid) => !starterSet.has(String(pid)));
+
     batch.set(
       lineupRef,
       {
-        starters,
+        starters,          
+        bench,            
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         autoInit: true,
@@ -3363,7 +3366,7 @@ exports.scheduleDraft = onCall({ region: "us-west2" }, async (request) => {
   if (memberUids.length === 0) return { ok: true, emailsQueued: 0 };
 
   const recipients = await getEmailsForUids(memberUids);
-  const subject = "Football Fantasy — Draft Scheduled";
+  const subject = "Fútbol Fantasy — Draft Scheduled";
   const html = `
     <div style="font-family:Arial,sans-serif;">
       <h2>Draft Scheduled</h2>
@@ -3455,7 +3458,7 @@ exports.scheduleMarket = onCall({ region: "us-west2" }, async (request) => {
   if (memberUids.length === 0) return { ok: true, emailsQueued: 0 };
 
   const recipients = await getEmailsForUids(memberUids);
-  const subject = "Football Fantasy — Market Scheduled";
+  const subject = "Fútbol Fantasy — Market Scheduled";
   const html = `
     <div style="font-family:Arial,sans-serif;">
       <h2>Market Scheduled</h2>
@@ -3508,7 +3511,7 @@ exports.processReminders = onSchedule(
       if (r.type === "draft_10min") {
         const whenStr = formatWhen(r.startAtMs);
 
-        const subject = "Football Fantasy — Draft starts in 10 minutes";
+        const subject = "Fútbol Fantasy — Draft starts in 10 minutes";
         const html = `
           <div style="font-family:Arial,sans-serif;">
             <h2>Draft Reminder</h2>
@@ -3534,7 +3537,7 @@ exports.processReminders = onSchedule(
         const openStr = formatWhen(r.scheduledAtMs);
         const durStr = formatDuration(Number(r.durationMs || 0));
 
-        const subject = "Football Fantasy — Market opens in 10 minutes";
+        const subject = "Fútbol Fantasy — Market opens in 10 minutes";
         const html = `
           <div style="font-family:Arial,sans-serif;">
             <h2>Market Reminder</h2>
