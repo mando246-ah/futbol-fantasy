@@ -662,15 +662,40 @@ async function runCupEngine({
     const picksSnap = await db.collection(`rooms/${roomId}/picks`).get();
     const pickRefByPid = new Map();
     const metaByPid = new Map();
+    const rosterByUid = {};
+
+    function inferOwnerUidFromPick(d) {
+      const v =
+        d?.ownerUid ?? d?.ownerId ?? d?.ownedBy ?? d?.managerUid ??
+        d?.userId ?? d?.uid ?? d?.pickedByUid ?? d?.pickedBy ??
+        d?.owner?.uid ?? d?.owner?.id;
+
+      if (!v) return null;
+      if (typeof v === "string") return v;
+      if (typeof v === "object") return v.uid || v.id || null;
+      return null;
+    }
+
     picksSnap.forEach((doc) => {
       const d = doc.data() || {};
       const pid = String(d.playerId ?? d.pid ?? d.apiPlayerId ?? d.player?.id ?? "");
       if (!pid) return;
+
       pickRefByPid.set(pid, doc.ref);
 
       const name = d.playerName || d.name || d.player?.name || "Unknown";
       const position = d.position || d.pos || d.role || d.player?.position || "MID";
       metaByPid.set(pid, { name, position });
+
+      const ownerUid = inferOwnerUidFromPick(d);
+      if (!ownerUid) return;
+
+      if (!rosterByUid[ownerUid]) rosterByUid[ownerUid] = [];
+      rosterByUid[ownerUid].push({
+        id: pid,
+        name,
+        position: toPos(position),
+      });
     });
 
     const lineupByUid = {};
@@ -707,7 +732,16 @@ async function runCupEngine({
       for (const uid of memberUids) {
         const lineup = lineupByUid[uid];
         const starters = extractStarters(lineup, metaByPid);
-        const bench = extractBench(lineup, metaByPid);
+        let bench = extractBench(lineup, metaByPid);
+
+        if (!bench.length) {
+          const roster = rosterByUid[String(uid)] || [];
+          const starterSet = new Set(starters.map((p) => String(p.id)));
+          bench = roster.filter((p) => p?.id && !starterSet.has(String(p.id)));
+        } else {
+          const starterSet = new Set(starters.map((p) => String(p.id)));
+          bench = bench.filter((p) => p?.id && !starterSet.has(String(p.id)));
+        }
 
         const starterScored = scoreTeam(starters, statsMap, toPos);
         const benchScored = scoreTeam(bench, statsMap, toPos);
@@ -818,7 +852,16 @@ async function runCupEngine({
         const lineup = lineupByUid[uid];
 
         const starters = extractStarters(lineup, metaByPid);
-        const bench = extractBench(lineup, metaByPid);
+        let bench = extractBench(lineup, metaByPid);
+
+        if (!bench.length) {
+          const roster = rosterByUid[String(uid)] || [];
+          const starterSet = new Set(starters.map((p) => String(p.id)));
+          bench = roster.filter((p) => p?.id && !starterSet.has(String(p.id)));
+        } else {
+          const starterSet = new Set(starters.map((p) => String(p.id)));
+          bench = bench.filter((p) => p?.id && !starterSet.has(String(p.id)));
+        }
 
         const starterScored = scoreTeam(starters, statsMap, toPos);
         const benchScored = scoreTeam(bench, statsMap, toPos);

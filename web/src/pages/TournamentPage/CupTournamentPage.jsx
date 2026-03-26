@@ -299,6 +299,18 @@ function parseCupWindowId(windowId) {
   return { startAtMs, endAtMs };
 }
 
+function inferOwnerUidFromPick(d) {
+  const v =
+    d?.ownerUid ?? d?.ownerId ?? d?.ownedBy ?? d?.managerUid ??
+    d?.userId ?? d?.uid ?? d?.pickedByUid ?? d?.pickedBy ??
+    d?.owner?.uid ?? d?.owner?.id;
+
+  if (!v) return null;
+  if (typeof v === "string") return v;
+  if (typeof v === "object") return v.uid || v.id || null;
+  return null;
+}
+
 export default function CupTournamentPage() {
   const { roomId } = useParams();
   const { loading, error, data } = useTournament(roomId);
@@ -322,6 +334,7 @@ export default function CupTournamentPage() {
   const scoringRef = useRef(null);
 
   const [devBusy, setDevBusy] = useState(false);
+  const [rosterByUid, setRosterByUid] = useState({});
   
 
   useEffect(() => {
@@ -377,13 +390,47 @@ export default function CupTournamentPage() {
     const unsubPicks = onSnapshot(
       collection(db, "rooms", roomId, "picks"),
       (snap) => {
-        const m = {};
+        const byPid = {};
+        const byUid = {};
+
         snap.forEach((d) => {
-          const val = d.data();
+          const val = d.data() || {};
           const pid = String(val.playerId || val.pid || val.apiPlayerId || "");
-          if (pid) m[pid] = val;
+          if (!pid) return;
+
+          byPid[pid] = val;
+
+          const ownerUid = inferOwnerUidFromPick(val);
+          if (!ownerUid) return;
+
+          if (!byUid[ownerUid]) byUid[ownerUid] = [];
+
+          byUid[ownerUid].push({
+            id: pid,
+            name: val.playerName || val.name || "Unknown",
+            position: val.position || val.pos || "MID",
+            country:
+              val.country ||
+              val.nationality ||
+              val.playerCountry ||
+              "",
+            clubName:
+              val.clubName ||
+              val.club ||
+              val.teamName ||
+              val.team?.name ||
+              "",
+            teamName:
+              val.teamName ||
+              val.clubName ||
+              val.club ||
+              val.team?.name ||
+              "",
+          });
         });
-        setPicksMap(m);
+
+        setPicksMap(byPid);
+        setRosterByUid(byUid);
       }
     );
 
@@ -543,30 +590,61 @@ export default function CupTournamentPage() {
 
   function getResolvedRoster(uid, type) {
     const lineup = lineups[uid] || {};
-    const ids = getLineupIds(lineup, type);
+    let ids = getLineupIds(lineup, type);
 
     const cupUserBreakdown = activeBreakdownByUserId?.[uid] || {};
     const perPlayer = cupUserBreakdown?.perPlayer || {};
 
+    // Fallback: derive bench from roster picks if lineup doc doesn't store bench
+    if (type === "bench" && (!ids || ids.length === 0)) {
+      const starterIds = new Set(getLineupIds(lineup, "starters").map(String));
+      const roster = rosterByUid[uid] || [];
+      ids = roster
+        .map((p) => String(p?.id || ""))
+        .filter((pid) => pid && !starterIds.has(pid));
+    }
+
     return ids.map((pid) => {
       const pick = picksMap[pid] || {};
+      const rosterMeta =
+        (rosterByUid[uid] || []).find((p) => String(p.id) === String(pid)) || {};
       const live = perPlayer[pid] || {};
 
       return {
         id: pid,
-        name: live.name || pick.playerName || pick.name || "Unknown",
-        position: live.position || pick.position || pick.pos || "MID",
+        name:
+          live.name ||
+          pick.playerName ||
+          pick.name ||
+          rosterMeta.name ||
+          "Unknown",
+        position:
+          live.position ||
+          pick.position ||
+          pick.pos ||
+          rosterMeta.position ||
+          "MID",
         points: Number(live.points ?? pick.lastDelta ?? 0),
         counted: live.counted ?? (pick.lastCounted !== false),
         stats: live.stats || pick.lastStats || pick.stats || null,
         breakdown: live.breakdown || pick.lastBreakdown || pick.breakdown || null,
-        teamName: live.teamName || pick.lastRealTeamName || pick.teamName || "",
-        opponentName: live.opponentName || pick.lastOpponentName || pick.opponentName || "",
+        teamName:
+          live.teamName ||
+          pick.lastRealTeamName ||
+          pick.teamName ||
+          rosterMeta.teamName ||
+          "",
+        opponentName:
+          live.opponentName ||
+          pick.lastOpponentName ||
+          pick.opponentName ||
+          "",
         country:
           live.country ||
           pick.country ||
           pick.nationality ||
           pick.playerCountry ||
+          rosterMeta.country ||
           "",
         clubName:
           live.clubName ||
@@ -574,6 +652,7 @@ export default function CupTournamentPage() {
           pick.club ||
           pick.teamName ||
           pick.team?.name ||
+          rosterMeta.clubName ||
           live.teamName ||
           "",
       };
