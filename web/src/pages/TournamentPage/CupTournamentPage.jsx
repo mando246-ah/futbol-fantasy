@@ -225,7 +225,7 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
           <div className="tpStatsCol">
             <span className="tpStatsHead">No stats yet</span>
             <div className="tpStatRow">
-              <span>Waiting for next scored fixture</span>
+              <span>Waiting for next games</span>
               <span>—</span>
             </div>
           </div>
@@ -316,6 +316,7 @@ export default function CupTournamentPage() {
   const { loading, error, data } = useTournament(roomId);
   const [myUid, setMyUid] = useState(auth.currentUser?.uid || null);
   const [nowMs, setNowMs] = useState(() => Date.now());
+  
 
   // Cup-specific State
   const [cupDoc, setCupDoc] = useState(null);
@@ -494,8 +495,9 @@ export default function CupTournamentPage() {
     // Status classification for styling
     const isLive = statusLower === "live";
     const isResolving = statusLower === "resolving";
-    const statusClass = isLive ? "live" : isResolving ? "resolving" : "idle";
-    const statusLabel = isLive ? "LIVE" : isResolving ? "RESOLVING" : "IDLE";
+    const isScheduled = statusLower === "scheduled"; 
+    const statusClass = isLive ? "live" : isResolving ? "resolving" : isScheduled ? "scheduled" : "idle";
+    const statusLabel = isLive ? "LIVE" : isResolving ? "RESOLVING" : isScheduled ? "SCHEDULED" : "IDLE";
 
     const cupTotals = cupDoc?.cupTotalsByUid || {};
     const livePoints = cupDoc?.livePointsByUid || {}; // NEW
@@ -741,7 +743,7 @@ export default function CupTournamentPage() {
                 <div className="tpRoomMeta">
                     Next Games: <b>{winText}</b> • Round: <b style={{ color: "var(--color-primary)" }}>{nextLabel}</b>
                 </div>
-              <div className="tpRoomMeta">Room: <b>{roomId}</b></div>
+              <div className="tpRoomMeta">Room: <b>{data?.room?.name} - {roomId}</b></div>
               <div className="tpLiveHeaderLine">
                 {isLive ? (
                     <span>

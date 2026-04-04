@@ -503,20 +503,38 @@ async function runCupEngine({
   const roomRef = db.doc(`rooms/${roomId}`);
   const cupRef = cupCurrentRef(db, roomId);
 
-  await cupRef.set({ lastPollAtMs: nowMs, updatedAtMs: nowMs }, { merge: true });
+  
 
   try {
     const competition = room.competition;
     if (!competition?.league || !competition?.season) return;
 
-    const league = competition.league;
-    const season = competition.season;
-    const timezone = competition.timezone || "America/Los_Angeles";
-
     if (Boolean(room?.competitionState?.isDone)) return;
 
     const cupSnap = await cupRef.get();
     let cup = cupSnap.exists ? (cupSnap.data() || {}) : null;
+
+    // --- ✅ ADD SMART TIME GATE LOGIC ---
+    if (cup) {
+      const status = String(cup.status || "").toLowerCase();
+      const startAtMs = Number(cup.currentWindowStartAtMs || 0);
+      const endAtMs = Number(cup.currentWindowEndAtMs || 0);
+
+      const PRE_MS = 20 * 60 * 1000;        // 20 min pre-kickoff
+      const POST_MS = 3 * 60 * 60 * 1000;   // 3 hrs post-kickoff
+
+      // Only apply sleep logic if scheduled or idle
+      if (startAtMs > 0 && endAtMs > 0 && status !== "resolving" && status !== "live" && status !== "final") {
+        if (nowMs < startAtMs - PRE_MS || nowMs > endAtMs + POST_MS) {
+          // Outside the active window: SLEEP!
+          return; 
+        }
+      }
+
+      if (cup.completed || status === "final") return;
+    }
+
+    await cupRef.set({ lastPollAtMs: nowMs, updatedAtMs: nowMs }, { merge: true });
 
     if (!cup) {
       cup = {

@@ -94,15 +94,7 @@ function fmtDT(v) {
   if (!v) return "—";
 
   const LOCALE = "en-US";
-  const OPTS = {
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "numeric",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: true,
-  };
+  const OPTS = { month: "short", day: "numeric", hour: "numeric", minute: "2-digit", hour12: true };
 
   // Firestore Timestamp support
   if (typeof v === "object") {
@@ -1124,6 +1116,15 @@ export default function TournamentPage() {
     return { ...m, homeTotal, awayTotal, homeResult, awayResult };
   });
 
+  //Status label with color 
+  const statusRaw = activeResults?.status
+  const statusLower = String(statusRaw).toLowerCase();
+  const isLive = statusLower === "live";
+  const isResolving = statusLower === "resolving";
+  const isScheduled = statusLower === "scheduled"; 
+  const statusClass = isLive ? "live" : isResolving ? "resolving" : isScheduled ? "scheduled" : "idle";
+  const statusLabel = isLive ? "LIVE" : isResolving ? "RESOLVING" : isScheduled ? "SCHEDULED" : "IDLE";
+
   return (
     <div className="tpPage">
     <div className="tpWrap">
@@ -1159,7 +1160,7 @@ export default function TournamentPage() {
             )}
 
             <div className="tpRoomMeta">
-              Room: <b>{roomId}</b>
+              Room: <b>{data?.room?.name} - {roomId}</b>
               {currentWeekIndex != null ? (
                 <>
                   {" "}
@@ -1177,7 +1178,7 @@ export default function TournamentPage() {
                 </span>
               ) : (
                 <span>
-                  Status: <b>{String(resultsStatusRaw || "idle").toUpperCase()}</b>
+                  Status:  <b className={`tpLivePill ${statusClass}`}>{statusLabel}</b>
                   <> • Last update at: <b>{lastUpdateLabel}</b></>
                 </span>
               )}
@@ -2166,6 +2167,22 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
   };
 
   const showMatchHeader = Boolean(stats?.isLive && (teamName || opponentName));
+
+  if (!stats?.isLive) {
+    return (
+      <div className="tpStatsCard">
+        <div className="tpStatsGrid">
+          <div className="tpStatsCol">
+            <span className="tpStatsHead">No stats yet</span>
+            <div className="tpStatRow">
+              <span>Waiting for next games</span>
+              <span>—</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="tpStatsCard">
