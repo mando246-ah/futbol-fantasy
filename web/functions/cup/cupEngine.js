@@ -12,34 +12,109 @@ function isFinished(short) {
 }
 
 function toPos(pos) {
-  const p = String(pos || "").toUpperCase();
+  const p = String(pos || "").toUpperCase().trim();
+
+  // Goalkeepers
   if (p.includes("GOALKEEP") || p === "GK" || p === "GKP") return "GK";
-  if (p.includes("DEFEND") || p.includes("BACK") || p === "DEF") return "DEF";
-  if (p.includes("MID") || p === "MID") return "MID";
-  if (p.includes("ATTACK") || p.includes("FORW") || p.includes("STRIK") || p === "FWD") return "FWD";
-  if (p === "ATT") return "FWD";
+
+  // Defenders
+  if (p.includes("DEFEND") || p.includes("BACK") || ["DEF", "CB", "LB", "RB", "LWB", "RWB"].includes(p)) return "DEF";
+
+  // Attackers / Forwards / Strikers
+  if (p.includes("ATTACK") || p.includes("FORW") || p.includes("STRIK") || ["FWD", "ATT", "ST", "CF", "LW", "RW", "WING"].includes(p)) return "FWD";
+
+  // Midfielders
+  if (p.includes("MID") || ["MID", "CM", "CDM", "CAM", "LM", "RM", "AM", "DM"].includes(p)) return "MID";
+
+  // Ultimate Fallback
   return "MID";
 }
 
-function normalizePlayer(raw, metaById) {
+// ✅ NEW HELPER: Fetches the actual match score and injects it into player stats
+async function enrichStatsMapWithScores(fixtureId, statsMap, apiFootballGet, apiKey) {
+  try {
+    const fixRes = await apiFootballGet(`fixtures?id=${fixtureId}`, apiKey);
+    const fixData = fixRes?.response?.[0];
+    const hId = String(fixData?.teams?.home?.id || "");
+    const aId = String(fixData?.teams?.away?.id || "");
+    const hScore = fixData?.goals?.home;
+    const aScore = fixData?.goals?.away;
+
+    if (hId && aId) {
+      for (const pid of Object.keys(statsMap)) {
+        const tId = String(statsMap[pid].teamId || statsMap[pid].team?.id || "");
+        if (tId === hId) {
+          statsMap[pid].teamScore = hScore ?? null;
+          statsMap[pid].opponentScore = aScore ?? null;
+        } else if (tId === aId) {
+          statsMap[pid].teamScore = aScore ?? null;
+          statsMap[pid].opponentScore = hScore ?? null;
+        }
+      }
+    }
+  } catch (e) {
+    console.error(`[CupEngine] Error enriching fixture ${fixtureId} with score`, e);
+  }
+}
+
+function resolveCanonicalPlayer(raw, metaById) {
   if (!raw) return null;
 
+  const candidates = [];
+  const pushCandidate = (value) => {
+    if (value === null || value === undefined) return;
+    const id = String(value).trim();
+    if (!id) return;
+    candidates.push(id);
+  };
+
   if (typeof raw === "string" || typeof raw === "number") {
-    const id = String(raw);
-    const m = metaById?.get(id) || null;
-    return { id, name: m?.name || "Unknown", position: toPos(m?.position || "MID") };
+    pushCandidate(raw);
+  } else {
+    pushCandidate(raw.playerId);
+    pushCandidate(raw.pid);
+    pushCandidate(raw.apiPlayerId);
+    pushCandidate(raw?.player?.playerId);
+    pushCandidate(raw?.player?.id);
+    pushCandidate(raw.id);
   }
 
-  const id = raw.id || raw.playerId || raw.pid || raw.apiPlayerId || raw?.player?.id || raw?.player?.playerId;
-  if (!id) return null;
+  if (!candidates.length) return null;
 
-  const pid = String(id);
-  const m = metaById?.get(pid) || null;
+  for (const candidate of candidates) {
+    const meta = metaById?.get(candidate) || null;
+    if (meta?.id) {
+      return {
+        id: String(meta.id),
+        meta,
+      };
+    }
+  }
+
+  const fallbackId = candidates[0];
+  return {
+    id: fallbackId,
+    meta: metaById?.get(fallbackId) || null,
+  };
+}
+
+function normalizePlayer(raw, metaById) {
+  const resolved = resolveCanonicalPlayer(raw, metaById);
+  if (!resolved) return null;
+
+  const { id, meta: m } = resolved;
+  const isScalar = typeof raw === "string" || typeof raw === "number";
 
   return {
-    id: pid,
-    name: raw.name || raw.fullName || raw.displayName || raw?.player?.name || m?.name || "Unknown",
-    position: toPos(raw.position || raw.pos || raw.role || raw?.player?.position || m?.position || "MID"),
+    id,
+    name: isScalar
+      ? (m?.name || "Unknown")
+      : (raw.name || raw.fullName || raw.displayName || raw?.player?.name || m?.name || "Unknown"),
+    position: toPos(
+      isScalar
+        ? (m?.position || "MID")
+        : (raw.position || raw.pos || raw.role || raw?.player?.position || m?.position || "MID")
+    ),
   };
 }
 
@@ -101,6 +176,23 @@ function sumNumberMaps(a = {}, b = {}) {
   return out;
 }
 
+function buildProjectedTotalsByUid({ memberUids = [], creditedTotalsByUid = {}, livePointsByUid = {} }) {
+  const out = {};
+  const keys = new Set([
+    ...memberUids.map(String),
+    ...Object.keys(creditedTotalsByUid || {}).map(String),
+    ...Object.keys(livePointsByUid || {}).map(String),
+  ]);
+
+  for (const uid of keys) {
+    out[uid] =
+      Number(creditedTotalsByUid?.[uid] || 0) +
+      Number(livePointsByUid?.[uid] || 0);
+  }
+
+  return out;
+}
+
 function mergeStatObjects(a = {}, b = {}) {
   const out = { ...(a || {}) };
 
@@ -117,15 +209,22 @@ function mergeStatObjects(a = {}, b = {}) {
   return out;
 }
 
-function buildCupPerPlayerEntry(playerObj, stats, one, counted) {
+function buildCupPerPlayerEntry(playerObj, stats, scoredObj, counted) {
+  // ✅ Gracefully handle if the scoring engine returns a raw number
+  const pts = typeof scoredObj === "number" ? scoredObj : Number(scoredObj?.points ?? scoredObj?.total ?? 0);
+
   return {
     id: String(playerObj?.id || ""),
     name: playerObj?.name || "Unknown",
     position: playerObj?.position || "MID",
-    points: Number(one?.points || 0),
+    points: pts,
     counted: !!counted,
     stats: stats || {},
-    breakdown: one?.breakdown || one?.parts || {},
+    breakdown:
+      scoredObj?.breakdown ||
+      scoredObj?.parts ||
+      scoredObj?.pointsBreakdown ||
+      {},
     teamName:
       stats?.teamName ||
       stats?.realTeamName ||
@@ -250,9 +349,17 @@ async function loadMemberMeta(db, roomId, memberUids) {
   return metaByUid;
 }
 
-function buildCupStandings({ memberUids, memberMetaByUid, totalsByUid }) {
+function buildCupStandings({
+  memberUids,
+  memberMetaByUid,
+  totalsByUid,
+  creditedTotalsByUid = {},
+  livePointsByUid = {},
+}) {
   const rows = memberUids.map((uid) => {
     const total = Number(totalsByUid?.[uid] || 0);
+    const credited = Number(creditedTotalsByUid?.[uid] || 0);
+    const live = Number(livePointsByUid?.[uid] || 0);
     const name = memberMetaByUid?.[uid]?.name || "Unknown";
 
     return {
@@ -265,19 +372,42 @@ function buildCupStandings({ memberUids, memberMetaByUid, totalsByUid }) {
       losses: 0,
       tablePoints: total,
       totalFantasyPoints: total,
+      projectedFantasyPoints: total,
+      creditedFantasyPoints: credited,
+      liveFantasyPoints: live,
     };
   });
 
   return sortCupRows(rows);
 }
 
-async function writeCupStandings({ db, roomId, memberUids, memberMetaByUid, totalsByUid, nowMs }) {
-  const standings = buildCupStandings({ memberUids, memberMetaByUid, totalsByUid });
+async function writeCupStandings({
+  db,
+  roomId,
+  memberUids,
+  memberMetaByUid,
+  totalsByUid,
+  creditedTotalsByUid = totalsByUid,
+  livePointsByUid = {},
+  includesLivePoints = false,
+  nowMs,
+}) {
+  const standings = buildCupStandings({
+    memberUids,
+    memberMetaByUid,
+    totalsByUid,
+    creditedTotalsByUid,
+    livePointsByUid,
+  });
 
   await db.doc(`rooms/${roomId}/standings/current`).set(
     {
       roomId,
       standings,
+      creditedTotalsByUid,
+      projectedTotalsByUid: totalsByUid || {},
+      livePointsByUid: livePointsByUid || {},
+      includesLivePoints: !!includesLivePoints,
       updatedAtMs: nowMs,
       source: "cup",
     },
@@ -285,6 +415,93 @@ async function writeCupStandings({ db, roomId, memberUids, memberMetaByUid, tota
   );
 
   return standings;
+}
+
+async function publishCupLeaderboardState({
+  db,
+  roomId,
+  cupRef,
+  memberUids,
+  memberMetaByUid,
+  creditedTotalsByUid,
+  livePointsByUid,
+  nowMs,
+}) {
+  const projectedTotalsByUid = buildProjectedTotalsByUid({
+    memberUids,
+    creditedTotalsByUid,
+    livePointsByUid,
+  });
+  const includesLivePoints = Object.values(livePointsByUid || {}).some(
+    (v) => Number(v || 0) !== 0
+  );
+
+  await cupRef.set(
+    {
+      projectedTotalsByUid,
+      projectedIncludesLivePoints: includesLivePoints,
+      projectedUpdatedAtMs: nowMs,
+    },
+    { merge: true }
+  );
+
+  return writeCupStandings({
+    db,
+    roomId,
+    memberUids,
+    memberMetaByUid,
+    totalsByUid: projectedTotalsByUid,
+    creditedTotalsByUid,
+    livePointsByUid,
+    includesLivePoints,
+    nowMs,
+  });
+}
+
+async function loadCupFixtureTotalsByUid({ db, roomId, fixtureIds = null }) {
+  const out = {};
+  const filterIds = fixtureIds
+    ? new Set(fixtureIds.map(String).filter(Boolean))
+    : null;
+
+  const snap = await db.collection(`rooms/${roomId}/cup/current/fixtures`).get();
+  for (const doc of snap.docs) {
+    const data = doc.data() || {};
+    const fixtureId = String(data.fixtureId || doc.id || "");
+    if (filterIds && !filterIds.has(fixtureId)) continue;
+
+    for (const [uid, pts] of Object.entries(data.pointsByUid || {})) {
+      const key = String(uid || "");
+      if (!key) continue;
+      out[key] = Number(out[key] || 0) + Number(pts || 0);
+    }
+  }
+
+  return out;
+}
+
+async function syncCupTotalsFromFixtureLedger({
+  db,
+  roomId,
+  cupRef,
+  currentWindowFixtureIds = [],
+  nowMs,
+}) {
+  const [creditedTotalsByUid, windowPointsByUid] = await Promise.all([
+    loadCupFixtureTotalsByUid({ db, roomId }),
+    loadCupFixtureTotalsByUid({ db, roomId, fixtureIds: currentWindowFixtureIds }),
+  ]);
+
+  await cupRef.set(
+    {
+      cupTotalsByUid: creditedTotalsByUid,
+      windowPointsByUid,
+      lastLedgerSyncAtMs: nowMs,
+    },
+    { merge: true }
+  );
+
+  return { creditedTotalsByUid, windowPointsByUid };
 }
 
 function makeCupHistoryDocId(windowId, startAtMs, endAtMs) {
@@ -418,6 +635,10 @@ async function armNextCupWindow({
       updatedAtMs: nowMs,
       breakdownByUserId: {},
       livePointsByUid: {},
+      liveBreakdownByUserId: {},
+      projectedTotalsByUid: {},
+      projectedIncludesLivePoints: false,
+      projectedUpdatedAtMs: nowMs,
     },
     { merge: true }
   );
@@ -467,6 +688,11 @@ async function finalizeCupCompetition({
       currentWindowEndAtMs: null,
       windowPointsByUid: {},
       creditedFixtures: {},
+      livePointsByUid: {},
+      liveBreakdownByUserId: {},
+      projectedTotalsByUid: {},
+      projectedIncludesLivePoints: false,
+      projectedUpdatedAtMs: nowMs,
       updatedAtMs: nowMs,
     },
     { merge: true }
@@ -508,6 +734,9 @@ async function runCupEngine({
   try {
     const competition = room.competition;
     if (!competition?.league || !competition?.season) return;
+    const league = Number(competition.league);
+    const season = Number(competition.season);
+    const timezone = String(competition.timezone || "America/Los_Angeles");
 
     if (Boolean(room?.competitionState?.isDone)) return;
 
@@ -608,7 +837,13 @@ async function runCupEngine({
       const membersSnap = await db.collection(`rooms/${roomId}/members`).get();
       const memberUids = membersSnap.docs.map((d) => d.id).filter(Boolean);
       const memberMetaByUid = await loadMemberMeta(db, roomId, memberUids);
-      const totalsByUid = cup.cupTotalsByUid || {};
+      const { creditedTotalsByUid, windowPointsByUid } = await syncCupTotalsFromFixtureLedger({
+        db,
+        roomId,
+        cupRef,
+        currentWindowFixtureIds: currentIds,
+        nowMs,
+      });
 
       await writeCupHistorySummary({
         db,
@@ -620,8 +855,8 @@ async function runCupEngine({
           currentWindowStartAtMs: cup.currentWindowStartAtMs,
           currentWindowEndAtMs: cup.currentWindowEndAtMs,
           currentWindowFixtureIds: currentIds,
-          windowPointsByUid: cup.windowPointsByUid || {},
-          cupTotalsByUid: totalsByUid,
+          windowPointsByUid,
+          cupTotalsByUid: creditedTotalsByUid,
           breakdownByUserId: cup.breakdownByUserId || {}
         },
         memberUids,
@@ -650,15 +885,22 @@ async function runCupEngine({
           cupRef,
           memberUids,
           memberMetaByUid,
-          totalsByUid,
+          totalsByUid: creditedTotalsByUid,
           nowMs,
         });
       }
       return;
     }
 
-    const needsResolving = anyFin && !allFinAndCredited;
-    const roomWeekStatus = anyLive ? "live" : needsResolving ? "resolving" : "scheduled";
+    // ✅ NEW LOGIC: Only "resolving" if there is a finished game that hasn't been credited yet
+    const hasUncreditedFinished = currentIds.some((fid) => isFinished(shortById[fid]) && !creditedMap[fid]);
+    const needsResolving = hasUncreditedFinished;
+
+    // ✅ NEW LOGIC: Trust the API's 'anyLive' flag! 
+    // The previous 48-hour window buffer was keeping the engine awake all night.
+    const effectiveLive = anyLive;
+
+    const roomWeekStatus = effectiveLive ? "live" : needsResolving ? "resolving" : "scheduled";
 
     await cupRef.set({ status: roomWeekStatus, updatedAtMs: nowMs }, { merge: true });
     await roomRef.set(
@@ -669,7 +911,7 @@ async function runCupEngine({
       { merge: true }
     );
 
-    if (!anyLive && !needsResolving) return;
+    if (!effectiveLive && !needsResolving) return;
 
     const membersSnap = await db.collection(`rooms/${roomId}/members`).get();
     const memberUids = membersSnap.docs.map((d) => d.id).filter(Boolean);
@@ -702,8 +944,9 @@ async function runCupEngine({
       pickRefByPid.set(pid, doc.ref);
 
       const name = d.playerName || d.name || d.player?.name || "Unknown";
-      const position = d.position || d.pos || d.role || d.player?.position || "MID";
-      metaByPid.set(pid, { name, position });
+      const position = toPos(d.position || d.pos || d.role || d.player?.position || "MID");
+      metaByPid.set(pid, { id: pid, name, position });
+      metaByPid.set(String(doc.id), { id: pid, name, position });
 
       const ownerUid = inferOwnerUidFromPick(d);
       if (!ownerUid) return;
@@ -735,7 +978,7 @@ async function runCupEngine({
 
     for (const fixtureId of currentIds) {
       const short = shortById[fixtureId] || null;
-      if (!short || short === "NS") continue;
+      if (!short || short === "NS" || isFinished(short)) continue;
       if (creditedMap[fixtureId]) continue; // Skip if already permanently credited
 
       const statsMap = await getFixturePlayersStatsMapCached({
@@ -744,6 +987,8 @@ async function runCupEngine({
         ttlMs: isInPlay(short) ? 60 * 1000 : 10 * 60 * 1000,
         timeZone: timezone,
       });
+
+      await enrichStatsMapWithScores(fixtureId, statsMap, apiFootballGet, apiKey);
 
       if (!statsMap) continue;
 
@@ -770,55 +1015,63 @@ async function runCupEngine({
         liveBreakdownByUserId[uid].benchTotal += Number(benchScored.total || 0);
 
         livePointsByUid[uid] += Number(starterScored.total || 0);
-        // Map updates for UI Breakdown Cards
-        const processPicks = (playerList, scoredObj, counted) => {
-          const listById = new Map(playerList.map((p) => [String(p.id), p]));
-          
-          for (const [pid, obj] of Object.entries(scoredObj.perPlayer || {})) {
-            const p = String(pid);
-            const ref = pickRefByPid.get(p);
-            
-            if (ref && statsMap[p]) {
-              const playerObj = listById.get(p) || { id: p, name: metaByPid.get(p)?.name || "Unknown", position: metaByPid.get(p)?.position || "MID" };
-              
-              // This is what generates the detailed breakdown for the UI!
-              const one = scorePlayer(playerObj, statsMap[p] || {}, toPos); 
-              const entry = buildCupPerPlayerEntry(playerObj, statsMap[p] || {}, one, counted);
 
-              liveBreakdownByUserId[uid].perPlayer[p] = mergeCupPerPlayerEntry(
-                liveBreakdownByUserId[uid].perPlayer[p],
+        // Map updates for UI Breakdown Cards
+        // ✅ Direct scorePlayer calculation (bypassing scoreTeam)
+        let sTotal = 0;
+        let bTotal = 0;
+
+        const processPicks = (playerList, counted) => {
+          for (const p of playerList) {
+            const pid = String(p.id);
+            const ref = pickRefByPid.get(pid);
+
+            // Only score if the API returned stats for this player's real-life game
+            if (statsMap[pid]) {
+              
+              // ✅ FORCE ISLIVE TO TRUE SO THE UI PILL LIGHTS UP!
+              statsMap[pid].isLive = true; 
+
+              statsMap[pid].position = toPos(statsMap[pid].position || p.position);
+
+              // Force the exact individual breakdown
+              const scoredOne = scorePlayer(p, statsMap[pid], toPos);
+              const onePts = Number(scoredOne?.points ?? scoredOne?.total ?? 0);
+
+              if (counted) sTotal += onePts;
+              else bTotal += onePts;
+
+              const entry = buildCupPerPlayerEntry(p, statsMap[pid], scoredOne, counted);
+              entry.points = onePts; // Force safety check
+
+              liveBreakdownByUserId[uid].perPlayer[pid] = mergeCupPerPlayerEntry(
+                liveBreakdownByUserId[uid].perPlayer[pid] || {},
                 entry
               );
-              
-              livePickUpdates.set(p, {
-                ref,
-                data: {
-                  lastFixtureId: String(fixtureId),
-                  lastDelta: Number(one?.points ?? obj.points ?? 0),
-                  lastDeltaAtMs: nowMs,
-                  lastCounted: counted,
-                  lastStats: statsMap[p] || {},
-                  lastBreakdown:
-                    one?.breakdown ||
-                    one?.parts ||
-                    obj?.breakdown ||
-                    obj?.parts ||
-                    obj?.pointsBreakdown ||
-                    {},
-                  lastParts:
-                    one?.parts ||
-                    obj?.parts ||
-                    {},
-                  lastRealTeamName: statsMap[p].teamName || statsMap[p].realTeamName || statsMap[p].team?.name || "",
-                  lastOpponentName: statsMap[p].opponentName || statsMap[p].opponent?.name || "",
-                }
-              });
+
+              if (ref) {
+                livePickUpdates.set(pid, {
+                  ref,
+                  data: {
+                    lastFixtureId: String(fixtureId),
+                    lastDelta: onePts,
+                    lastDeltaAtMs: nowMs,
+                    lastCounted: counted,
+                    lastStats: statsMap[pid] || {},
+                    lastBreakdown: scoredOne?.breakdown || scoredOne?.parts || {},
+                    lastParts: scoredOne?.parts || {},
+                    lastRealTeamName: statsMap[pid].teamName || statsMap[pid].realTeamName || "",
+                    lastOpponentName: statsMap[pid].opponentName || "",
+                  }
+                });
+              }
             }
           }
         };
 
-        processPicks(starters, starterScored, true);
-        processPicks(bench, benchScored, false);
+        processPicks(starters, true);
+        processPicks(bench, false);
+
       }
     }
 
@@ -861,6 +1114,8 @@ async function runCupEngine({
         timeZone: timezone,
       });
 
+      await enrichStatsMapWithScores(fixtureId, statsMap, apiFootballGet, apiKey);
+
       const pointsByUid = {};
       const pointsByPlayerId = {};
       const pickUpdates = [];
@@ -894,42 +1149,44 @@ async function runCupEngine({
 
         pointsByUid[uid] = Number(starterScored.total || 0);
 
-        for (const [pid, obj] of Object.entries(starterScored.perPlayer || {})) {
+        // ✅ Safely extract starters map
+        const starterMap = starterScored.perPlayer || starterScored.partsByPlayerId || starterScored.breakdownByPlayerId || starterScored.playerBreakdown || {};
+
+        for (const [pid, obj] of Object.entries(starterMap)) {
           const p = String(pid);
-          pointsByPlayerId[p] = { points: obj.points, counted: true };
+          const objPts = typeof obj === "number" ? obj : Number(obj?.points ?? obj?.total ?? 0);
+
+          pointsByPlayerId[p] = { points: objPts, counted: true };
           const ref = pickRefByPid.get(p);
           const playerObj =
             starterById.get(p) ||
             { id: p, name: metaByPid.get(p)?.name || "Unknown", position: metaByPid.get(p)?.position || "MID" };
 
-          const one = scorePlayer(playerObj, statsMap?.[p] || {}, toPos);
-          breakdownByUserId[uid].perPlayer[p] = buildCupPerPlayerEntry(
-            playerObj,
-            statsMap?.[p] || {},
-            one,
-            true
-          );
+              breakdownByUserId[uid].perPlayer[p] = buildCupPerPlayerEntry(
+                playerObj,
+                statsMap?.[p] || {},
+                obj,
+                true
+              );
+              breakdownByUserId[uid].perPlayer[p].points = objPts;
 
-          if (ref) {
-            pickUpdates.push({
-              ref,
-              data: {
-                lastFixtureId: String(fixtureId),
-                lastDelta: Number(one?.points ?? obj.points ?? 0),
-                lastDeltaAtMs: nowMs,
-                lastCounted: true,
-                lastStats: statsMap?.[p] || {},
-                lastBreakdown:
-                  one?.breakdown ||
-                  one?.parts ||
-                  obj?.breakdown ||
-                  obj?.parts ||
-                  obj?.pointsBreakdown ||
-                  {},
-                lastParts:
-                  one?.parts ||
-                  obj?.parts ||
-                  {},
+              if (ref) {
+                pickUpdates.push({
+                  ref,
+                  data: {
+                    lastFixtureId: String(fixtureId),
+                    lastDelta: objPts,
+                    lastDeltaAtMs: nowMs,
+                    lastCounted: true,
+                    lastStats: statsMap?.[p] || {},
+                    lastBreakdown:
+                      obj?.breakdown ||
+                      obj?.parts ||
+                      obj?.pointsBreakdown ||
+                      {},
+                    lastParts:
+                      obj?.parts ||
+                      {},
                 lastRealTeamName:
                   statsMap?.[p]?.teamName ||
                   statsMap?.[p]?.realTeamName ||
@@ -944,41 +1201,44 @@ async function runCupEngine({
           }
         }
 
-        for (const [pid, obj] of Object.entries(benchScored.perPlayer || {})) {
+        // ✅ Safely extract bench map
+        const benchMap = benchScored.perPlayer || benchScored.partsByPlayerId || benchScored.breakdownByPlayerId || benchScored.playerBreakdown || {};
+
+        for (const [pid, obj] of Object.entries(benchMap)) {
           const p = String(pid);
-          pointsByPlayerId[p] = { points: obj.points, counted: false };
+          const objPts = typeof obj === "number" ? obj : Number(obj?.points ?? obj?.total ?? 0);
+
+          pointsByPlayerId[p] = { points: objPts, counted: false };
           const ref = pickRefByPid.get(p);
           const playerObj =
             benchById.get(p) ||
             { id: p, name: metaByPid.get(p)?.name || "Unknown", position: metaByPid.get(p)?.position || "MID" };
 
-          const one = scorePlayer(playerObj, statsMap?.[p] || {}, toPos);
-          breakdownByUserId[uid].perPlayer[p] = buildCupPerPlayerEntry(
-            playerObj,
-            statsMap?.[p] || {},
-            one,
-            false
-          );
-          if (ref) {
-            pickUpdates.push({
-              ref,
-              data: {
-                lastFixtureId: String(fixtureId),
-                lastDelta: Number(one?.points ?? obj.points ?? 0),
-                lastDeltaAtMs: nowMs,
-                lastCounted: false,
-                lastStats: statsMap?.[p] || {},
-                lastBreakdown:
-                  one?.breakdown ||
-                  one?.parts ||
-                  obj?.breakdown ||
-                  obj?.parts ||
-                  obj?.pointsBreakdown ||
-                  {},
-                lastParts:
-                  one?.parts ||
-                  obj?.parts ||
-                  {},
+              breakdownByUserId[uid].perPlayer[p] = buildCupPerPlayerEntry(
+                playerObj,
+                statsMap?.[p] || {},
+                obj,
+                false
+              );
+              breakdownByUserId[uid].perPlayer[p].points = objPts;
+
+              if (ref) {
+                pickUpdates.push({
+                  ref,
+                  data: {
+                    lastFixtureId: String(fixtureId),
+                    lastDelta: objPts,
+                    lastDeltaAtMs: nowMs,
+                    lastCounted: false,
+                    lastStats: statsMap?.[p] || {},
+                    lastBreakdown:
+                      obj?.breakdown ||
+                      obj?.parts ||
+                      obj?.pointsBreakdown ||
+                      {},
+                    lastParts:
+                      obj?.parts ||
+                      {},
                 lastRealTeamName:
                   statsMap?.[p]?.teamName ||
                   statsMap?.[p]?.realTeamName ||
@@ -1035,7 +1295,10 @@ async function runCupEngine({
             lastCreditedFixtureId: String(fixtureId),
             lastCreditedAtMs: nowMs,
             updatedAtMs: nowMs,
-            [`creditedFixtures.${fixtureId}`]: true,
+            creditedFixtures: {
+                ...(cur.creditedFixtures || {}),
+                [fixtureId]: true
+              },
             breakdownByUserId: mergedBreakdownByUserId,
           },
           { merge: true }
@@ -1051,14 +1314,22 @@ async function runCupEngine({
 
     const cupAfterSnap = await cupRef.get();
     const cupAfter = cupAfterSnap.exists ? (cupAfterSnap.data() || {}) : {};
-    const totalsByUid = cupAfter.cupTotalsByUid || {};
-
-    await writeCupStandings({
+    const { creditedTotalsByUid, windowPointsByUid } = await syncCupTotalsFromFixtureLedger({
       db,
+      roomId,
+      cupRef,
+      currentWindowFixtureIds: currentIds,
+      nowMs,
+    });
+
+    await publishCupLeaderboardState({
+      db,
+      cupRef,
       roomId,
       memberUids,
       memberMetaByUid,
-      totalsByUid,
+      creditedTotalsByUid,
+      livePointsByUid,
       nowMs,
     });
 
@@ -1076,9 +1347,9 @@ async function runCupEngine({
           currentWindowStartAtMs: cupAfter.currentWindowStartAtMs || cup.currentWindowStartAtMs,
           currentWindowEndAtMs: cupAfter.currentWindowEndAtMs || cup.currentWindowEndAtMs,
           currentWindowFixtureIds: currentIds,
-          windowPointsByUid: cupAfter.windowPointsByUid || {},
-          cupTotalsByUid: totalsByUid,
-          breakdownByUserId: cup.breakdownByUserId || {}
+          windowPointsByUid,
+          cupTotalsByUid: creditedTotalsByUid,
+          breakdownByUserId: cupAfter.breakdownByUserId || {}
         },
         memberUids,
         memberMetaByUid,
@@ -1105,12 +1376,12 @@ async function runCupEngine({
           cupRef,
           memberUids,
           memberMetaByUid,
-          totalsByUid,
+          totalsByUid: creditedTotalsByUid,
           nowMs,
         });
       }
     } else {
-      const statusToSave = anyLive ? "live" : anyFin ? "resolving" : "scheduled";
+      const statusToSave = effectiveLive ? "live" : needsResolving ? "resolving" : "scheduled";
       await cupRef.set({ status: statusToSave, updatedAtMs: nowMs }, { merge: true });
       await roomRef.set(
         {

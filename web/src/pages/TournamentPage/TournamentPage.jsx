@@ -1172,7 +1172,7 @@ export default function TournamentPage() {
             <div className="tpLiveHeaderLine">
               {resultsStatus === "live" ? (
                 <span>
-                  <b>Live Updating</b>
+                  <b className="tpLivePill live">Live Updating</b>
                   {nextUpdateInSec != null ? <> • Next update in: <b>{nextUpdateInSec}s</b></> : null}
                   <> • Last update at: <b>{lastUpdateLabel}</b></>
                 </span>
@@ -1949,17 +1949,32 @@ export default function TournamentPage() {
       <p className="tpText">Loading week…</p>
     ) : (
       <>
-        <p className="tpText tpHistoryMeta">
-          Window: <b>{fmtDT(histWeek.startAtMs)}</b> → <b>{fmtDT(histWeek.endAtMs)}</b>
-          {histWeek.roundLabel ? (
-            <> • Round: <b>{histWeek.roundLabel}</b>
-            {totalRoundsDisplay ? <> / <b>{totalRoundsDisplay}</b></> : null}
-            </>
-          ) : null}
-          {histResults?.status ? (
-            <> • Status: <b>{String(histResults.status).toUpperCase()}</b></>
-          ) : null}
-        </p>
+        <div className="tpHistoryMetaGrid">
+          {/* Window Card */}
+          <div className="tpHistoryMetaCard">
+            <span className="tpHistoryMetaLabel">Window</span>
+            <span className="tpHistoryMetaValue">
+              {histWeek?.startAtMs ? fmtDT(histWeek.startAtMs) : "—"} → {histWeek?.endAtMs ? fmtDT(histWeek.endAtMs) : "—"}
+            </span>
+          </div>
+
+          {/* Round Card */}
+          <div className="tpHistoryMetaCard">
+            <span className="tpHistoryMetaLabel">Round</span>
+            <span className="tpHistoryMetaValue">
+              {histWeek?.roundLabel || "—"}
+              {totalRoundsDisplay ? ` / ${totalRoundsDisplay}` : ""}
+            </span>
+          </div>
+
+          {/* Status (or Winner) Card */}
+          <div className="tpHistoryMetaCard">
+            <span className="tpHistoryMetaLabel">Status</span>
+            <span className="tpHistoryMetaValue">
+              {histResults?.status ? String(histResults.status).toUpperCase() : "—"}
+            </span>
+          </div>
+        </div>
 
         {!histMatchups.length ? (
           <p className="tpText">No matchups found for this week.</p>
@@ -2157,23 +2172,23 @@ export default function TournamentPage() {
   );
 }
 
-function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
-  if (!stats) return null;
+function PlayerStatsCard({ stats, breakdown, teamName, opponentName, labels }) {
+  const hasStats = stats && Object.keys(stats).length > 0;
+  const hasBD = breakdown && Object.keys(breakdown).length > 0;
+  
+  const showMatchHeader = Boolean(teamName || opponentName);
 
-  const labels = {
-    minutes: "Mins", goals: "Goals", assists: "Assists",
-    passesCompleted: "Passes", saves: "Saves", goalsConceded: "Conceded",
-    yellow: "Yellow", red: "Red", cleanSheet: "Clean Sheet", sixtyPlus: "60+ Mins", appearance: "Appearance",
-  };
+  // Look for the game score in the raw stats
+  const tScore = stats?.teamScore ?? stats?.teamGoals ?? null;
+  const oScore = stats?.opponentScore ?? stats?.opponentGoals ?? null;
+  const hasScore = tScore !== null && oScore !== null;
 
-  const showMatchHeader = Boolean(stats?.isLive && (teamName || opponentName));
-
-  if (!stats?.isLive) {
+  if (!hasStats && !hasBD) {
     return (
       <div className="tpStatsCard">
         <div className="tpStatsGrid">
-          <div className="tpStatsCol">
-            <span className="tpStatsHead">No stats yet</span>
+          <div className="tpStatsCol" style={{ gridColumn: "1 / -1" }}>
+            <span className="tpStatsHead" style={{ textTransform: "uppercase" }}>No stats yet</span>
             <div className="tpStatRow">
               <span>Waiting for next games</span>
               <span>—</span>
@@ -2184,26 +2199,85 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
     );
   }
 
+  // The Master Order for sorting
+  const STAT_ORDER = [
+    "position",
+    "rating",
+    "minutes",
+    "goals",
+    "assists",
+    "shotsOnTarget",
+    "passesCompleted",
+    "tackles",
+    "duelsWon",
+    "dribblesSuccess",
+    "saves",
+    "goalsConceded",
+    "cleanSheet",
+    "yellow",
+    "red",
+    "foulsCommitted",
+    "offsides",
+    "sixtyPlus",
+    "appearance"
+  ];
+
+  const sortedRawKeys = Object.keys(stats || {}).sort((a, b) => {
+    const indexA = STAT_ORDER.indexOf(a);
+    const indexB = STAT_ORDER.indexOf(b);
+    if (indexA !== -1 && indexB !== -1) return indexA - indexB;
+    if (indexA !== -1) return -1;
+    if (indexB !== -1) return 1;
+    return a.localeCompare(b);
+  });
+
+  const sortedBreakdownKeys = Object.keys(breakdown || {}).sort((a, b) => {
+    const indexA = STAT_ORDER.indexOf(a);
+    const indexB = STAT_ORDER.indexOf(b);
+    if (indexA !== -1 && indexB !== -1) return indexA - indexB;
+    if (indexA !== -1) return -1;
+    if (indexB !== -1) return 1;
+    return a.localeCompare(b);
+  });
+
+  const validBreakdownKeys = sortedBreakdownKeys.filter((k) => {
+    const v = breakdown[k];
+    return v != null && v !== 0 && v !== "0";
+  });
+
+  // Helper to fallback to pretty text if STAT_LABELS is missing a key
+  const prettyLabel = (k) => {
+    if (labels && labels[k]) return labels[k];
+    return k.replace(/([A-Z])/g, " $1").replace(/^./, str => str.toUpperCase());
+  };
+
   return (
     <div className="tpStatsCard">
       {showMatchHeader && (
         <div className="tpCardHeader">
           <span className="tpCardTeam">{teamName || "Unknown Team"}</span>
-          {opponentName && <span className="tpCardVs">vs {opponentName}</span>}
+          {opponentName && (
+            <span className="tpCardVs">
+              {hasScore ? ` ${tScore} - ${oScore} ` : " vs "}
+              {opponentName}
+            </span>
+          )}
         </div>
       )}
 
       <div className="tpStatsGrid">
         <div className="tpStatsCol">
           <span className="tpStatsHead">Raw Stats</span>
-          {Object.entries(stats).map(([k, v]) => {
-            if (!v && v !== 0) return null;
-            if (v === false) return null;
-            if (k === "minutes" && v === 0) return null;
-            if (!labels[k]) return null;
+          {sortedRawKeys.map((k) => {
+            const v = stats[k];
+            
+            // Hide the stat completely if the value is 0, false, null, or an internal API flag
+            if (v == null || v === false || v === 0 || v === "0") return null;
+            if (k === "isLive" || k === "teamId" || k === "fixtureId" || k === "teamScore" || k === "opponentScore" || k === "teamGoals" || k === "opponentGoals") return null;
+
             return (
               <div key={k} className="tpStatRow">
-                <span>{prettyStatLabel(k)}</span>
+                <span>{prettyLabel(k)}</span>
                 <span>{String(v)}</span>
               </div>
             );
@@ -2212,15 +2286,18 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
 
         <div className="tpStatsCol">
           <span className="tpStatsHead">Points</span>
-          {Object.entries(breakdown || {}).map(([k, v]) => (
-            <div key={k} className="tpStatRow">
-              <span>{prettyStatLabel(k)}</span>
-              <span className={v > 0 ? "tpPos" : "tpNeg"}>
-                {v > 0 ? "+" : ""}{v}
-              </span>
-            </div>
-          ))}
-          {Object.keys(breakdown || {}).length === 0 && (
+          {validBreakdownKeys.map((k) => {
+            const v = breakdown[k];
+            return (
+              <div key={k} className="tpStatRow">
+                <span>{prettyLabel(k)}</span>
+                <span className={v > 0 ? "tpPos" : "tpNeg"}>
+                  {v > 0 ? "+" : ""}{v}
+                </span>
+              </div>
+            );
+          })}
+          {validBreakdownKeys.length === 0 && (
             <div className="tpStatRow"><span>Base</span><span>0</span></div>
           )}
         </div>

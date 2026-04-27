@@ -4,6 +4,7 @@ import { useParams, Link } from "react-router-dom";
 import { doc, onSnapshot, collection, query, orderBy } from "firebase/firestore";
 
 import { useTournament } from "../../tournament/hooks/useTournament";
+import { scorePlayerFromCore, toCorePos } from "../../tournament/logic/scoringCoreClient";
 import { auth, db } from "../../firebase";
 
 import "./TournamentPage.css";
@@ -133,6 +134,132 @@ function sortPlayersForDisplay(list = []) {
   });
 }
 
+function hasBreakdownMap(breakdown) {
+  return !!(breakdown && Object.keys(breakdown).length > 0);
+}
+
+function sumDisplayedPoints(list = []) {
+  return (list || []).reduce((sum, p) => sum + Number(p?.points || 0), 0);
+}
+
+function sortCupLeaderboardRows(rows = []) {
+  return [...rows].sort((a, b) => {
+    const aFantasy = Number(a.totalFantasyPoints ?? a.totalPoints ?? 0);
+    const bFantasy = Number(b.totalFantasyPoints ?? b.totalPoints ?? 0);
+    if (bFantasy !== aFantasy) return bFantasy - aFantasy;
+
+    const aTable = Number(a.tablePoints ?? 0);
+    const bTable = Number(b.tablePoints ?? 0);
+    if (bTable !== aTable) return bTable - aTable;
+
+    return String(a.name || "").localeCompare(String(b.name || ""));
+  });
+}
+
+function sumNumberMaps(base = {}, add = {}) {
+  const out = { ...(base || {}) };
+  for (const [key, value] of Object.entries(add || {})) {
+    const uid = String(key || "");
+    if (!uid) continue;
+    out[uid] = Number(out[uid] || 0) + Number(value || 0);
+  }
+  return out;
+}
+
+function buildFixtureTotalsByUid(fixtures = [], fixtureIds = null) {
+  const out = {};
+  const filterIds = fixtureIds
+    ? new Set(Array.from(fixtureIds).map((id) => String(id)).filter(Boolean))
+    : null;
+
+  for (const fx of fixtures || []) {
+    const fixtureId = String(fx?.fixtureId || fx?.id || "");
+    if (filterIds && !filterIds.has(fixtureId)) continue;
+
+    for (const [uid, pts] of Object.entries(fx?.pointsByUid || {})) {
+      const key = String(uid || "");
+      if (!key) continue;
+      out[key] = Number(out[key] || 0) + Number(pts || 0);
+    }
+  }
+
+  return out;
+}
+
+function sortCupHistoryRows(rows = []) {
+  return [...rows]
+    .sort((a, b) => {
+      const aTotal = Number(a?.totalAfter || 0);
+      const bTotal = Number(b?.totalAfter || 0);
+      if (bTotal !== aTotal) return bTotal - aTotal;
+
+      const aRound = Number(a?.roundPoints || 0);
+      const bRound = Number(b?.roundPoints || 0);
+      if (bRound !== aRound) return bRound - aRound;
+
+      return String(a?.name || "").localeCompare(String(b?.name || ""));
+    })
+    .map((row, idx) => ({ ...row, rank: idx + 1 }));
+}
+
+function normalizeCupHistoryRounds(rounds = [], userById = {}) {
+  const asc = [...(rounds || [])].sort(
+    (a, b) =>
+      Number(a?.closedAtMs || a?.endAtMs || a?.startAtMs || 0) -
+      Number(b?.closedAtMs || b?.endAtMs || b?.startAtMs || 0)
+  );
+
+  const cumulativeByUid = {};
+  const normalizedAsc = asc.map((round) => {
+    const rowMap = new Map();
+    for (const row of Array.isArray(round?.rows) ? round.rows : []) {
+      const uid = String(row?.userId || row?.uid || "");
+      if (!uid) continue;
+      rowMap.set(uid, row);
+    }
+
+    const uids = new Set([
+      ...Array.from(rowMap.keys()),
+      ...Object.keys(round?.windowPointsByUid || {}).map(String),
+      ...Object.keys(round?.cupTotalsAfterByUid || {}).map(String),
+    ]);
+
+    const rowsForRound = Array.from(uids).map((uid) => {
+      const rawRow = rowMap.get(uid) || {};
+      const roundPoints = Number(
+        rawRow?.roundPoints ?? round?.windowPointsByUid?.[uid] ?? 0
+      );
+
+      cumulativeByUid[uid] = Number(cumulativeByUid[uid] || 0) + roundPoints;
+
+      return {
+        ...rawRow,
+        userId: uid,
+        uid,
+        name:
+          rawRow?.name ||
+          userById?.[uid]?.name ||
+          userById?.[uid]?.displayName ||
+          "Unknown",
+        roundPoints,
+        totalAfter: cumulativeByUid[uid],
+      };
+    });
+
+    return {
+      ...round,
+      cupTotalsAfterByUid: { ...cumulativeByUid },
+      rows: sortCupHistoryRows(rowsForRound),
+    };
+  });
+
+  return normalizedAsc.sort(
+    (a, b) =>
+      Number(b?.closedAtMs || b?.endAtMs || b?.startAtMs || 0) -
+      Number(a?.closedAtMs || a?.endAtMs || a?.startAtMs || 0)
+  );
+}
+
 function firstText(...values) {
   for (const v of values) {
     const s = String(v ?? "").trim();
@@ -216,14 +343,22 @@ function UserChip({ user }) {
 function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
   const hasStats = stats && Object.keys(stats).length > 0;
   const hasBD = breakdown && Object.keys(breakdown).length > 0;
-  const showMatchHeader = Boolean(stats?.isLive && (teamName || opponentName));
+  
+  // ✅ 1. Remove stats?.isLive so it shows permanently!
+  const showMatchHeader = Boolean(teamName || opponentName);
+
+  // ✅ 2. Look for the game score in the raw stats
+  // (Adjust these names if your API uses 'homeScore' or 'goalsFor' instead)
+  const tScore = stats?.teamScore ?? stats?.teamGoals ?? null;
+  const oScore = stats?.opponentScore ?? stats?.opponentGoals ?? null;
+  const hasScore = tScore !== null && oScore !== null;
 
   if (!hasStats && !hasBD) {
     return (
       <div className="tpStatsCard">
         <div className="tpStatsGrid">
-          <div className="tpStatsCol">
-            <span className="tpStatsHead">No stats yet</span>
+          <div className="tpStatsCol" style={{ gridColumn: "1 / -1" }}>
+            <span className="tpStatsHead" style={{ textTransform: "uppercase" }}>No stats yet</span>
             <div className="tpStatRow">
               <span>Waiting for next games</span>
               <span>—</span>
@@ -234,23 +369,76 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
     );
   }
 
+  const STAT_ORDER = [
+    "position",
+    "rating",
+    "minutes",
+    "goals",
+    "assists",
+    "shotsOnTarget",
+    "passesCompleted",
+    "tackles",
+    "duelsWon",
+    "dribblesSuccess",
+    "saves",
+    "goalsConceded",
+    "cleanSheet",
+    "yellow",
+    "red",
+    "foulsCommitted",
+    "offsides",
+    "sixtyPlus",
+    "appearance"
+  ];
+
+  const sortedRawKeys = Object.keys(stats || {}).sort((a, b) => {
+    const indexA = STAT_ORDER.indexOf(a);
+    const indexB = STAT_ORDER.indexOf(b);
+    if (indexA !== -1 && indexB !== -1) return indexA - indexB;
+    if (indexA !== -1) return -1;
+    if (indexB !== -1) return 1;
+    return a.localeCompare(b);
+  });
+
+  const sortedBreakdownKeys = Object.keys(breakdown || {}).sort((a, b) => {
+    const indexA = STAT_ORDER.indexOf(a);
+    const indexB = STAT_ORDER.indexOf(b);
+    if (indexA !== -1 && indexB !== -1) return indexA - indexB;
+    if (indexA !== -1) return -1;
+    if (indexB !== -1) return 1;
+    return a.localeCompare(b);
+  });
+
+  const validBreakdownKeys = sortedBreakdownKeys.filter((k) => {
+    const v = breakdown[k];
+    return v != null && v !== 0 && v !== "0";
+  });
+
   return (
     <div className="tpStatsCard">
       {showMatchHeader && (
         <div className="tpCardHeader">
           <span className="tpCardTeam">{teamName || "Unknown Team"}</span>
-          {opponentName && <span className="tpCardVs">vs {opponentName}</span>}
+          {opponentName && (
+            <span className="tpCardVs">
+              {/* ✅ 3. If we have the score, display " 2 - 1 ", otherwise fallback to " vs " */}
+              {hasScore ? ` ${tScore} - ${oScore} ` : " vs "}
+              {opponentName}
+            </span>
+          )}
         </div>
       )}
 
       <div className="tpStatsGrid">
         <div className="tpStatsCol">
           <span className="tpStatsHead">Raw Stats</span>
-          {Object.entries(stats || {}).map(([k, v]) => {
-            if (v === null || v === undefined) return null;
-            if (v === false) return null;
-            if (k === "minutes" && Number(v) === 0) return null;
-            if (Number(v) === 0 && k !== "minutes") return null;
+          {sortedRawKeys.map((k) => {
+            const v = stats[k];
+            if (v == null || v === false || v === 0 || v === "0") return null;
+            
+            // ✅ 4. Hide the score keys from the list below so they don't randomly show up twice!
+            if (k === "isLive" || k === "teamId" || k === "fixtureId" || k === "teamScore" || k === "opponentScore" || k === "teamGoals" || k === "opponentGoals") return null;
+
             return (
               <div key={k} className="tpStatRow">
                 <span>{prettyStatLabel(k)}</span>
@@ -262,20 +450,19 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
 
         <div className="tpStatsCol">
           <span className="tpStatsHead">Points</span>
-          {Object.entries(breakdown || {}).map(([k, v]) => (
-            <div key={k} className="tpStatRow">
-              <span>{prettyStatLabel(k)}</span>
-              <span className={Number(v) > 0 ? "tpPos" : "tpNeg"}>
-                {Number(v) > 0 ? "+" : ""}
-                {String(v)}
-              </span>
-            </div>
-          ))}
-          {Object.keys(breakdown || {}).length === 0 && (
-            <div className="tpStatRow">
-              <span>Base</span>
-              <span>0</span>
-            </div>
+          {validBreakdownKeys.map((k) => {
+            const v = breakdown[k];
+            return (
+              <div key={k} className="tpStatRow">
+                <span>{prettyStatLabel(k)}</span>
+                <span className={v > 0 ? "tpPos" : "tpNeg"}>
+                  {v > 0 ? "+" : ""}{v}
+                </span>
+              </div>
+            );
+          })}
+          {validBreakdownKeys.length === 0 && (
+            <div className="tpStatRow"><span>Base</span><span>0</span></div>
           )}
         </div>
       </div>
@@ -320,6 +507,8 @@ export default function CupTournamentPage() {
 
   // Cup-specific State
   const [cupDoc, setCupDoc] = useState(null);
+  const [cupFixtureDocs, setCupFixtureDocs] = useState([]);
+  const [standingsDoc, setStandingsDoc] = useState(null);
   const [lineups, setLineups] = useState({});
   const [picksMap, setPicksMap] = useState({});
   const [finalResultsDoc, setFinalResultsDoc] = useState(null);
@@ -379,6 +568,21 @@ export default function CupTournamentPage() {
       (snap) => setCupDoc(snap.exists() ? snap.data() : null)
     );
 
+    const unsubCupFixtures = onSnapshot(
+      collection(db, "rooms", roomId, "cup", "current", "fixtures"),
+      (snap) => {
+        const rows = snap.docs.map((d) => ({ id: d.id, ...(d.data() || {}) }));
+        setCupFixtureDocs(rows);
+      },
+      () => setCupFixtureDocs([])
+    );
+
+    const unsubStandings = onSnapshot(
+      doc(db, "rooms", roomId, "standings", "current"),
+      (snap) => setStandingsDoc(snap.exists() ? snap.data() : null),
+      () => setStandingsDoc(null)
+    );
+
     const unsubLineups = onSnapshot(
       collection(db, "rooms", roomId, "lineups"),
       (snap) => {
@@ -399,7 +603,18 @@ export default function CupTournamentPage() {
           const pid = String(val.playerId || val.pid || val.apiPlayerId || "");
           if (!pid) return;
 
-          byPid[pid] = val;
+          // allow lookup by BOTH real player id and pick doc id
+          byPid[pid] = {
+            ...val,
+            _resolvedPlayerId: pid,
+            _pickDocId: d.id,
+          };
+
+          byPid[d.id] = {
+            ...val,
+            _resolvedPlayerId: pid,
+            _pickDocId: d.id,
+          };
 
           const ownerUid = inferOwnerUidFromPick(val);
           if (!ownerUid) return;
@@ -452,6 +667,8 @@ export default function CupTournamentPage() {
 
     return () => {
       unsubCup();
+      unsubCupFixtures();
+      unsubStandings();
       unsubLineups();
       unsubPicks();
       unsubHistory();
@@ -473,46 +690,157 @@ export default function CupTournamentPage() {
   const isHost = data?.room?.hostUid === myUid;
   const users = data?.users || [];
   const userById = Object.fromEntries(users.map((u) => [u.userId, u]));
+  const displayHistoryRounds = normalizeCupHistoryRounds(historyRounds, userById);
+  const latestCompletedHistoryTotalsByUid =
+    displayHistoryRounds[0]?.cupTotalsAfterByUid || {};
 
   const competitionName = data?.room?.competitionMeta?.name || data?.room?.competition?.name || "";
   const competitionSeason = data?.room?.competition?.season || data?.room?.competitionMeta?.season || "";
   const competitionLabel = [competitionSeason, competitionName].filter(Boolean).join(" ");
   
     // Cup Data
-    const statusRaw = cupDoc?.status || "IDLE";
-    const status = String(statusRaw).toUpperCase();
+    
+    
+
+    
+
+    //Status 
+    const statusRaw =
+      cupDoc?.status ||
+      data?.room?.competitionState?.weekStatus ||
+      data?.room?.["competitionState.weekStatus"] ||
+      "scheduled";
+
     const statusLower = String(statusRaw).toLowerCase();
 
-    const currentWindowLabel = cupDoc?.currentWindowLabel || "Waiting for next round";
-    const isFinal = status === "FINAL" || cupDoc?.completed;
+    const isLive = statusLower === "live";
+    const isResolving = statusLower === "resolving";
+    const isScheduled = statusLower === "scheduled";
+    const isError = statusLower === "error";
+
+    const statusClass = isLive
+      ? "live"
+      : isResolving
+      ? "resolving"
+      : isScheduled
+      ? "scheduled"
+      : isError
+      ? "error"
+      : "idle";
+
+    const statusLabel = isLive
+      ? "LIVE"
+      : isResolving
+      ? "RESOLVING"
+      : isScheduled
+      ? "SCHEDULED"
+      : isError
+      ? "ERROR"
+      : "IDLE";
 
     // --- Live-style header timing (match TournamentPage feel) ---
-    const lastUpdateMs = Number(cupDoc?.updatedAtMs || cupDoc?.lastPollAtMs || 0) || null;
+    const lastUpdateMs = Number(cupDoc?.updatedAtMs || 0) || null;
     const ageSec = lastUpdateMs ? Math.max(0, Math.floor((nowMs - lastUpdateMs) / 1000)) : null;
     const nextUpdateInSec = lastUpdateMs ? Math.max(0, 60 - (ageSec % 60)) : null;
     const lastUpdateLabel = lastUpdateMs ? fmtDT(lastUpdateMs) : "—";
+    const status = String(statusRaw).toUpperCase();
+    const currentWindowLabel = cupDoc?.currentWindowLabel || "Waiting for next round";
+    const isFinal = status === "FINAL" || cupDoc?.completed;
+    
+    const livePoints = cupDoc?.livePointsByUid || {};
+    const fixtureLedgerTotalsByUid = buildFixtureTotalsByUid(cupFixtureDocs);
+    const creditedTotalsByUid =
+      Object.keys(fixtureLedgerTotalsByUid).length > 0
+        ? fixtureLedgerTotalsByUid
+        : Object.keys(latestCompletedHistoryTotalsByUid).length > 0
+        ? latestCompletedHistoryTotalsByUid
+        : (cupDoc?.creditedTotalsByUid || cupDoc?.cupTotalsByUid || {});
+    const projectedTotalsByUid = sumNumberMaps(creditedTotalsByUid, livePoints);
+    const standingsIncludeLive =
+      Boolean(standingsDoc?.includesLivePoints) ||
+      Boolean(cupDoc?.projectedIncludesLivePoints);
+    const standingsSourceIsCup =
+      String(standingsDoc?.source || "").toLowerCase() === "cup";
+    const shouldProjectLive =
+      !isFinal &&
+      !standingsIncludeLive &&
+      Object.values(livePoints).some((v) => Number(v || 0) !== 0);
+    const leaderboardByUid = {};
+    const standingsRows = Array.isArray(standingsDoc?.standings) ? standingsDoc.standings : [];
+    const standingsByUid = Object.fromEntries(
+      standingsRows
+        .map((row) => {
+          const uid = String(row?.userId || row?.uid || "");
+          return uid ? [uid, row] : null;
+        })
+        .filter(Boolean)
+    );
+    const leaderboardIds = new Set([
+      ...users.map((u) => String(u.userId || "")).filter(Boolean),
+      ...Object.keys(standingsByUid),
+      ...Object.keys(creditedTotalsByUid || {}).map(String),
+      ...Object.keys(projectedTotalsByUid || {}).map(String),
+    ]);
 
-    // Status classification for styling
-    const isLive = statusLower === "live";
-    const isResolving = statusLower === "resolving";
-    const isScheduled = statusLower === "scheduled"; 
-    const statusClass = isLive ? "live" : isResolving ? "resolving" : isScheduled ? "scheduled" : "idle";
-    const statusLabel = isLive ? "LIVE" : isResolving ? "RESOLVING" : isScheduled ? "SCHEDULED" : "IDLE";
+    leaderboardIds.forEach((uid) => {
+      const standingRow = standingsByUid[uid] || null;
+      const hasCreditedTotal = Object.prototype.hasOwnProperty.call(
+        creditedTotalsByUid || {},
+        uid
+      );
+      const hasProjectedTotal = Object.prototype.hasOwnProperty.call(
+        projectedTotalsByUid || {},
+        uid
+      );
 
-    const cupTotals = cupDoc?.cupTotalsByUid || {};
-    const livePoints = cupDoc?.livePointsByUid || {}; // NEW
-    const windowPoints = cupDoc?.windowPointsByUid || {};
+      const fallbackCredited = standingsSourceIsCup
+        ? Number(
+            standingRow?.creditedFantasyPoints ??
+              standingRow?.totalFantasyPoints ??
+              0
+          )
+        : 0;
+      const fallbackProjected = standingsSourceIsCup
+        ? Number(
+            standingRow?.projectedFantasyPoints ??
+              standingRow?.totalFantasyPoints ??
+              fallbackCredited
+          )
+        : fallbackCredited;
 
-    // Build Leaderboard (Base + Live)
-    const leaderboard = users.map((u) => {
-      const base = Number(cupTotals[u.userId] || 0);
-      const live = Number(livePoints[u.userId] || 0);
-      return {
-        userId: u.userId,
-        name: u.name || u.displayName,
-        totalPoints: base + live,
+      const creditedTotal = hasCreditedTotal
+        ? Number(creditedTotalsByUid?.[uid] || 0)
+        : fallbackCredited;
+      const projectedTotal = hasProjectedTotal
+        ? Number(projectedTotalsByUid?.[uid] || 0)
+        : fallbackProjected;
+      const baseTotal = standingsIncludeLive ? projectedTotal : creditedTotal;
+
+      leaderboardByUid[uid] = {
+        userId: uid,
+        uid,
+        name:
+          standingRow?.name ||
+          userById?.[uid]?.name ||
+          userById?.[uid]?.displayName ||
+          "Unknown",
+        tablePoints: baseTotal,
+        totalFantasyPoints: baseTotal,
       };
-    }).sort((a, b) => b.totalPoints - a.totalPoints);
+    });
+
+    const leaderboard = sortCupLeaderboardRows(
+      Object.values(leaderboardByUid).map((row) => {
+        const live = shouldProjectLive ? Number(livePoints[row.userId] || 0) : 0;
+        const totalPoints = Number(row.totalFantasyPoints || 0) + live;
+        return {
+          ...row,
+          tablePoints: totalPoints,
+          totalFantasyPoints: totalPoints,
+          totalPoints,
+        };
+      })
+    );
 
   const fakePodiumData = {
     computedAtMs: Date.now(),
@@ -572,7 +900,7 @@ export default function CupTournamentPage() {
 
   const selectedHistory =
     selectedHistoryId
-      ? historyRounds.find((r) => r.id === selectedHistoryId) || null
+      ? displayHistoryRounds.find((r) => r.id === selectedHistoryId) || null
       : null;
 
   const selectedHistoryRows = Array.isArray(selectedHistory?.rows)
@@ -585,14 +913,280 @@ export default function CupTournamentPage() {
       ? `${fmtDT(selectedHistory.startAtMs)} → ${fmtDT(selectedHistory.endAtMs)}`
       : "—";
 
-  const activeBreakdownByUserId =
-    selectedHistory?.breakdownByUserId ||
-    cupDoc?.breakdownByUserId ||
-    {};
+  function mergeStatObjects(a = {}, b = {}) {
+    const out = { ...(a || {}) };
+
+    for (const [k, v] of Object.entries(b || {})) {
+      if (typeof v === "number") {
+        out[k] = Number(out[k] || 0) + v;
+      } else if (typeof v === "boolean") {
+        out[k] = Boolean(out[k]) || v;
+      } else if ((out[k] === undefined || out[k] === null || out[k] === "") && v != null) {
+        out[k] = v;
+      }
+    }
+
+    return out;
+  }
+
+  function mergeNumberMaps(a = {}, b = {}) {
+    const out = { ...(a || {}) };
+    for (const [k, v] of Object.entries(b || {})) {
+      const n = Number(v);
+      if (!Number.isFinite(n)) continue;
+      out[k] = Number(out[k] || 0) + n;
+    }
+    return out;
+  }
+
+  function mergePerPlayerEntry(prev = {}, next = {}) {
+    return {
+      id: next.id || prev.id || "",
+      name: next.name || prev.name || "Unknown",
+      position: next.position || prev.position || "MID",
+      points: Number(prev.points || 0) + Number(next.points || 0),
+      counted: next.counted ?? prev.counted ?? true,
+      stats: mergeStatObjects(prev.stats || {}, next.stats || {}),
+      breakdown: mergeNumberMaps(prev.breakdown || {}, next.breakdown || {}),
+      teamName: next.teamName || prev.teamName || "",
+      opponentName: next.opponentName || prev.opponentName || "",
+      country: next.country || prev.country || "",
+      clubName: next.clubName || prev.clubName || "",
+    };
+  }
+
+  function mergeBreakdownMaps(base = {}, live = {}) {
+    const out = { ...(base || {}) };
+
+    for (const [uid, incoming] of Object.entries(live || {})) {
+      const prev = out[uid] || { total: 0, benchTotal: 0, perPlayer: {} };
+
+      const mergedPerPlayer = { ...(prev.perPlayer || {}) };
+      for (const [pid, entry] of Object.entries(incoming?.perPlayer || {})) {
+        mergedPerPlayer[pid] = mergePerPlayerEntry(mergedPerPlayer[pid], entry);
+      }
+
+      out[uid] = {
+        total: Number(prev.total || 0) + Number(incoming?.total || 0),
+        benchTotal: Number(prev.benchTotal || 0) + Number(incoming?.benchTotal || 0),
+        perPlayer: mergedPerPlayer,
+      };
+    }
+
+    return out;
+  }
+
+  function aggregateFixtureBreakdowns(fixtures = []) {
+    let agg = {};
+    for (const fx of fixtures || []) {
+      agg = mergeBreakdownMaps(agg, fx?.breakdownByUserId || {});
+    }
+    return agg;
+  }
+
+  const parsedWindow = parseCupWindowId(cupDoc?.currentWindowId);
+
+  const winStartMs =
+    cupDoc?.currentWindowStartAtMs ??
+    cupDoc?.startAtMs ??
+    parsedWindow?.startAtMs ??
+    null;
+
+  const winEndMs =
+    cupDoc?.currentWindowEndAtMs ??
+    cupDoc?.endAtMs ??
+    parsedWindow?.endAtMs ??
+    null;
+
+  const currentBreakdownByUserId = mergeBreakdownMaps(
+    cupDoc?.breakdownByUserId || {},
+    cupDoc?.liveBreakdownByUserId || {}
+  );
+
+  const latestHistory = displayHistoryRounds[0] || null;
+  const autoHidePreviousRoundAtMs = Number(winStartMs || 0) ? Number(winStartMs) - (60 * 60 * 1000) : null;
+  const shouldAutoShowLatestHistory =
+    !selectedHistory &&
+    !isFinal &&
+    !isLive &&
+    !isResolving &&
+    !!latestHistory &&
+    (autoHidePreviousRoundAtMs == null || nowMs < autoHidePreviousRoundAtMs);
+
+  const activeHistory = selectedHistory || (shouldAutoShowLatestHistory ? latestHistory : null);
+  const activeHistoryFixtureIds = new Set(
+    Array.isArray(activeHistory?.fixtureIds)
+      ? activeHistory.fixtureIds.map((id) => String(id)).filter(Boolean)
+      : []
+  );
+  const activeFixtureDocs = activeHistory
+    ? cupFixtureDocs.filter((fx) => {
+        const fixtureId = String(fx?.fixtureId || fx?.id || "");
+        if (activeHistoryFixtureIds.size > 0) return activeHistoryFixtureIds.has(fixtureId);
+        if (activeHistory?.windowId && fx?.windowId) return String(fx.windowId) === String(activeHistory.windowId);
+        return false;
+      })
+    : [];
+  const currentWindowFixtureIds = new Set(
+    Array.isArray(cupDoc?.currentWindowFixtureIds)
+      ? cupDoc.currentWindowFixtureIds.map((id) => String(id)).filter(Boolean)
+      : []
+  );
+  const currentWindowFixtureDocs = cupFixtureDocs.filter((fx) => {
+    const fixtureId = String(fx?.fixtureId || fx?.id || "");
+    return currentWindowFixtureIds.has(fixtureId);
+  });
+  const activeHistoryBreakdownByUserId =
+    activeFixtureDocs.length > 0
+      ? aggregateFixtureBreakdowns(activeFixtureDocs)
+      : (activeHistory?.breakdownByUserId || {});
+  const activeBreakdownByUserId = activeHistory ? activeHistoryBreakdownByUserId : currentBreakdownByUserId;
+  const isAutoShowingLatestHistory = !selectedHistory && activeHistory === latestHistory && shouldAutoShowLatestHistory;
+  const latestFixtureEntryByPlayerId = (() => {
+    const out = {};
+    const sourceFixtureDocs = activeHistory ? activeFixtureDocs : currentWindowFixtureDocs;
+    const sorted = [...sourceFixtureDocs].sort(
+      (a, b) => Number(b?.creditedAtMs || 0) - Number(a?.creditedAtMs || 0)
+    );
+
+    for (const fx of sorted) {
+      for (const userBreakdown of Object.values(fx?.breakdownByUserId || {})) {
+        for (const [pid, entry] of Object.entries(userBreakdown?.perPlayer || {})) {
+          const key = String(pid || entry?.id || "");
+          if (!key || out[key]) continue;
+          out[key] = entry;
+        }
+      }
+    }
+
+    return out;
+  })();
+
+  function withDerivedScoring(player) {
+    const stats = player?.stats && typeof player.stats === "object" ? player.stats : null;
+    const breakdown = hasBreakdownMap(player?.breakdown) ? player.breakdown : null;
+    const existingPoints = Number(player?.points ?? NaN);
+
+    if (!stats) {
+      return {
+        ...player,
+        points: Number.isFinite(existingPoints) ? existingPoints : 0,
+        breakdown,
+      };
+    }
+
+    const scored = scorePlayerFromCore(
+      stats,
+      toCorePos(player?.position || stats?.position || stats?.pos || stats?.role)
+    );
+    const derivedPoints = Number(scored?.points || 0);
+    const derivedBreakdown = hasBreakdownMap(scored?.breakdown) ? scored.breakdown : null;
+    const shouldKeepExistingPoints =
+      breakdown &&
+      Number.isFinite(existingPoints) &&
+      (existingPoints !== 0 || derivedPoints === 0);
+
+    return {
+      ...player,
+      position: player?.position || stats?.position || stats?.pos || stats?.role || "MID",
+      points: shouldKeepExistingPoints ? existingPoints : derivedPoints,
+      breakdown: breakdown || derivedBreakdown,
+    };
+  }
+
+  function withDerivedLiveState(player, uid, pid) {
+    const liveEntry = !activeHistory
+      ? cupDoc?.liveBreakdownByUserId?.[uid]?.perPlayer?.[String(pid)]
+      : null;
+    const isPlayerLive = Boolean(player?.stats?.isLive) || Boolean(liveEntry);
+    const nextStats = player?.stats
+      ? { ...player.stats, isLive: isPlayerLive }
+      : (isPlayerLive ? { isLive: true } : null);
+
+    return {
+      ...player,
+      stats: nextStats,
+    };
+  }
+
+  function buildHistoryRoster(uid, type) {
+    if (!activeHistory) return null;
+
+    const perPlayer = activeBreakdownByUserId?.[uid]?.perPlayer || {};
+
+    const explicit =
+      type === "starters"
+        ? activeHistory?.startersByUserId?.[uid]
+        : activeHistory?.benchByUserId?.[uid];
+
+    if (Array.isArray(explicit) && explicit.length) {
+      const normalized = explicit
+        .map((p) => {
+          const pid = String(p?.id || p?.playerId || p?.pid || "");
+          const entry = perPlayer[pid] || null;
+          return {
+            id: pid,
+            name: entry?.name || p?.name || p?.playerName || "Unknown",
+            position: entry?.position || p?.position || p?.pos || "MID",
+            points: Number(entry?.points || 0),
+            counted: entry?.counted ?? (type === "starters"),
+            stats: entry?.stats || null,
+            breakdown: entry?.breakdown || null,
+            teamName: entry?.teamName || p?.teamName || "",
+            opponentName: entry?.opponentName || p?.opponentName || "",
+            country: entry?.country || p?.country || p?.nationality || p?.playerCountry || "",
+            clubName: entry?.clubName || p?.clubName || p?.club || p?.teamName || entry?.teamName || "",
+          };
+        })
+        .filter((p) => p.id);
+
+      if (normalized.length) {
+        return normalized.map((player) =>
+          withDerivedLiveState(withDerivedScoring(player), uid, player.id)
+        );
+      }
+    }
+
+    const derived = Object.values(perPlayer)
+      .filter((entry) => Boolean(entry) && Boolean(entry.id))
+      .filter((entry) => (type === "starters" ? entry.counted !== false : entry.counted === false))
+      .map((entry) => ({
+        id: String(entry.id),
+        name: entry.name || "Unknown",
+        position: entry.position || "MID",
+        points: Number(entry.points || 0),
+        counted: entry.counted !== false,
+        stats: entry.stats || null,
+        breakdown: entry.breakdown || null,
+        teamName: entry.teamName || "",
+        opponentName: entry.opponentName || "",
+        country: entry.country || "",
+        clubName: entry.clubName || entry.teamName || "",
+      }));
+
+    return derived.length
+      ? derived.map((player) =>
+          withDerivedLiveState(withDerivedScoring(player), uid, player.id)
+        )
+      : null;
+  }
+
 
   function getResolvedRoster(uid, type) {
+    const historyRoster = buildHistoryRoster(uid, type);
+    if (historyRoster) return historyRoster;
+
     const lineup = lineups[uid] || {};
     let ids = getLineupIds(lineup, type);
+      ids = ids
+    .map((rawId) => {
+      const row = picksMap[String(rawId)] || null;
+      return String(row?._resolvedPlayerId || rawId);
+    })
+    .filter(Boolean);
+
+    // prevent duplicates after remapping
+    ids = Array.from(new Set(ids));
 
     const cupUserBreakdown = activeBreakdownByUserId?.[uid] || {};
     const perPlayer = cupUserBreakdown?.perPlayer || {};
@@ -610,61 +1204,84 @@ export default function CupTournamentPage() {
       const pick = picksMap[pid] || {};
       const rosterMeta =
         (rosterByUid[uid] || []).find((p) => String(p.id) === String(pid)) || {};
-      const live = perPlayer[pid] || {};
 
-      return {
+      const entry = perPlayer[pid] || null;
+      const fixtureFallback = latestFixtureEntryByPlayerId[String(pid)] || null;
+
+      const entryPoints = Number(entry?.points ?? NaN);
+      const entryHasStats = !!(entry?.stats && Object.keys(entry.stats).length > 0);
+      const entryHasBreakdown = !!(entry?.breakdown && Object.keys(entry.breakdown).length > 0);
+      const entryHasContent =
+        entryHasStats ||
+        entryHasBreakdown ||
+        (Number.isFinite(entryPoints) && entryPoints !== 0);
+
+      return withDerivedLiveState(withDerivedScoring({
         id: pid,
         name:
-          live.name ||
+          entry?.name ||
+          fixtureFallback?.name ||
           pick.playerName ||
           pick.name ||
           rosterMeta.name ||
           "Unknown",
         position:
-          live.position ||
+          entry?.position ||
+          fixtureFallback?.position ||
           pick.position ||
           pick.pos ||
           rosterMeta.position ||
           "MID",
-        points: Number(live.points ?? pick.lastDelta ?? 0),
-        counted: live.counted ?? (pick.lastCounted !== false),
-        stats: live.stats || pick.lastStats || pick.stats || null,
-        breakdown: live.breakdown || pick.lastBreakdown || pick.breakdown || null,
+        points:
+          entryHasContent
+            ? entryPoints
+            : Number(fixtureFallback?.points ?? pick.lastDelta ?? 0),
+        counted: entry?.counted ?? fixtureFallback?.counted ?? (pick.lastCounted !== false),
+        stats:
+          entryHasStats
+            ? entry.stats
+            : (fixtureFallback?.stats || pick.lastStats || pick.stats || null),
+        breakdown:
+          entryHasBreakdown
+            ? entry.breakdown
+            : (fixtureFallback?.breakdown || pick.lastBreakdown || pick.breakdown || null),
         teamName:
-          live.teamName ||
+          entry?.teamName ||
+          fixtureFallback?.teamName ||
           pick.lastRealTeamName ||
           pick.teamName ||
           rosterMeta.teamName ||
           "",
         opponentName:
-          live.opponentName ||
+          entry?.opponentName ||
+          fixtureFallback?.opponentName ||
           pick.lastOpponentName ||
           pick.opponentName ||
           "",
         country:
-          live.country ||
+          fixtureFallback?.country ||
           pick.country ||
           pick.nationality ||
           pick.playerCountry ||
           rosterMeta.country ||
           "",
         clubName:
-          live.clubName ||
+          fixtureFallback?.clubName ||
           pick.clubName ||
           pick.club ||
           pick.teamName ||
           pick.team?.name ||
           rosterMeta.clubName ||
-          live.teamName ||
+          entry?.teamName ||
           "",
-      };
+      }), uid, pid);
     });
   }
 
   const myStarters = sortPlayersForDisplay(getResolvedRoster(myUid, 'starters'));
   const myBench = sortPlayersForDisplay(getResolvedRoster(myUid, 'bench'));
-  const myRoundTotal = Number(activeBreakdownByUserId?.[myUid]?.total || 0);
-  const myBenchTotal = Number(activeBreakdownByUserId?.[myUid]?.benchTotal || 0);
+  const myRoundTotal = sumDisplayedPoints(myStarters);
+  const myBenchTotal = sumDisplayedPoints(myBench);
   const otherUsers = users.filter(u => u.userId !== myUid);
 
   async function copyRoomCode() {
@@ -701,25 +1318,11 @@ export default function CupTournamentPage() {
 
     const nextGameLabel = roomNextLabel || currentWindowLabel || "—";
 
-  const parsedWindow = parseCupWindowId(cupDoc?.currentWindowId);
-
   const nextLabel =
     cupDoc?.currentWindowLabel ||
     data?.room?.competitionState?.currentLabel ||
     data?.room?.["competitionState.currentLabel"] ||
     "—";
-
-  const winStartMs =
-    cupDoc?.currentWindowStartAtMs ??
-    cupDoc?.startAtMs ??
-    parsedWindow?.startAtMs ??
-    null;
-
-  const winEndMs =
-    cupDoc?.currentWindowEndAtMs ??
-    cupDoc?.endAtMs ??
-    parsedWindow?.endAtMs ??
-    null;
 
   const winText =
     winStartMs && winEndMs ? `${fmtDT(winStartMs)} → ${fmtDT(winEndMs)}` : "—";
@@ -858,6 +1461,11 @@ export default function CupTournamentPage() {
           {!showFinalPodium && (
             <div className="tpCard tpFull">
               <h3 className="tpCardTitle">Your Roster</h3>
+              {isAutoShowingLatestHistory && (
+                <p className="tpText" style={{ marginTop: -4, marginBottom: 14, opacity: 0.8 }}>
+                  Showing the last completed Cup round until one hour before the next kickoff. The leaderboard above remains your cumulative Cup total.
+                </p>
+              )}
               <div className="tpLineups tpLineupsSingle">
                 <div className="tpSide tpSideMe tpSideSolo">
                   <div className="tpLineupHead">
@@ -964,8 +1572,8 @@ export default function CupTournamentPage() {
                     const oppStarters = sortPlayersForDisplay(getResolvedRoster(u.userId, 'starters'));
                     const oppBench = sortPlayersForDisplay(getResolvedRoster(u.userId, 'bench'));
 
-                    const oppRoundTotal = Number(activeBreakdownByUserId?.[u.userId]?.total || 0);
-                    const oppBenchTotal = Number(activeBreakdownByUserId?.[u.userId]?.benchTotal || 0);
+                    const oppRoundTotal = sumDisplayedPoints(oppStarters);
+                    const oppBenchTotal = sumDisplayedPoints(oppBench);
 
                     return (
                       <div key={u.userId} className={`tpOtherMatchupItem ${isOpen ? "open" : ""}`}>
@@ -1087,19 +1695,30 @@ export default function CupTournamentPage() {
                   className="tpHistorySelect"
                   value={selectedHistoryId}
                   onChange={(e) => setSelectedHistoryId(e.target.value)}
-                  disabled={historyRounds.length === 0}
+                  disabled={displayHistoryRounds.length === 0}
                 >
                   <option value="">
-                    {historyRounds.length === 0 ? "No completed rounds yet" : "Select a previous round…"}
+                    {displayHistoryRounds.length === 0 ? "No completed rounds yet" : "Select a previous round…"}
                   </option>
 
-                  {historyRounds.map((h) => (
+                  {displayHistoryRounds.map((h) => (
                     <option key={h.id} value={h.id}>
                       {h.label || "Cup"}
-                      {h.startAtMs && h.endAtMs ? ` — ${fmtDT(h.startAtMs)} → ${fmtDT(h.endAtMs)}` : ""}
+                      {h.startAtMs ? ` • ${fmtDT(h.startAtMs)}` : ""}
                     </option>
                   ))}
                 </select>
+                
+                {/* ✅ ADDED: The Clear Button */}
+                {selectedHistoryId && selectedHistoryId !== "" && (
+                  <button 
+                    type="button" 
+                    className="tpMiniBtn" 
+                    onClick={() => setSelectedHistoryId("")}
+                  >
+                    Clear
+                  </button>
+                )}
               </div>
             </div>
 
@@ -1107,33 +1726,57 @@ export default function CupTournamentPage() {
               <p className="tpText">Pick a previous round to view final scores.</p>
             ) : (
               <>
-                <p className="tpText tpHistoryMeta">
-                  Window: <b>{selectedHistoryRange}</b>
-                  {selectedHistoryLabel ? (
-                    <>
-                      {" "}• Round: <b>{selectedHistoryLabel}</b>
-                    </>
-                  ) : null}
-                </p>
+                <div className="tpHistoryMetaGrid">
+                  <div className="tpHistoryMetaCard">
+                    <span className="tpHistoryMetaLabel">Window</span>
+                    <span className="tpHistoryMetaValue">{selectedHistoryRange}</span>
+                  </div>
+
+                  <div className="tpHistoryMetaCard">
+                    <span className="tpHistoryMetaLabel">Round</span>
+                    <span className="tpHistoryMetaValue">{selectedHistoryLabel}</span>
+                  </div>
+
+                  <div className="tpHistoryMetaCard">
+                    <span className="tpHistoryMetaLabel">Winner</span>
+                    <span className="tpHistoryMetaValue">
+                      {selectedHistoryRows[0]?.name || "—"}
+                    </span>
+                  </div>
+                </div>
 
                 {selectedHistoryRows.length > 0 ? (
                   <div className="tpHistoryTableWrap">
                     <table className="tpHistoryTable">
                       <thead>
                         <tr>
-                          <th>#</th>
+                          <th>Rank</th>
                           <th>Manager</th>
-                          <th>This Round</th>
-                          <th>Total After</th>
+                          <th>Round Pts</th>
+                          <th>Cup Total</th>
                         </tr>
                       </thead>
                       <tbody>
                         {selectedHistoryRows.map((row) => (
                           <tr key={row.userId || row.uid}>
-                            <td>{row.rank}</td>
-                            <td>{row.name || "Unknown"}</td>
-                            <td>{Number(row.roundPoints || 0)}</td>
-                            <td>{Number(row.totalAfter || 0)}</td>
+                            <td>
+                              <span className="tpHistoryRankBadge">#{row.rank}</span>
+                            </td>
+                            <td>
+                              <div className="tpHistoryManagerCell">
+                                <span className="tpHistoryManagerName">{row.name || "Unknown"}</span>
+                              </div>
+                            </td>
+                            <td>
+                              <span className="tpHistoryPointsPill">
+                                {Number(row.roundPoints || 0)} pts
+                              </span>
+                            </td>
+                            <td>
+                              <span className="tpHistoryTotalValue">
+                                {Number(row.totalAfter || 0)} pts
+                              </span>
+                            </td>
                           </tr>
                         ))}
                       </tbody>

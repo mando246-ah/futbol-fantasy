@@ -262,12 +262,21 @@ function isHost(room, uid) {
 
 //Tournament 
 function toPos(pos) {
-  const p = String(pos || "").toUpperCase();
+  const p = String(pos || "").toUpperCase().trim();
+
+  // Goalkeepers
   if (p.includes("GOALKEEP") || p === "GK" || p === "GKP") return "GK";
-  if (p.includes("DEFEND") || p.includes("BACK") || p === "DEF") return "DEF";
-  if (p.includes("MID") || p === "MID") return "MID";
-  if (p.includes("ATTACK") || p.includes("FORW") || p.includes("STRIK") || p === "FWD") return "FWD";
-  if (p === "ATT") return "FWD";
+
+  // Defenders
+  if (p.includes("DEFEND") || p.includes("BACK") || ["DEF", "CB", "LB", "RB", "LWB", "RWB"].includes(p)) return "DEF";
+
+  // Attackers / Forwards / Strikers
+  if (p.includes("ATTACK") || p.includes("FORW") || p.includes("STRIK") || ["FWD", "ATT", "ST", "CF", "LW", "RW", "WING"].includes(p)) return "FWD";
+
+  // Midfielders
+  if (p.includes("MID") || ["MID", "CM", "CDM", "CAM", "LM", "RM", "AM", "DM"].includes(p)) return "MID";
+
+  // Ultimate Fallback
   return "MID";
 }
 
@@ -2971,23 +2980,10 @@ exports.debugForceRunCup = onCall(
 
     await db.doc(`rooms/${roomId}/cup/current`).set(
       {
-        status: "scheduled",
-        completed: false,
         updatedAtMs: nowMs,
         lastManualDebugAtMs: nowMs,
         lastError: FieldValue.delete(),
         lastErrorAtMs: FieldValue.delete(),
-
-        // clear stale active window so engine re-arms the real next round
-        currentWindowId: FieldValue.delete(),
-        currentWindowLabel: FieldValue.delete(),
-        currentWindowStartAtMs: FieldValue.delete(),
-        currentWindowEndAtMs: FieldValue.delete(),
-        currentWindowFixtureIds: [],
-        windowPointsByUid: {},
-        creditedFixtures: {},
-        livePointsByUid: {},
-        breakdownByUserId: {},
       },
       { merge: true }
     );
@@ -3212,7 +3208,7 @@ await weekRef.set(
 );
 
 exports.pollLiveTournamentWeeks = onSchedule(
-  { schedule: "*/3 * * * *", timeZone: "America/Los_Angeles", region: "us-west2", secrets: [APIFOOTBALL_KEY] },
+  { schedule: "*/1 * * * *", timeZone: "America/Los_Angeles", region: "us-west2", secrets: [APIFOOTBALL_KEY] },
   async () => {
     const apiKey = APIFOOTBALL_KEY.value();
     const nowMs = Date.now();
