@@ -90,7 +90,7 @@ function Nav({ user, displayName, photoURL }) {
             alt="Fútbol Fantasy"
             className="h-12 w-16 object-contain shrink-0"
           />
-          <span>Fútbol Fantasy</span>
+          <span>Fútbol Fantasy - <i>BETA</i></span>
         </Link>
         {/* Desktop nav */}
         <nav className="hidden md:flex items-center gap-4 text-sm">

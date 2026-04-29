@@ -418,13 +418,22 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
     <div className="tpStatsCard">
       {showMatchHeader && (
         <div className="tpCardHeader">
-          <span className="tpCardTeam">{teamName || "Unknown Team"}</span>
+          <div className="tpMatchHeaderTeam tpMatchHeaderTeamTop">
+            <span className="tpMatchHeaderName">{teamName || "Unknown Team"}</span>
+            {hasScore && <span className="tpMatchHeaderScore">{tScore}</span>}
+          </div>
+
           {opponentName && (
-            <span className="tpCardVs">
-              {/* ✅ 3. If we have the score, display " 2 - 1 ", otherwise fallback to " vs " */}
-              {hasScore ? ` ${tScore} - ${oScore} ` : " vs "}
-              {opponentName}
-            </span>
+            <>
+              <div className="tpMatchHeaderDivider">
+                {hasScore ? "FINAL SCORE" : "VS"}
+              </div>
+
+              <div className="tpMatchHeaderTeam">
+                <span className="tpMatchHeaderName">{opponentName}</span>
+                {hasScore && <span className="tpMatchHeaderScore">{oScore}</span>}
+              </div>
+            </>
           )}
         </div>
       )}

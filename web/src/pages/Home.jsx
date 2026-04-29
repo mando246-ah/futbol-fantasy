@@ -2,7 +2,7 @@ import React from "react";
 import { useNavigate } from "react-router-dom";
 import HyperSpeed from "../components/backgrounds/HyperSpeed"; // adjust path if needed
 import "./Home.css";
-import logo from "../assets/logo.png";
+import logo from "../assets/logov2.png";
 
 export default function Home() {
   const navigate = useNavigate();

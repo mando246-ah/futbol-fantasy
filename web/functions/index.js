@@ -9,6 +9,17 @@ const { FieldValue } = admin.firestore;
 const { scorePlayer, scoreTeam, SCORING } = require("./shared/scoringCore");
 const { runCupEngine } = require("./cup/cupEngine");
 const { detectPhaseFromRoundLabel } = require("./shared/phaseDetect");
+const { deriveSeasonContext } = require("./shared/seasonMeta");
+const {
+  bootstrapSeasonPlayerPool,
+  loadSeasonPlayerPool,
+  replacePlayersInRoom,
+} = require("./shared/seasonPlayerPool");
+const {
+  estimateDocBytes,
+  writeSeasonFixtureSummary,
+  writeSeasonLiveFixture,
+} = require("./shared/seasonLiveFixtures");
 
 //Serve Resolve Market Helpers
 async function loadStandingsByUid(roomRef) {
@@ -332,6 +343,54 @@ exports.seedPlayersFromCompetition = onCall(
     if (room.hostUid !== uid) throw new HttpsError("permission-denied", "Host only.");
 
     const apiKey = APIFOOTBALL_KEY.value();
+    const competition = {
+      provider: "api-football",
+      league,
+      season,
+      timezone,
+    };
+    let window = null;
+    try {
+      window = await fetchNextRoundWindow(competition, { fallbackDate: fixtureDate });
+    } catch (e) {
+      console.warn(`[seedPlayersFromCompetition] fetchNextRoundWindow failed`, e);
+    }
+
+    const roundLabel = window?.roundLabel || null;
+    const phaseLabel = detectPhaseFromRoundLabel(roundLabel);
+    const normalizedSeasonContext = deriveSeasonContext({
+      roomSeasonKey: room?.seasonKey,
+      roomCompetitionKey: room?.competitionKey,
+      roomCompetitionType: room?.competitionType,
+      roomCompetitionName:
+        room?.competitionMeta?.name ||
+        room?.competition?.name ||
+        request.data?.competitionName ||
+        null,
+      season,
+      league,
+      phaseLabel,
+      seasonKey: request.data?.seasonKey,
+      competitionKey: request.data?.competitionKey,
+      competitionType: request.data?.competitionType,
+      seasonLabel: request.data?.seasonLabel,
+    });
+    const seasonKey = normalizedSeasonContext.seasonKey || "";
+    const roomSeasonFieldUpdates = {};
+
+    // Phase 1 global season foundation:
+    // These fields are additive room metadata only. Existing room-scoped
+    // competition, scoring, polling, and Cup/Regular Season flows continue
+    // to read room.competition and room.competitionState as before.
+    if (normalizedSeasonContext.seasonKey) {
+      roomSeasonFieldUpdates.seasonKey = normalizedSeasonContext.seasonKey;
+    }
+    if (normalizedSeasonContext.competitionKey) {
+      roomSeasonFieldUpdates.competitionKey = normalizedSeasonContext.competitionKey;
+    }
+    if (normalizedSeasonContext.competitionType) {
+      roomSeasonFieldUpdates.competitionType = normalizedSeasonContext.competitionType;
+    }
 
     // If fixtureDate is provided, fetch the fixtures for that day and build the allowed team set.
     // We'll then pull players by TEAM to avoid missing Wednesday teams due to league pagination limits.
@@ -362,19 +421,30 @@ exports.seedPlayersFromCompetition = onCall(
 
     let written = 0;
     let pagesFetched = 0;
+    let usedGlobalSeasonPlayers = false;
+    const fetchedPlayerDocs = [];
 
-    // Firestore batch limit is 500 ops; stay under it comfortably
-    let batch = db.batch();
-    let ops = 0;
+    function filterPlayersForFixtureDate(players = []) {
+      if (!fixtureDate) return players;
 
-    function commitIfNeeded(force = false) {
-      if (ops >= 450 || force) {
-        const b = batch;
-        batch = db.batch();
-        ops = 0;
-        return b.commit();
+      return (players || []).filter((player) => {
+        const teamIdStr = player?.teamId ? String(player.teamId) : "";
+        return !teamIdStr || teamMeta.has(teamIdStr);
+      });
+    }
+
+    if (seasonKey) {
+      const seasonPlayers = await loadSeasonPlayerPool({ db, seasonKey });
+      const roomSourcePlayers = filterPlayersForFixtureDate(seasonPlayers);
+
+      if (seasonPlayers.length > 0 && (!fixtureDate || roomSourcePlayers.length > 0)) {
+        written = await replacePlayersInRoom({
+          db,
+          roomId,
+          players: roomSourcePlayers,
+        });
+        usedGlobalSeasonPlayers = true;
       }
-      return Promise.resolve();
     }
 
     const seen = new Set();
@@ -417,34 +487,26 @@ exports.seedPlayersFromCompetition = onCall(
 
       const full = `${p?.firstname || ""} ${p?.lastname || ""}`.trim();
       const displayName = full || p?.name || "Unknown";
+      const playerDoc = {
+        id: pid,
+        name: displayName,
+        position,
+        teamId: teamIdStr,
+        teamName,
+        teamLogo,
+        nationality: p?.nationality || "",
 
-      const docRef = db.doc(`rooms/${roomId}/players/${pid}`);
-      batch.set(
-        docRef,
-        {
-          id: pid,
-          name: displayName,
-          position,
-          teamId: teamIdStr,
-          teamName,
-          teamLogo,
-          nationality: p?.nationality || "",
+        provider: "api-football",
+        league: String(league),
+        season: String(season),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      };
 
-          provider: "api-football",
-          league: String(league),
-          season: String(season),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      );
-
-      ops += 1;
+      fetchedPlayerDocs.push(playerDoc);
       written += 1;
-
-      if (ops >= 450) await commitIfNeeded(true);
     }
 
-    if (!fixtureDate) {
+    if (!usedGlobalSeasonPlayers && !fixtureDate) {
       // --- Original mode: pull players by league/season (paged) ---
       let page = 1;
       let totalPages = 1;
@@ -462,7 +524,7 @@ exports.seedPlayersFromCompetition = onCall(
 
         page += 1;
       }
-    } else {
+    } else if (!usedGlobalSeasonPlayers) {
       // --- Fixture-date mode: pull players only for the clubs playing that day ---
       for (const teamIdStr of teamMeta.keys()) {
         let page = 1;
@@ -485,26 +547,24 @@ exports.seedPlayersFromCompetition = onCall(
       }
     }
 
-    await commitIfNeeded(true);
-
-    // Store competition choice + seeding filter on room
-    const competition = {
-      provider: "api-football",
-      league,
-      season,
-      timezone,
-    };
-
-    // Ask API: what round are we in?
-    let window = null;
-    try {
-      window = await fetchNextRoundWindow(competition, { fallbackDate: fixtureDate });
-    } catch (e) {
-      console.warn(`[seedPlayersFromCompetition] fetchNextRoundWindow failed`, e);
+    if (!usedGlobalSeasonPlayers && fetchedPlayerDocs.length > 0) {
+      written = await replacePlayersInRoom({
+        db,
+        roomId,
+        players: fetchedPlayerDocs,
+      });
     }
 
-    const roundLabel = window?.roundLabel || null;
-    const phaseLabel = detectPhaseFromRoundLabel(roundLabel);
+    // Only bootstrap the global season pool from a full season seed.
+    // Fixture-date seeding remains room-local fallback so we never create
+    // an incomplete master season pool from a slate-specific request.
+    if (!usedGlobalSeasonPlayers && seasonKey && !fixtureDate && fetchedPlayerDocs.length > 0) {
+      await bootstrapSeasonPlayerPool({
+        db,
+        seasonKey,
+        players: fetchedPlayerDocs,
+      });
+    }
 
     // Only RegularSeason needs competitionMeta.totalRounds
     if (phaseLabel === "RegularSeason") {
@@ -516,6 +576,7 @@ exports.seedPlayersFromCompetition = onCall(
         competition,
         seedFilter: fixtureDate ? { fixtureDate } : admin.firestore.FieldValue.delete(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        ...roomSeasonFieldUpdates,
 
         competitionState: {
           phaseLabel: phaseLabel,
@@ -1788,6 +1849,7 @@ function buildPlayerStatsMapFromFixturePlayersResponse(responseArr, fixtureMeta)
       const ownGoals = 0; 
 
       out[String(pid)] = { 
+        teamId: teamId ? String(teamId) : "",
         teamName,
         opponentName,
         minutes, 
@@ -1959,17 +2021,47 @@ async function getFixtureStatusMap({ fixtureIds, timezone, apiKey }) {
       const short = f?.fixture?.status?.short ?? null;
       if (!fixtureId || !short) continue;
 
+      const kickoffMs = f?.fixture?.timestamp
+        ? Number(f.fixture.timestamp) * 1000
+        : Date.parse(f?.fixture?.date);
       const homeTeamId = f?.teams?.home?.id ?? null;
+      const homeTeamName = f?.teams?.home?.name || "";
+      const homeTeamLogo = f?.teams?.home?.logo || "";
       const awayTeamId = f?.teams?.away?.id ?? null;
+      const awayTeamName = f?.teams?.away?.name || "";
+      const awayTeamLogo = f?.teams?.away?.logo || "";
       const goalsHome = toNum(f?.goals?.home);
       const goalsAway = toNum(f?.goals?.away);
+      const statusLong = f?.fixture?.status?.long ?? null;
+      const elapsed = toNum(f?.fixture?.status?.elapsed);
+      const leagueId = f?.league?.id ?? null;
+      const leagueName = f?.league?.name || "";
+      const leagueRound = f?.league?.round || null;
 
       out[fixtureId] = short;
 
       const ref = db.doc(`apiCache/fixtureStatus_${fixtureId}`);
       writes.push(
         ref.set(
-          { short, updatedAtMs: now, homeTeamId, awayTeamId, goalsHome, goalsAway },
+          {
+            fixtureId,
+            short,
+            statusLong,
+            elapsed,
+            kickoffMs: Number.isFinite(kickoffMs) ? kickoffMs : null,
+            updatedAtMs: now,
+            homeTeamId,
+            homeTeamName,
+            homeTeamLogo,
+            awayTeamId,
+            awayTeamName,
+            awayTeamLogo,
+            goalsHome,
+            goalsAway,
+            leagueId,
+            leagueName,
+            leagueRound,
+          },
           { merge: true }
         )
       );
@@ -1989,6 +2081,299 @@ function isInPlay(short) {
 }
 function isFinished(short) {
   return ["FT", "AET", "PEN"].includes(short);
+}
+
+function hasFixtureStarted(short) {
+  const s = String(short || "").trim().toUpperCase();
+  if (!s) return false;
+  if (["NS", "TBD", "PST", "CANC"].includes(s)) return false;
+  return true;
+}
+
+function getRoomPhaseLabel(room) {
+  return (
+    room?.competitionState?.phaseLabel ??
+    room?.["competitionState.phaseLabel"] ??
+    room?.competitionState?.phaseLable ??
+    room?.["competitionState.phaseLable"] ??
+    null
+  );
+}
+
+function extractFixtureIdsFromWeekDoc(week) {
+  const ids = new Set();
+
+  for (const id of Array.isArray(week?.fixtureIds) ? week.fixtureIds : []) {
+    const str = String(id || "").trim();
+    if (str) ids.add(str);
+  }
+
+  for (const fixture of Array.isArray(week?.fixtures) ? week.fixtures : []) {
+    const str = String(fixture?.id || fixture?.fixture?.id || "").trim();
+    if (str) ids.add(str);
+  }
+
+  return Array.from(ids);
+}
+
+async function loadFixtureStatusDetailsMap(fixtureIds = []) {
+  const ids = [...new Set((fixtureIds || []).map((id) => String(id || "").trim()).filter(Boolean))];
+  if (!ids.length) return {};
+
+  const refs = ids.map((id) => db.doc(`apiCache/fixtureStatus_${id}`));
+  const snaps = await db.getAll(...refs);
+  const out = {};
+
+  for (let i = 0; i < snaps.length; i += 1) {
+    const snap = snaps[i];
+    if (!snap.exists) continue;
+    out[ids[i]] = snap.data() || {};
+  }
+
+  return out;
+}
+
+async function collectActiveSeasonFixtureTargets() {
+  const roomsSnap = await db.collection("rooms")
+    .where("competitionState.weekStatus", "in", ["scheduled", "live", "resolving"])
+    .get();
+
+  const roomTargets = await Promise.all(
+    roomsSnap.docs.map(async (roomDoc) => {
+      const roomId = roomDoc.id;
+      const room = roomDoc.data() || {};
+      const competition = room?.competition || {};
+
+      if (competition?.provider && competition.provider !== "api-football") {
+        return null;
+      }
+
+      const league = Number(competition?.league);
+      const season = Number(competition?.season);
+      if (!Number.isFinite(league) || !Number.isFinite(season)) {
+        return null;
+      }
+
+      const phaseLabel = getRoomPhaseLabel(room);
+      const seasonContext = deriveSeasonContext({
+        roomSeasonKey: room?.seasonKey,
+        roomCompetitionKey: room?.competitionKey,
+        roomCompetitionType: room?.competitionType,
+        roomCompetitionName:
+          room?.competitionMeta?.name ||
+          room?.competition?.name ||
+          null,
+        league,
+        season,
+        phaseLabel,
+      });
+
+      if (!seasonContext?.seasonKey) {
+        return null;
+      }
+
+      let fixtureIds = [];
+
+      if (phaseLabel === "Cup") {
+        const cupSnap = await db.doc(`rooms/${roomId}/cup/current`).get();
+        const cup = cupSnap.exists ? (cupSnap.data() || {}) : {};
+        fixtureIds = Array.isArray(cup?.currentWindowFixtureIds)
+          ? cup.currentWindowFixtureIds.map(String).filter(Boolean)
+          : [];
+      } else {
+        const weekIndex = Number(room?.currentWeekIndex);
+        if (!Number.isFinite(weekIndex)) {
+          return null;
+        }
+
+        const weekSnap = await db.doc(`rooms/${roomId}/weeks/${String(weekIndex)}`).get();
+        if (!weekSnap.exists) {
+          return null;
+        }
+
+        fixtureIds = extractFixtureIdsFromWeekDoc(weekSnap.data() || {});
+      }
+
+      if (!fixtureIds.length) {
+        return null;
+      }
+
+      return {
+        roomId,
+        seasonKey: seasonContext.seasonKey,
+        competitionKey: seasonContext.competitionKey || "",
+        competitionType: seasonContext.competitionType || "",
+        league,
+        season,
+        timezone: String(competition?.timezone || "America/Los_Angeles"),
+        fixtureIds,
+      };
+    })
+  );
+
+  const grouped = new Map();
+
+  for (const target of roomTargets) {
+    if (!target) continue;
+
+    const existing = grouped.get(target.seasonKey) || {
+      seasonKey: target.seasonKey,
+      competitionKey: target.competitionKey,
+      competitionType: target.competitionType,
+      league: target.league,
+      season: target.season,
+      timezone: target.timezone,
+      fixtureIds: new Set(),
+      roomIds: new Set(),
+    };
+
+    for (const fixtureId of target.fixtureIds) {
+      existing.fixtureIds.add(String(fixtureId));
+    }
+    existing.roomIds.add(String(target.roomId));
+    grouped.set(target.seasonKey, existing);
+  }
+
+  return Array.from(grouped.values()).map((entry) => ({
+    ...entry,
+    fixtureIds: Array.from(entry.fixtureIds),
+    roomIds: Array.from(entry.roomIds),
+  }));
+}
+
+function buildGlobalFantasyByPlayerId(rawStatsByPlayerId = {}) {
+  const fantasyByPlayerId = {};
+
+  for (const [playerId, stats] of Object.entries(rawStatsByPlayerId || {})) {
+    const position = toPos(stats?.position || stats?.pos || stats?.role);
+    const playerObj = {
+      id: String(playerId),
+      name: stats?.name || "Unknown",
+      position,
+    };
+
+    const scored = scorePlayer(playerObj, stats || {}, toPos);
+
+    fantasyByPlayerId[String(playerId)] = {
+      points: Number(scored?.points ?? scored?.total ?? 0),
+      breakdown: scored?.breakdown || scored?.parts || {},
+      stats: stats || {},
+      position,
+      teamName: stats?.teamName || stats?.realTeamName || "",
+      opponentName: stats?.opponentName || "",
+    };
+  }
+
+  return fantasyByPlayerId;
+}
+
+async function pollGlobalSeasonLiveFixturesOnce({ seasonTarget, apiKey, nowMs }) {
+  const fixtureIds = [...new Set((seasonTarget?.fixtureIds || []).map(String).filter(Boolean))];
+  if (!fixtureIds.length) {
+    return { fixtureCount: 0, payloadCount: 0 };
+  }
+
+  const seasonKey = String(seasonTarget?.seasonKey || "").trim();
+  if (!seasonKey) {
+    return { fixtureCount: 0, payloadCount: 0 };
+  }
+
+  const timezone = String(seasonTarget?.timezone || "America/Los_Angeles");
+  const statusByFixtureId = await getFixtureStatusMap({ fixtureIds, timezone, apiKey });
+  const detailsByFixtureId = await loadFixtureStatusDetailsMap(fixtureIds);
+
+  let payloadCount = 0;
+
+  for (const fixtureId of fixtureIds) {
+    const detail = detailsByFixtureId[fixtureId] || {};
+    const short = statusByFixtureId[fixtureId] || detail?.short || null;
+    const shouldFetchPlayers = hasFixtureStarted(short);
+
+    let rawStatsByPlayerId = {};
+    let fantasyByPlayerId = {};
+    let payloadBytesEstimate = 0;
+
+    if (shouldFetchPlayers) {
+      const ttlMs = isInPlay(short) ? 60 * 1000 : 60 * 60 * 1000;
+      rawStatsByPlayerId = await getFixturePlayersStatsMapCached({
+        fixtureId,
+        apiKey,
+        ttlMs,
+        timeZone: timezone,
+      });
+      fantasyByPlayerId = buildGlobalFantasyByPlayerId(rawStatsByPlayerId);
+
+      const payloadDoc = {
+        fixtureId: String(fixtureId),
+        seasonKey,
+        updatedAtMs: nowMs,
+        computedAt: admin.firestore.FieldValue.serverTimestamp(),
+        rawStatsByPlayerId,
+        fantasyByPlayerId,
+      };
+
+      payloadBytesEstimate = estimateDocBytes(payloadDoc);
+      if (payloadBytesEstimate >= 900000) {
+        console.warn(
+          `[pollGlobalSeasonLiveFixturesOnce] Large payload estimate ${payloadBytesEstimate} bytes for ${seasonKey}/${fixtureId}`
+        );
+      }
+
+      await writeSeasonLiveFixture({
+        db,
+        seasonKey,
+        fixtureId,
+        payload: {
+          ...payloadDoc,
+          payloadBytesEstimate,
+        },
+      });
+      payloadCount += 1;
+    }
+
+    await writeSeasonFixtureSummary({
+      db,
+      seasonKey,
+      fixtureId,
+      summary: {
+        fixtureId: String(fixtureId),
+        seasonKey,
+        competitionKey: seasonTarget?.competitionKey || "",
+        competitionType: seasonTarget?.competitionType || "",
+        league: String(seasonTarget?.league || ""),
+        season: String(seasonTarget?.season || ""),
+        timezone,
+        updatedAtMs: nowMs,
+        computedAt: admin.firestore.FieldValue.serverTimestamp(),
+        kickoffMs: Number.isFinite(Number(detail?.kickoffMs)) ? Number(detail.kickoffMs) : null,
+        statusShort: short,
+        statusLong: detail?.statusLong || null,
+        elapsed: Number.isFinite(Number(detail?.elapsed)) ? Number(detail.elapsed) : null,
+        isLive: isInPlay(short),
+        isFinished: isFinished(short),
+        hasStarted: hasFixtureStarted(short),
+        homeTeamId: detail?.homeTeamId ?? null,
+        homeTeamName: detail?.homeTeamName || "",
+        homeTeamLogo: detail?.homeTeamLogo || "",
+        awayTeamId: detail?.awayTeamId ?? null,
+        awayTeamName: detail?.awayTeamName || "",
+        awayTeamLogo: detail?.awayTeamLogo || "",
+        goalsHome: toNum(detail?.goalsHome),
+        goalsAway: toNum(detail?.goalsAway),
+        roundLabel: detail?.leagueRound || null,
+        leagueName: detail?.leagueName || "",
+        rawStatsPlayerCount: Object.keys(rawStatsByPlayerId || {}).length,
+        fantasyPlayerCount: Object.keys(fantasyByPlayerId || {}).length,
+        payloadBytesEstimate,
+        sourceRoomCount: Array.isArray(seasonTarget?.roomIds) ? seasonTarget.roomIds.length : 0,
+      },
+    });
+  }
+
+  return {
+    fixtureCount: fixtureIds.length,
+    payloadCount,
+  };
 }
 
 // ---------------- Live Week Compute (API stats) ----------------
@@ -2711,7 +3096,7 @@ async function ensureCurrentWeekIfMissing({ roomId, room, apiKey }) {
   return weekIndex;
 }
 
-async function fetchAggregatedStats(fixtureIds, apiKey) {
+async function fetchAggregatedStats(fixtureIds, apiKey, timezone = "America/Los_Angeles") {
   const aggStatsByPlayerId = {};
   const fixtureStatusById = {};
   let nextKickoffMs = null;
@@ -2980,10 +3365,24 @@ exports.debugForceRunCup = onCall(
 
     await db.doc(`rooms/${roomId}/cup/current`).set(
       {
+        status: "scheduled",
+        completed: false,
         updatedAtMs: nowMs,
         lastManualDebugAtMs: nowMs,
         lastError: FieldValue.delete(),
         lastErrorAtMs: FieldValue.delete(),
+
+        // Force the engine to re-arm the current Cup window
+        currentWindowId: null,
+        currentWindowLabel: null,
+        currentWindowFixtureIds: [],
+        currentWindowStartAtMs: null,
+        currentWindowEndAtMs: null,
+
+        livePointsByUid: {},
+        liveBreakdownByUserId: {},
+        projectedTotalsByUid: {},
+        projectedIncludesLivePoints: false,
       },
       { merge: true }
     );
@@ -3204,6 +3603,34 @@ await weekRef.set(
       message: `Updated Week ${weekIndex} with ${games.length} fixtures.`,
       teams: games.map(g => `${g.teams.home.name} vs ${g.teams.away.name}`)
     };
+  }
+);
+
+exports.pollGlobalSeasonLiveFixtures = onSchedule(
+  { schedule: "*/1 * * * *", timeZone: "America/Los_Angeles", region: "us-west2", secrets: [APIFOOTBALL_KEY] },
+  async () => {
+    const apiKey = APIFOOTBALL_KEY.value();
+    const nowMs = Date.now();
+    const seasonTargets = await collectActiveSeasonFixtureTargets();
+
+    for (const seasonTarget of seasonTargets) {
+      try {
+        const result = await pollGlobalSeasonLiveFixturesOnce({
+          seasonTarget,
+          apiKey,
+          nowMs,
+        });
+
+        console.log(
+          `[pollGlobalSeasonLiveFixtures] season=${seasonTarget.seasonKey} fixtures=${result.fixtureCount} payloads=${result.payloadCount}`
+        );
+      } catch (e) {
+        console.error(
+          `[pollGlobalSeasonLiveFixtures] Failed season=${seasonTarget?.seasonKey || "unknown"}`,
+          e
+        );
+      }
+    }
   }
 );
 

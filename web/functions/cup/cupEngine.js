@@ -33,7 +33,7 @@ function toPos(pos) {
 // ✅ NEW HELPER: Fetches the actual match score and injects it into player stats
 async function enrichStatsMapWithScores(fixtureId, statsMap, apiFootballGet, apiKey) {
   try {
-    const fixRes = await apiFootballGet(`fixtures?id=${fixtureId}`, apiKey);
+    const fixRes = await apiFootballGet("fixtures", { id: fixtureId }, apiKey);
     const fixData = fixRes?.response?.[0];
     const hId = String(fixData?.teams?.home?.id || "");
     const aId = String(fixData?.teams?.away?.id || "");
@@ -41,12 +41,25 @@ async function enrichStatsMapWithScores(fixtureId, statsMap, apiFootballGet, api
     const aScore = fixData?.goals?.away;
 
     if (hId && aId) {
-      for (const pid of Object.keys(statsMap)) {
-        const tId = String(statsMap[pid].teamId || statsMap[pid].team?.id || "");
-        if (tId === hId) {
+      const homeName = String(fixData?.teams?.home?.name || "").trim().toLowerCase();
+      const awayName = String(fixData?.teams?.away?.name || "").trim().toLowerCase();
+
+      for (const pid of Object.keys(statsMap || {})) {
+        const tId = String(statsMap[pid]?.teamId || statsMap[pid]?.team?.id || "");
+        const tName = String(
+          statsMap[pid]?.teamName ||
+          statsMap[pid]?.realTeamName ||
+          statsMap[pid]?.team?.name ||
+          ""
+        ).trim().toLowerCase();
+
+        const isHome = (tId && tId === hId) || (!tId && tName && tName === homeName);
+        const isAway = (tId && tId === aId) || (!tId && tName && tName === awayName);
+
+        if (isHome) {
           statsMap[pid].teamScore = hScore ?? null;
           statsMap[pid].opponentScore = aScore ?? null;
-        } else if (tId === aId) {
+        } else if (isAway) {
           statsMap[pid].teamScore = aScore ?? null;
           statsMap[pid].opponentScore = hScore ?? null;
         }
@@ -274,38 +287,63 @@ function mergeCupBreakdownByUserId(base = {}, add = {}) {
 
 async function discoverFixtures({ apiFootballGet, apiKey, league, season, timezone }) {
   const out = [];
+  const seen = new Set();
+
+  function pushAll(list = []) {
+    for (const m of Array.isArray(list) ? list : []) {
+      const id = String(m?.fixture?.id || "");
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      out.push(m);
+    }
+  }
 
   try {
     const live = await apiFootballGet("fixtures", { live: "all", league, season }, apiKey);
-    const list = Array.isArray(live?.response) ? live.response : [];
-    out.push(...list);
+    pushAll(live?.response || []);
   } catch (_) {}
 
   try {
     const up = await apiFootballGet("fixtures", { league, season, next: 100, timezone }, apiKey);
-    const list2 = Array.isArray(up?.response) ? up.response : [];
-    out.push(...list2);
+    pushAll(up?.response || []);
   } catch (_) {}
 
-  // FIX: Fallback to 90-day search if 'next' returns nothing (Very common for Cups)
-  if (out.length === 0) {
-    try {
-      const now = new Date();
-      const from = now.toISOString().split("T")[0];
-      now.setUTCDate(now.getUTCDate() + 90);
-      const to = now.toISOString().split("T")[0];
-      const range = await apiFootballGet("fixtures", { league, season, from, to, timezone }, apiKey);
-      const list3 = Array.isArray(range?.response) ? range.response : [];
-      out.push(...list3);
-    } catch (_) {}
-  }
+  // IMPORTANT:
+  // Include recent past fixtures too, so a leg that finished earlier today
+  // still gets included when we arm a round window like "Semi-finals".
+  try {
+    const now = new Date();
+    const fromDt = new Date(now);
+    fromDt.setUTCDate(fromDt.getUTCDate() - 7);
+
+    const toDt = new Date(now);
+    toDt.setUTCDate(toDt.getUTCDate() + 90);
+
+    const from = fromDt.toISOString().slice(0, 10);
+    const to = toDt.toISOString().slice(0, 10);
+
+    const range = await apiFootballGet(
+      "fixtures",
+      { league, season, from, to, timezone },
+      apiKey
+    );
+    pushAll(range?.response || []);
+  } catch (_) {}
 
   const parsed = [];
   for (const m of out) {
     const id = String(m?.fixture?.id || "");
-    const kickoffMs = m?.fixture?.timestamp ? Number(m.fixture.timestamp) * 1000 : Date.parse(m?.fixture?.date);
+    const kickoffMs = m?.fixture?.timestamp
+      ? Number(m.fixture.timestamp) * 1000
+      : Date.parse(m?.fixture?.date);
+
     if (!id || !Number.isFinite(kickoffMs)) continue;
-    parsed.push({ id, kickoffMs, round: m?.league?.round || null });
+
+    parsed.push({
+      id,
+      kickoffMs,
+      round: m?.league?.round || null,
+    });
   }
 
   return parsed;
@@ -743,24 +781,26 @@ async function runCupEngine({
     const cupSnap = await cupRef.get();
     let cup = cupSnap.exists ? (cupSnap.data() || {}) : null;
 
-    // --- ✅ ADD SMART TIME GATE LOGIC ---
+    // Sleep only BEFORE kickoff of the currently armed window.
+    // Do NOT sleep after a window ended, because the engine still needs
+    // to resolve/advance into the next Cup window.
     if (cup) {
       const status = String(cup.status || "").toLowerCase();
       const startAtMs = Number(cup.currentWindowStartAtMs || 0);
-      const endAtMs = Number(cup.currentWindowEndAtMs || 0);
 
-      const PRE_MS = 20 * 60 * 1000;        // 20 min pre-kickoff
-      const POST_MS = 3 * 60 * 60 * 1000;   // 3 hrs post-kickoff
-
-      // Only apply sleep logic if scheduled or idle
-      if (startAtMs > 0 && endAtMs > 0 && status !== "resolving" && status !== "live" && status !== "final") {
-        if (nowMs < startAtMs - PRE_MS || nowMs > endAtMs + POST_MS) {
-          // Outside the active window: SLEEP!
-          return; 
-        }
-      }
+      const PRE_MS = 20 * 60 * 1000; // 20 min pre-kickoff
 
       if (cup.completed || status === "final") return;
+
+      if (
+        startAtMs > 0 &&
+        status !== "resolving" &&
+        status !== "live" &&
+        status !== "final" &&
+        nowMs < startAtMs - PRE_MS
+      ) {
+        return;
+      }
     }
 
     await cupRef.set({ lastPollAtMs: nowMs, updatedAtMs: nowMs }, { merge: true });

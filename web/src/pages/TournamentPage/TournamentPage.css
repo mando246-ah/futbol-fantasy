@@ -1626,3 +1626,101 @@
   text-overflow: ellipsis;
   max-width: 220px;
 }
+/* Cup player dropdown match-score header */
+.tpCardHeader{
+  align-items: stretch;
+  gap: 8px;
+  padding: 12px 12px 14px;
+  margin-bottom: 14px;
+  border-radius: 14px;
+  border: 1px solid rgba(34, 211, 238, 0.14);
+  background:
+    radial-gradient(circle at 50% 0%, rgba(34, 211, 238, 0.10), transparent 55%),
+    rgba(255,255,255,0.035);
+}
+
+.tpMatchHeaderTeam{
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.tpMatchHeaderTeamTop{
+  opacity: 0.96;
+}
+
+.tpMatchHeaderName{
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+
+  font-size: 0.86rem;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: rgba(255,255,255,0.92);
+}
+
+.tpMatchHeaderScore{
+  min-width: 34px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  text-align: center;
+
+  font-size: 1rem;
+  line-height: 1;
+  font-weight: 950;
+  color: rgba(255,255,255,0.96);
+
+  border: 1px solid rgba(34, 211, 238, 0.28);
+  background: rgba(34, 211, 238, 0.12);
+  box-shadow: 0 0 18px rgba(34, 211, 238, 0.10);
+}
+
+.tpMatchHeaderDivider{
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+
+  font-size: 0.62rem;
+  font-weight: 900;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: rgba(255,255,255,0.45);
+}
+
+.tpMatchHeaderDivider::before,
+.tpMatchHeaderDivider::after{
+  content: "";
+  height: 1px;
+  flex: 1;
+  background: rgba(255,255,255,0.10);
+}
+
+/* Mobile-friendly scoreboard */
+@media (max-width: 520px){
+  .tpCardHeader{
+    padding: 10px;
+    gap: 7px;
+  }
+
+  .tpMatchHeaderName{
+    font-size: 0.74rem;
+    letter-spacing: 0.05em;
+  }
+
+  .tpMatchHeaderScore{
+    min-width: 30px;
+    padding: 5px 8px;
+    font-size: 0.92rem;
+  }
+
+  .tpMatchHeaderDivider{
+    font-size: 0.56rem;
+    letter-spacing: 0.12em;
+  }
+}
