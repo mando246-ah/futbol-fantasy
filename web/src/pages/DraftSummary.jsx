@@ -399,7 +399,6 @@ export default function DraftSummary() {
             teamName={teamNamesByUid[manager.uid] || ""}
             roomId={roomId}
             room={room}
-            roomPath={tradeRoomPath}
             myUid={myUid}
             
           />
@@ -426,28 +425,15 @@ export default function DraftSummary() {
   );
 }
 
-function ManagerRosterCard({ manager, picks, totalRounds, photoURL, teamName, roomId, myUid, room, roomPath }) {
+function ManagerRosterCard({ manager, picks, totalRounds, photoURL, teamName, roomId, myUid, room }) {
   const name = displayNameOf(manager);
   const showTeamName = teamName?.trim();
   const title = showTeamName ? `${name} — ${showTeamName}` : name;
   const lineupRoomId = roomId;
-
-  const isMe = myUid && manager.uid === myUid;
-
-  // Ensure the "members mirror" doc exists so Firestore rules (isRoomMember) passes.
-  useEffect(() => {
-    if (!isMe || !myUid || !lineupRoomId) return;
-
-    setDoc(
-      doc(db, "rooms", lineupRoomId, "members", myUid),
-      {
-        uid: myUid,
-        displayName: displayNameOf(manager),
-        lastSeenAt: serverTimestamp(),
-      },
-      { merge: true }
-    );
-  }, [isMe, myUid, roomPath, manager]);
+  const authUid = myUid || auth.currentUser?.uid || null;
+  const targetUid = manager?.uid || authUid || null;
+  const isHost = !!authUid && room?.hostUid === authUid;
+  const isMe = !!authUid && targetUid === authUid;
 
 
 
@@ -631,6 +617,14 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, teamName, ro
   async function saveStarters(next) {
     if (!isMe || lockedNow) return;
 
+    if (!authUid) {
+      throw new Error("Sign in required.");
+    }
+
+    if (targetUid !== authUid && !isHost) {
+      throw new Error("You can only edit your own lineup.");
+    }
+
     const clean = (next || []).slice(0, STARTING_CAP);
 
     const v = validateStarters(clean);
@@ -675,29 +669,86 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, teamName, ro
     });
 
     try {
-      // 3) Keep the member mirror update (Crucial for both engines to see you)
-      await setDoc(
-        doc(db, "rooms", lineupRoomId, "members", myUid),
-        { uid: myUid, lastSeenAt: serverTimestamp() },
-        { merge: true }
-      );
+      console.log("[substitution] save attempt", {
+        roomId: lineupRoomId,
+        authUid,
+        userUid: manager?.uid || null,
+        targetUid,
+        isHost,
+        lineupPath: `rooms/${lineupRoomId}/lineups/${targetUid}`,
+        starterOutId: null,
+        benchInId: null,
+      });
 
-      // 4) Write lineup with FULL explicit data for both Matchday & Cup
       await setDoc(
-        doc(db, "rooms", lineupRoomId, "lineups", myUid),
+        doc(db, "rooms", lineupRoomId, "lineups", targetUid),
         {
-          uid: myUid,
+          uid: targetUid,
           starters: clean,       // String IDs
           startingXI,            // Objects
           bench: benchKeys,      // String IDs for Bench (Cup/Regular)
           benchXI,               // Objects for Bench
           updatedAt: serverTimestamp(),
+          updatedBy: authUid,
         },
         { merge: true }
       );
-    } catch (error) {
-      console.error("Failed to save substitution:", error);
+    } catch (e) {
+      console.error("[substitution] failed", {
+        roomId: lineupRoomId,
+        authUid,
+        targetUid,
+        lineupPath: `rooms/${lineupRoomId}/lineups/${targetUid}`,
+        errorCode: e?.code,
+        errorMessage: e?.message,
+        error: e,
+      });
       alert("Substitution failed. Check console for details.");
+    }
+  }
+
+  async function saveSwapSubstitution(starterOutId, benchInId) {
+    if (!isMe || lockedNow) return;
+
+    if (!authUid) {
+      throw new Error("Sign in required.");
+    }
+
+    if (targetUid !== authUid && !isHost) {
+      throw new Error("You can only edit your own lineup.");
+    }
+
+    console.log("[substitution] save attempt", {
+      roomId: lineupRoomId,
+      authUid,
+      userUid: manager?.uid || null,
+      targetUid,
+      isHost,
+      lineupPath: `rooms/${lineupRoomId}/lineups/${targetUid}`,
+      starterOutId,
+      benchInId,
+    });
+
+    try {
+      const fn = httpsCallable(functions, "saveLineupSubstitution");
+      await fn({
+        roomId: lineupRoomId,
+        targetUid,
+        starterOutId,
+        benchInId,
+      });
+    } catch (e) {
+      console.error("[substitution] failed", {
+        roomId: lineupRoomId,
+        authUid,
+        targetUid,
+        lineupPath: `rooms/${lineupRoomId}/lineups/${targetUid}`,
+        errorCode: e?.code,
+        errorMessage: e?.message,
+        error: e,
+      });
+      alert("Substitution failed. Check console for details.");
+      throw e;
     }
   }
 
@@ -778,11 +829,10 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, teamName, ro
     setPendingIn(benchKey);
   }
 
-  function onStarterClick(starterKey) {
+  async function onStarterClick(starterKey) {
     if (!isMe || lockedNow) return;
     if (!pendingIn) return;
 
-    const starterPick = pickByKey.get(starterKey);
     const benchPick = pickByKey.get(pendingIn);
 
   
@@ -791,9 +841,12 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, teamName, ro
       return;
     }
 
-    const next = starters.map((k) => (k === starterKey ? pendingIn : k));
-    saveStarters(next);
-    setPendingIn(null);
+    try {
+      await saveSwapSubstitution(starterKey, pendingIn);
+      setPendingIn(null);
+    } catch {
+      // saveSwapSubstitution already logged and alerted
+    }
   }
 
   const replaceableStarters = useMemo(() => {

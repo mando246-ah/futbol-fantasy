@@ -4,19 +4,19 @@
  * Phase 1 foundation for global season data.
  *
  * Target Firestore layout:
- * - globalData/seasons/{seasonKey}
- * - globalData/seasons/{seasonKey}/players/{playerId}
- * - globalData/seasons/{seasonKey}/fixtures/{fixtureId}
- * - globalData/seasons/{seasonKey}/liveFixtures/{fixtureId}
- * - globalData/seasons/{seasonKey}/weeks/{weekKey}
- * - globalData/seasons/{seasonKey}/fixtureRooms/{fixtureId}
+ * - globalData/main/seasons/{seasonKey}
+ * - globalData/main/seasons/{seasonKey}/players/{playerId}
+ * - globalData/main/seasons/{seasonKey}/fixtures/{fixtureId}
+ * - globalData/main/seasons/{seasonKey}/liveFixtures/{fixtureId}
+ * - globalData/main/seasons/{seasonKey}/weeks/{weekKey}
+ * - globalData/main/seasons/{seasonKey}/fixtureRooms/{fixtureId}
  *
  * This file is intentionally additive only.
  * Current room-level competition, polling, scoring, and UI flows continue
  * to use room.competition and room.competitionState exactly as before.
  */
 
-const GLOBAL_SEASONS_ROOT = "globalData/seasons";
+const GLOBAL_SEASONS_ROOT = "globalData/main/seasons";
 
 const COMPETITION_ALIASES = [
   { match: /world cup/i, key: "worldcup", type: "tournament" },

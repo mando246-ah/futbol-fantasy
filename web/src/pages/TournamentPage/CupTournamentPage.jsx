@@ -82,6 +82,8 @@ const STAT_LABELS = {
   dribbles: "Dribbles",
   duels: "Duels",
   shotsOn: "Shots on target",
+  kickoffMs: "Kickoff",
+  kickoffAtMs: "Kickoff",
 };
 
 function prettyStatLabel(key) {
@@ -340,9 +342,124 @@ function UserChip({ user }) {
   );
 }
 
+const LIVE_TIMER_STATUSES = new Set(["1H", "2H", "ET"]);
+const HOLD_TIMER_STATUSES = new Set(["HT", "BT", "P"]);
+const FINISHED_TIMER_STATUSES = new Set(["FT", "AET", "PEN"]);
+
+function timerStatusOf(stats = {}) {
+  return String(
+    stats?.statusShort ||
+    stats?.fixtureStatus ||
+    stats?.matchStatus ||
+    ""
+  ).toUpperCase();
+}
+
+function formatClockSeconds(totalSeconds) {
+  const safe = Math.max(0, Math.floor(Number(totalSeconds) || 0));
+  const mins = Math.floor(safe / 60);
+  const secs = safe % 60;
+
+  return `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+}
+
+function getLiveTimerDisplay(stats, nowMs) {
+  const status = timerStatusOf(stats);
+
+  if (!status || status === "NS" || status === "TBD") return null;
+
+  if (FINISHED_TIMER_STATUSES.has(status)) {
+    return { main: "FINAL SCORE", extra: "", kind: "final" };
+  }
+
+  if (status === "HT") {
+    return { main: "HT 45:00", extra: "", kind: "hold" };
+  }
+
+  if (status === "BT") {
+    return { main: "ET 90:00", extra: "", kind: "hold" };
+  }
+
+  if (status === "P") {
+    return { main: "PENS", extra: "", kind: "hold" };
+  }
+
+  const apiElapsed = Number(
+    stats?.elapsed ??
+    stats?.timerElapsed ??
+    stats?.matchElapsed
+  );
+
+  if (!Number.isFinite(apiElapsed)) return null;
+
+  const updatedAtMs = Number(
+    stats?.statusUpdatedAtMs ??
+    stats?.timerUpdatedAtMs ??
+    stats?.updatedAtMs
+  );
+
+  const apiExtra = Number(stats?.extra ?? stats?.stoppageTime ?? 0);
+
+  let seconds = Math.max(0, Math.floor(apiElapsed * 60));
+
+  if (
+    LIVE_TIMER_STATUSES.has(status) &&
+    Number.isFinite(updatedAtMs) &&
+    updatedAtMs > 0 &&
+    nowMs > updatedAtMs
+  ) {
+    seconds += Math.floor((nowMs - updatedAtMs) / 1000);
+  }
+
+  let capSeconds = null;
+  if (status === "1H") capSeconds = 45 * 60;
+  if (status === "2H") capSeconds = 90 * 60;
+  if (status === "ET") capSeconds = 120 * 60;
+
+  let extra = "";
+
+  if (capSeconds && (seconds > capSeconds || apiExtra > 0)) {
+    const computedExtra = seconds > capSeconds
+      ? Math.ceil((seconds - capSeconds) / 60)
+      : 0;
+
+    const bestExtra = Math.max(
+      Number.isFinite(apiExtra) ? apiExtra : 0,
+      computedExtra
+    );
+
+    seconds = capSeconds;
+    extra = bestExtra > 0 ? `+${bestExtra}` : "";
+  }
+
+  return {
+    main: formatClockSeconds(seconds),
+    extra,
+    kind: "live",
+  };
+}
+
 function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
   const hasStats = stats && Object.keys(stats).length > 0;
   const hasBD = breakdown && Object.keys(breakdown).length > 0;
+
+  const [timerNowMs, setTimerNowMs] = useState(Date.now());
+  const timerStatus = timerStatusOf(stats);
+
+  useEffect(() => {
+    if (!LIVE_TIMER_STATUSES.has(timerStatus)) return;
+
+    const id = window.setInterval(() => {
+      setTimerNowMs(Date.now());
+    }, 1000);
+
+    return () => window.clearInterval(id);
+  }, [
+    timerStatus,
+    stats?.elapsed,
+    stats?.extra,
+    stats?.statusUpdatedAtMs,
+  ]);
   
   // ✅ 1. Remove stats?.isLive so it shows permanently!
   const showMatchHeader = Boolean(teamName || opponentName);
@@ -352,6 +469,15 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
   const tScore = stats?.teamScore ?? stats?.teamGoals ?? null;
   const oScore = stats?.opponentScore ?? stats?.opponentGoals ?? null;
   const hasScore = tScore !== null && oScore !== null;
+
+  const timerDisplay = getLiveTimerDisplay(stats, timerNowMs);
+  const isLiveStatus =
+    LIVE_TIMER_STATUSES.has(timerStatus) ||
+    HOLD_TIMER_STATUSES.has(timerStatus);
+
+  const dividerLabel =
+    timerDisplay?.main ||
+    (isLiveStatus ? "LIVE" : hasScore ? "FINAL SCORE" : "VS");
 
   if (!hasStats && !hasBD) {
     return (
@@ -388,7 +514,9 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
     "foulsCommitted",
     "offsides",
     "sixtyPlus",
-    "appearance"
+    "appearance",
+    "kickoffMs",
+    "kickoffAtMs",
   ];
 
   const sortedRawKeys = Object.keys(stats || {}).sort((a, b) => {
@@ -414,6 +542,21 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
     return v != null && v !== 0 && v !== "0";
   });
 
+  function formatStatValue(key, value) {
+    if (key === "kickoffMs" || key === "kickoffAtMs") {
+      const ms = Number(value);
+      if (!Number.isFinite(ms) || ms <= 0) return "—";
+
+      return new Date(ms).toLocaleTimeString("en-US", {
+        hour: "numeric",
+        minute: "2-digit",
+        hour12: true,
+      });
+    }
+
+    return String(value);
+  }
+
   return (
     <div className="tpStatsCard">
       {showMatchHeader && (
@@ -425,8 +568,11 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
 
           {opponentName && (
             <>
-              <div className="tpMatchHeaderDivider">
-                {hasScore ? "FINAL SCORE" : "VS"}
+              <div className={`tpMatchHeaderDivider ${timerDisplay?.kind ? `tpMatchHeaderDivider-${timerDisplay.kind}` : ""}`}>
+                <span>{dividerLabel}</span>
+                {timerDisplay?.extra ? (
+                  <span className="tpMatchTimerExtra">{timerDisplay.extra}</span>
+                ) : null}
               </div>
 
               <div className="tpMatchHeaderTeam">
@@ -445,13 +591,29 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
             const v = stats[k];
             if (v == null || v === false || v === 0 || v === "0") return null;
             
-            // ✅ 4. Hide the score keys from the list below so they don't randomly show up twice!
-            if (k === "isLive" || k === "teamId" || k === "fixtureId" || k === "teamScore" || k === "opponentScore" || k === "teamGoals" || k === "opponentGoals") return null;
+            // 4. Hide the score keys from the list below so they don't randomly show up twice!
+            if (
+              k === "isLive" ||
+              k === "teamId" ||
+              k === "fixtureId" ||
+              k === "fixtureStatus" ||
+              k === "matchStatus" ||
+              k === "statusShort" ||
+              k === "statusLong" ||
+              k === "elapsed" ||
+              k === "extra" ||
+              k === "statusUpdatedAtMs" ||
+              k === "timerUpdatedAtMs" ||
+              k === "teamScore" ||
+              k === "opponentScore" ||
+              k === "teamGoals" ||
+              k === "opponentGoals"
+            ) return null;
 
             return (
               <div key={k} className="tpStatRow">
                 <span>{prettyStatLabel(k)}</span>
-                <span>{String(v)}</span>
+                <span>{formatStatValue(k, v)}</span>
               </div>
             );
           })}
@@ -532,8 +694,11 @@ export default function CupTournamentPage() {
   const [showScoring, setShowScoring] = useState(false);
   const scoringRef = useRef(null);
 
+  // Dev Tools State
   const [devBusy, setDevBusy] = useState(false);
   const [rosterByUid, setRosterByUid] = useState({});
+  const [shadowTestBusy, setShadowTestBusy] = useState(false);
+  const [shadowTestResult, setShadowTestResult] = useState(null);
   
 
   useEffect(() => {
@@ -720,19 +885,21 @@ export default function CupTournamentPage() {
       data?.room?.["competitionState.weekStatus"] ||
       "scheduled";
 
-    const statusLower = String(statusRaw).toLowerCase();
+    const statusLowerRaw = String(statusRaw).toLowerCase();
+
+    // UI rule:
+    // Backend "scheduled" means the engine is sleeping/waiting.
+    // User-facing label should match regular season and show IDLE.
+    const statusLower = statusLowerRaw === "scheduled" ? "idle" : statusLowerRaw;
 
     const isLive = statusLower === "live";
     const isResolving = statusLower === "resolving";
-    const isScheduled = statusLower === "scheduled";
     const isError = statusLower === "error";
 
     const statusClass = isLive
       ? "live"
       : isResolving
       ? "resolving"
-      : isScheduled
-      ? "scheduled"
       : isError
       ? "error"
       : "idle";
@@ -741,8 +908,6 @@ export default function CupTournamentPage() {
       ? "LIVE"
       : isResolving
       ? "RESOLVING"
-      : isScheduled
-      ? "SCHEDULED"
       : isError
       ? "ERROR"
       : "IDLE";
@@ -865,7 +1030,7 @@ export default function CupTournamentPage() {
       totalFantasyPoints: u.totalPoints,
     })),
   };
-  const showFinalPodium = devPreviewComplete || Boolean(finalResultsDoc) || isFinal;
+  const showFinalPodium = devPreviewComplete || (Boolean(finalResultsDoc) && isFinal);
 
   // Resolve Rosters Helper
   function firstNonEmptyArray(...candidates) {
@@ -925,9 +1090,27 @@ export default function CupTournamentPage() {
   function mergeStatObjects(a = {}, b = {}) {
     const out = { ...(a || {}) };
 
+    const NON_ADDITIVE_NUMBER_KEYS = new Set([
+      "kickoffMs",
+      "kickoffAtMs",
+      "statusUpdatedAtMs",
+      "updatedAtMs",
+      "elapsed",
+      "extra",
+      "teamScore",
+      "opponentScore",
+      "teamGoals",
+      "opponentGoals",
+      "rating",
+    ]);
+
     for (const [k, v] of Object.entries(b || {})) {
       if (typeof v === "number") {
-        out[k] = Number(out[k] || 0) + v;
+        if (NON_ADDITIVE_NUMBER_KEYS.has(k)) {
+          out[k] = out[k] ?? v;
+        } else {
+          out[k] = Number(out[k] || 0) + v;
+        }
       } else if (typeof v === "boolean") {
         out[k] = Boolean(out[k]) || v;
       } else if ((out[k] === undefined || out[k] === null || out[k] === "") && v != null) {
@@ -1293,6 +1476,8 @@ export default function CupTournamentPage() {
   const myBenchTotal = sumDisplayedPoints(myBench);
   const otherUsers = users.filter(u => u.userId !== myUid);
 
+
+  //Dev tools
   async function copyRoomCode() {
     try {
       await navigator.clipboard.writeText(String(roomId));
@@ -1317,6 +1502,34 @@ export default function CupTournamentPage() {
       alert(e?.message || "Cup sync failed.");
     } finally {
       setDevBusy(false);
+    }
+  }
+
+  async function debugRunGlobalShadowCupTest() {
+    if (!roomId) return;
+
+    setShadowTestBusy(true);
+
+    try {
+      const functions = getFunctions(getApp(), "us-west2");
+      const fn = httpsCallable(functions, "debugComputeGlobalShadowCupRoom");
+      const res = await fn({ roomId });
+
+      console.log("====================================");
+      console.log("GLOBAL SHADOW CUP TEST RESULT");
+      console.log("Room:", roomId);
+      console.log("Summary:", res.data);
+      console.log("Diffs by UID:", res.data?.diffsByUid || {});
+      console.log("Max Abs Diff:", res.data?.maxAbsDiff);
+      console.log("Missing Fixtures:", res.data?.missingFixtureCount);
+      console.log("====================================");
+
+      alert("Global shadow test complete. Press F12 and check the console.");
+    } catch (e) {
+      console.error("GLOBAL SHADOW CUP TEST FAILED", e);
+      alert(e?.message || "Global shadow test failed. Check console.");
+    } finally {
+      setShadowTestBusy(false);
     }
   }
 
@@ -1359,7 +1572,7 @@ export default function CupTournamentPage() {
               <div className="tpLiveHeaderLine">
                 {isLive ? (
                     <span>
-                    <b>Live Updating</b>
+                    <b className="tpLivePill live">Live Updating</b>
                     {nextUpdateInSec != null ? <> • Next update in: <b>{nextUpdateInSec}s</b></> : null}
                     <> • Last update at: <b>{lastUpdateLabel}</b></>
                     </span>
@@ -1393,6 +1606,15 @@ export default function CupTournamentPage() {
                     <div className="tpToolsMenu">
                     <button className="tpToolsItem" onClick={() => setDevPreviewComplete(!devPreviewComplete)}>
                         {devPreviewComplete ? "Hide Podium" : "DEV: Preview Final Podium"}
+                    </button>
+
+                    <button
+                      type="button"
+                      className="tpToolMenuItem"
+                      onClick={debugRunGlobalShadowCupTest}
+                      disabled={shadowTestBusy}
+                    >
+                      {shadowTestBusy ? "Running Shadow Test..." : "DEV: Test Global Shadow"}
                     </button>
 
                     <button
@@ -1470,11 +1692,6 @@ export default function CupTournamentPage() {
           {!showFinalPodium && (
             <div className="tpCard tpFull">
               <h3 className="tpCardTitle">Your Roster</h3>
-              {isAutoShowingLatestHistory && (
-                <p className="tpText" style={{ marginTop: -4, marginBottom: 14, opacity: 0.8 }}>
-                  Showing the last completed Cup round until one hour before the next kickoff. The leaderboard above remains your cumulative Cup total.
-                </p>
-              )}
               <div className="tpLineups tpLineupsSingle">
                 <div className="tpSide tpSideMe tpSideSolo">
                   <div className="tpLineupHead">

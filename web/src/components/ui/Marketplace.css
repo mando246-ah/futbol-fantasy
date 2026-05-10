@@ -444,3 +444,214 @@
   min-width: 0;
   box-sizing: border-box !important;
 }
+.marketSuggestionHeader{
+  display:flex;
+  align-items:flex-end;
+  justify-content:space-between;
+  gap:12px;
+  margin-bottom:10px;
+}
+
+.marketSubText{
+  margin-top:3px;
+  font-size:.78rem;
+  color:rgba(255,255,255,.58);
+}
+
+.marketSearchInput{
+  width:100%;
+  margin-bottom:12px;
+}
+
+.marketClearSearchBtn{
+  padding:8px 12px;
+  white-space:nowrap;
+}
+
+.marketPlayerCard{
+  position:relative;
+  transition:
+    transform .16s ease,
+    border-color .16s ease,
+    background .16s ease,
+    box-shadow .16s ease;
+}
+
+.marketPlayerCard:hover{
+  transform:translateY(-1px);
+  border-color:rgba(34,211,238,.28);
+  background:rgba(255,255,255,.045);
+}
+
+.marketPlayerCardSelected{
+  border-color:rgba(34,211,238,.55);
+  background:
+    radial-gradient(circle at top right, rgba(34,211,238,.14), transparent 46%),
+    rgba(255,255,255,.04);
+  box-shadow:0 0 0 1px rgba(34,211,238,.12);
+}
+
+.marketPlayerCardTop{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+}
+
+.marketPlayerInfo{
+  min-width:0;
+}
+
+.marketPlayerInfo .font-medium{
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+
+.marketPlayerMeta{
+  display:flex;
+  flex-wrap:wrap;
+  gap:5px;
+  margin-top:3px;
+  font-size:.74rem;
+  line-height:1.25;
+  color:rgba(255,255,255,.62);
+}
+
+.marketTransferMiniBtn{
+  flex:0 0 auto;
+  border:1px solid rgba(34,211,238,.35);
+  background:rgba(34,211,238,.10);
+  color:rgba(255,255,255,.92);
+  border-radius:999px;
+  padding:7px 10px;
+  font-size:.74rem;
+  font-weight:800;
+  cursor:pointer;
+  transition:background .16s ease, transform .16s ease, opacity .16s ease;
+}
+
+.marketTransferMiniBtn:hover:not(:disabled){
+  transform:translateY(-1px);
+  background:rgba(34,211,238,.18);
+}
+
+.marketTransferMiniBtn:disabled{
+  cursor:not-allowed;
+  opacity:.46;
+}
+
+.marketSelectedTarget{
+  min-height:48px;
+  width:100%;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  padding:10px 12px;
+  border:1px solid rgba(125,211,252,.22);
+  border-radius:14px;
+  background:rgba(255,255,255,.035);
+}
+
+.marketSelectedInfo{
+  min-width:0;
+}
+
+.marketSelectedName{
+  font-weight:850;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+
+.marketEmptyTarget{
+  font-size:.86rem;
+  color:rgba(255,255,255,.52);
+}
+
+@media (max-width: 720px){
+  .marketSuggestionHeader{
+    align-items:stretch;
+    flex-direction:column;
+  }
+
+  .marketClearSearchBtn{
+    width:max-content;
+  }
+
+  .marketPlayerCardTop{
+    align-items:flex-start;
+    flex-direction:column;
+  }
+
+  .marketTransferMiniBtn{
+    width:100%;
+  }
+
+  .marketSelectedTarget{
+    align-items:flex-start;
+    flex-direction:column;
+  }
+
+  .marketSelectedTarget .marketLinkBtn{
+    align-self:flex-start;
+  }
+}
+
+/* ===== More visible Transfer Market search ===== */
+.marketSearchInput,
+.marketInput.marketSearchInput{
+  height: 44px;
+  width: 100%;
+  border-radius: 14px;
+  padding: 0 14px;
+
+  border: 1px solid rgba(34, 211, 238, 0.62) !important;
+  background:
+    linear-gradient(135deg, rgba(34, 211, 238, 0.08), rgba(168, 85, 247, 0.08)),
+    rgba(2, 6, 23, 0.72) !important;
+
+  color: rgba(255,255,255,0.96) !important;
+  box-shadow:
+    0 0 0 1px rgba(168, 85, 247, 0.18),
+    0 10px 24px rgba(0,0,0,0.20),
+    inset 0 1px 0 rgba(255,255,255,0.06);
+
+  outline: none;
+  font-weight: 750;
+}
+
+.marketSearchInput::placeholder,
+.marketInput.marketSearchInput::placeholder{
+  color: rgba(226, 232, 240, 0.72) !important;
+  font-weight: 600;
+}
+
+.marketSearchInput:hover,
+.marketInput.marketSearchInput:hover{
+  border-color: rgba(34, 211, 238, 0.82) !important;
+  box-shadow:
+    0 0 0 1px rgba(34, 211, 238, 0.24),
+    0 12px 28px rgba(0,0,0,0.24),
+    inset 0 1px 0 rgba(255,255,255,0.07);
+}
+
+.marketSearchInput:focus,
+.marketInput.marketSearchInput:focus{
+  border-color: rgba(34, 211, 238, 0.98) !important;
+  box-shadow:
+    0 0 0 3px rgba(34, 211, 238, 0.28),
+    0 0 0 1px rgba(168, 85, 247, 0.34),
+    0 14px 30px rgba(0,0,0,0.26) !important;
+}
+
+/* Mobile: keep search easy to tap */
+@media (max-width: 720px){
+  .draftPage .draftPlayerSearchInput,
+  .marketSearchInput,
+  .marketInput.marketSearchInput{
+    height: 46px;
+    font-size: 0.95rem;
+  }
+}

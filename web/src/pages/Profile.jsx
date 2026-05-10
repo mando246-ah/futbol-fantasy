@@ -310,7 +310,7 @@ export default function Profile() {
 
           <input
             className="profileInput"
-            placeholder="e.g. Mando"
+            placeholder="e.g. User"
             value={name}
             onChange={(e) => setName(e.target.value)}
             maxLength={30}
@@ -356,7 +356,7 @@ export default function Profile() {
               </button>
 
               {avatarMsg ? <div>{avatarMsg}</div> : null}
-              <div className="hint">PNG/JPG/WEBP up to 2MB</div>
+              <div className="hint">PNG/JPG/WEBP up to 8MB</div>
             </div>
           </div>
         </section>

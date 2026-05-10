@@ -16,10 +16,25 @@ const {
   replacePlayersInRoom,
 } = require("./shared/seasonPlayerPool");
 const {
+  buildDefaultGlobalPipeline,
+  getGlobalPipelineMode,
+  isGlobalPlayerPoolEnabled,
+  isGlobalLiveFixtureCacheEnabled,
+  normalizeGlobalPipelineMode,
+} = require("./shared/globalPipeline");
+const {
   estimateDocBytes,
+  getSeasonFixtureSummaryRef,
+  getSeasonLiveFixtureRef,
   writeSeasonFixtureSummary,
   writeSeasonLiveFixture,
 } = require("./shared/seasonLiveFixtures");
+const {
+  buildCompetitionStateRepairData,
+  deleteBadFlatCompetitionStateFields,
+  getCompetitionState,
+  setCompetitionState,
+} = require("./shared/competitionState");
 
 //Serve Resolve Market Helpers
 async function loadStandingsByUid(roomRef) {
@@ -164,6 +179,7 @@ async function getEmailsForUids(uids) {
 }
 
 const DEFAULT_TZ = "America/Los_Angeles";
+const ADMIN_UIDS = new Set(["PASTE_MY_UID_HERE"]);
 
 function getRoomTimeZone(room) {
   return (
@@ -306,6 +322,158 @@ function normalizePlayer(raw) {
   };
 }
 
+function pickBestApiFootballPlayerStats(statsArr, { league, preferredTeamId = null } = {}) {
+  const arr = Array.isArray(statsArr) ? statsArr : [];
+  if (!arr.length) return null;
+
+  if (preferredTeamId) {
+    const teamIdStr = String(preferredTeamId);
+    return (
+      arr.find((s) => String(s?.team?.id || "") === teamIdStr && String(s?.league?.id || "") === String(league)) ||
+      arr.find((s) => String(s?.team?.id || "") === teamIdStr) ||
+      arr[0] ||
+      null
+    );
+  }
+
+  return (
+    arr.find((s) => String(s?.league?.id || "") === String(league)) ||
+    arr[0] ||
+    null
+  );
+}
+
+function buildPlayerPoolDocFromApiItem({
+  item,
+  league,
+  season,
+  preferredTeamId = null,
+  allowedTeamIds = null,
+  teamMeta = null,
+}) {
+  const p = item?.player;
+  const playerId = p?.id;
+  if (!playerId) return null;
+
+  const st0 = pickBestApiFootballPlayerStats(item?.statistics, { league, preferredTeamId });
+  const positionRaw = st0?.games?.position || st0?.games?.pos || "";
+  const position = toPos(positionRaw);
+
+  const teamId = st0?.team?.id ?? preferredTeamId ?? null;
+  const teamIdStr = teamId ? String(teamId) : null;
+
+  if (allowedTeamIds instanceof Set && teamIdStr && !allowedTeamIds.has(teamIdStr)) {
+    return null;
+  }
+
+  const teamName =
+    st0?.team?.name ||
+    (teamMeta instanceof Map && teamIdStr ? teamMeta.get(teamIdStr)?.name : "") ||
+    "";
+  const teamLogo =
+    st0?.team?.logo ||
+    (teamMeta instanceof Map && teamIdStr ? teamMeta.get(teamIdStr)?.logo : "") ||
+    "";
+
+  const full = `${p?.firstname || ""} ${p?.lastname || ""}`.trim();
+  const displayName = full || p?.name || "Unknown";
+
+  return {
+    id: String(playerId),
+    name: displayName,
+    position,
+    teamId: teamIdStr,
+    teamName,
+    teamLogo,
+    nationality: p?.nationality || "",
+    provider: "api-football",
+    league: String(league),
+    season: String(season),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+}
+
+async function fetchCompetitionPlayerPoolFromApi({
+  apiKey,
+  league,
+  season,
+  maxPlayers = 1500,
+  maxPages = 200,
+  maxPagesPerTeam = 10,
+  teamIds = null,
+  teamMeta = null,
+}) {
+  const seen = new Set();
+  const players = [];
+  let pagesFetched = 0;
+
+  const pushPlayer = (item, preferredTeamId = null, allowedTeamIds = null) => {
+    const playerDoc = buildPlayerPoolDocFromApiItem({
+      item,
+      league,
+      season,
+      preferredTeamId,
+      allowedTeamIds,
+      teamMeta,
+    });
+    if (!playerDoc) return;
+
+    const pid = String(playerDoc.id);
+    if (seen.has(pid)) return;
+    seen.add(pid);
+    players.push(playerDoc);
+  };
+
+  if (Array.isArray(teamIds) && teamIds.length > 0) {
+    const allowedTeamIds = new Set(teamIds.map(String).filter(Boolean));
+
+    for (const teamIdStr of allowedTeamIds) {
+      if (players.length >= maxPlayers) break;
+
+      let page = 1;
+      let totalPages = 1;
+
+      while (page <= totalPages && page <= maxPagesPerTeam && players.length < maxPlayers) {
+        const res = await apiFootballGet("players", { team: teamIdStr, season, page }, apiKey);
+        totalPages = Number(res?.paging?.total ?? 1) || 1;
+        pagesFetched += 1;
+
+        const items = Array.isArray(res?.response) ? res.response : [];
+        for (const item of items) {
+          if (players.length >= maxPlayers) break;
+          pushPlayer(item, teamIdStr, allowedTeamIds);
+        }
+
+        page += 1;
+      }
+    }
+  } else {
+    let page = 1;
+    let totalPages = 1;
+
+    while (page <= totalPages && page <= maxPages && players.length < maxPlayers) {
+      const res = await apiFootballGet("players", { league, season, page }, apiKey);
+      totalPages = Number(res?.paging?.total ?? 1) || 1;
+      pagesFetched += 1;
+
+      const items = Array.isArray(res?.response) ? res.response : [];
+      for (const item of items) {
+        if (players.length >= maxPlayers) break;
+        pushPlayer(item, null, null);
+      }
+
+      page += 1;
+    }
+  }
+
+  return {
+    players,
+    written: players.length,
+    pagesFetched,
+    hitCap: players.length >= maxPlayers,
+  };
+}
+
 exports.seedPlayersFromCompetition = onCall(
   { region: "us-west2", secrets: [APIFOOTBALL_KEY], timeoutSeconds: 540, memory: "1GiB" },
   async (request) => {
@@ -422,6 +590,9 @@ exports.seedPlayersFromCompetition = onCall(
     let written = 0;
     let pagesFetched = 0;
     let usedGlobalSeasonPlayers = false;
+    let hitCap = false;
+    let globalBootstrapWritten = 0;
+    let globalBootstrapError = null;
     const fetchedPlayerDocs = [];
 
     function filterPlayersForFixtureDate(players = []) {
@@ -433,7 +604,9 @@ exports.seedPlayersFromCompetition = onCall(
       });
     }
 
-    if (seasonKey) {
+    const globalPlayerPoolEnabled = isGlobalPlayerPoolEnabled(room);
+
+    if (globalPlayerPoolEnabled && seasonKey) {
       const seasonPlayers = await loadSeasonPlayerPool({ db, seasonKey });
       const roomSourcePlayers = filterPlayersForFixtureDate(seasonPlayers);
 
@@ -447,104 +620,22 @@ exports.seedPlayersFromCompetition = onCall(
       }
     }
 
-    const seen = new Set();
+    if (!usedGlobalSeasonPlayers) {
+      const fetchResult = await fetchCompetitionPlayerPoolFromApi({
+        apiKey,
+        league,
+        season,
+        maxPlayers,
+        maxPages,
+        maxPagesPerTeam,
+        teamIds: fixtureDate ? Array.from(teamMeta.keys()) : null,
+        teamMeta,
+      });
 
-    function pickBestStats(statsArr, preferredTeamId) {
-      const arr = Array.isArray(statsArr) ? statsArr : [];
-      if (!preferredTeamId) return arr[0] || null;
-      const teamIdStr = String(preferredTeamId);
-
-      return (
-        arr.find((s) => String(s?.team?.id || "") === teamIdStr && String(s?.league?.id || "") === String(league)) ||
-        arr.find((s) => String(s?.team?.id || "") === teamIdStr) ||
-        arr[0] ||
-        null
-      );
-    }
-
-    async function upsertPlayerFromApiItem(it, preferredTeamId) {
-      const p = it?.player;
-      const playerId = p?.id;
-      if (!playerId) return;
-
-      const pid = String(playerId);
-      if (seen.has(pid)) return;
-      seen.add(pid);
-
-      const st0 = pickBestStats(it?.statistics, preferredTeamId);
-
-      const positionRaw = st0?.games?.position || st0?.games?.pos || "";
-      const position = toPos(positionRaw);
-
-      const teamId = st0?.team?.id ?? preferredTeamId ?? null;
-      const teamIdStr = teamId ? String(teamId) : null;
-
-      // If we're in fixture-date mode, only keep players whose club is in the slate.
-      if (fixtureDate && teamIdStr && !teamMeta.has(teamIdStr)) return;
-
-      const teamName = st0?.team?.name || (teamIdStr ? teamMeta.get(teamIdStr)?.name : "") || "";
-      const teamLogo = st0?.team?.logo || (teamIdStr ? teamMeta.get(teamIdStr)?.logo : "") || "";
-
-      const full = `${p?.firstname || ""} ${p?.lastname || ""}`.trim();
-      const displayName = full || p?.name || "Unknown";
-      const playerDoc = {
-        id: pid,
-        name: displayName,
-        position,
-        teamId: teamIdStr,
-        teamName,
-        teamLogo,
-        nationality: p?.nationality || "",
-
-        provider: "api-football",
-        league: String(league),
-        season: String(season),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      };
-
-      fetchedPlayerDocs.push(playerDoc);
-      written += 1;
-    }
-
-    if (!usedGlobalSeasonPlayers && !fixtureDate) {
-      // --- Original mode: pull players by league/season (paged) ---
-      let page = 1;
-      let totalPages = 1;
-
-      while (page <= totalPages && page <= maxPages && written < maxPlayers) {
-        const res = await apiFootballGet("players", { league, season, page }, apiKey);
-        totalPages = Number(res?.paging?.total ?? 1) || 1;
-        pagesFetched += 1;
-
-        const items = Array.isArray(res?.response) ? res.response : [];
-        for (const it of items) {
-          if(written >= maxPlayers) break;
-          await upsertPlayerFromApiItem(it, null);
-        }
-
-        page += 1;
-      }
-    } else if (!usedGlobalSeasonPlayers) {
-      // --- Fixture-date mode: pull players only for the clubs playing that day ---
-      for (const teamIdStr of teamMeta.keys()) {
-        let page = 1;
-        if(written >= maxPlayers) break;
-        let totalPages = 1;
-
-        while (page <= totalPages && page <= maxPagesPerTeam && written < maxPlayers) {
-          const res = await apiFootballGet("players", { team: teamIdStr, season, page }, apiKey);
-          totalPages = Number(res?.paging?.total ?? 1) || 1;
-          pagesFetched += 1;
-
-          const items = Array.isArray(res?.response) ? res.response : [];
-          for (const it of items) {
-            if(written >= maxPlayers) break;
-            await upsertPlayerFromApiItem(it, teamIdStr);
-          }
-
-          page += 1;
-        }
-      }
+      fetchedPlayerDocs.push(...fetchResult.players);
+      written = fetchResult.written;
+      pagesFetched = fetchResult.pagesFetched;
+      hitCap = fetchResult.hitCap;
     }
 
     if (!usedGlobalSeasonPlayers && fetchedPlayerDocs.length > 0) {
@@ -559,11 +650,20 @@ exports.seedPlayersFromCompetition = onCall(
     // Fixture-date seeding remains room-local fallback so we never create
     // an incomplete master season pool from a slate-specific request.
     if (!usedGlobalSeasonPlayers && seasonKey && !fixtureDate && fetchedPlayerDocs.length > 0) {
-      await bootstrapSeasonPlayerPool({
-        db,
-        seasonKey,
-        players: fetchedPlayerDocs,
-      });
+      try {
+        globalBootstrapWritten = await bootstrapSeasonPlayerPool({
+          db,
+          seasonKey,
+          players: fetchedPlayerDocs,
+        });
+      } catch (e) {
+        globalBootstrapError = String(e?.message || e);
+        console.warn("[seedPlayersFromCompetition] Global bootstrap failed but room seed succeeded", {
+          roomId,
+          seasonKey,
+          error: globalBootstrapError,
+        });
+      }
     }
 
     // Only RegularSeason needs competitionMeta.totalRounds
@@ -577,33 +677,146 @@ exports.seedPlayersFromCompetition = onCall(
         seedFilter: fixtureDate ? { fixtureDate } : admin.firestore.FieldValue.delete(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         ...roomSeasonFieldUpdates,
-
-        competitionState: {
-          phaseLabel: phaseLabel,
-          currentLabel: roundLabel,
-          isDone: false,
-          weekStatus: "scheduled",
-        }
-        
+        competitionLocked: true,
+        status: "ready_to_draft",
+        playerCount: written,
       },
       { merge: true }
+    );
+
+    await setCompetitionState(
+      roomRef,
+      {
+        phaseLabel,
+        currentLabel: roundLabel,
+        isDone: false,
+        weekStatus: "scheduled",
+      },
+      {
+        roomData: room,
+      }
     );
 
     return {
       ok: true,
       league,
       season,
+      seasonKey,
       fixtureDate,
       timezone,
       pagesFetched,
       written,
       maxPlayers,
-      hitCap: written >= maxPlayers,
+      hitCap: hitCap || written >= maxPlayers,
       teamCount: fixtureDate ? teamMeta.size : null,
+      globalPlayerPoolEnabled,
+      usedGlobalSeasonPlayers,
+      source: usedGlobalSeasonPlayers ? "global-season-player-pool" : "api-football",
+      globalBootstrapWritten,
+      globalBootstrapError,
 
       // helpful for debugging in the client
       phaseLabel,
       roundLabel,
+    };
+  }
+);
+
+exports.bootstrapGlobalSeasonPlayerPool = onCall(
+  { region: "us-west2", secrets: [APIFOOTBALL_KEY], timeoutSeconds: 540, memory: "1GiB" },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) throw new HttpsError("unauthenticated", "Sign in required.");
+
+    const league = Number(request.data?.league);
+    const season = Number(request.data?.season);
+    const timezone = String(request.data?.timezone ?? "America/Los_Angeles");
+    const maxPlayers = Math.max(1, Math.min(1500, Number(request.data?.maxPlayers ?? 1500)));
+    const maxPages = Math.max(1, Math.min(250, Number(request.data?.maxPages ?? 200)));
+
+    if (!Number.isFinite(league) || !Number.isFinite(season)) {
+      throw new HttpsError("invalid-argument", "league and season are required.");
+    }
+
+    const seasonContext = deriveSeasonContext({
+      roomCompetitionName: request.data?.competitionName || null,
+      league,
+      season,
+      seasonKey: request.data?.seasonKey,
+      competitionKey: request.data?.competitionKey,
+      competitionType: request.data?.competitionType,
+      seasonLabel: request.data?.seasonLabel,
+    });
+
+    if (!seasonContext?.seasonKey) {
+      throw new HttpsError("invalid-argument", "Could not derive seasonKey.");
+    }
+
+    const apiKey = APIFOOTBALL_KEY.value();
+    const fetchResult = await fetchCompetitionPlayerPoolFromApi({
+      apiKey,
+      league,
+      season,
+      maxPlayers,
+      maxPages,
+    });
+
+    const written = await bootstrapSeasonPlayerPool({
+      db,
+      seasonKey: seasonContext.seasonKey,
+      players: fetchResult.players,
+    });
+
+    return {
+      ok: true,
+      seasonKey: seasonContext.seasonKey,
+      competitionKey: seasonContext.competitionKey || "",
+      competitionType: seasonContext.competitionType || "",
+      timezone,
+      written,
+      pagesFetched: fetchResult.pagesFetched,
+      hitCap: fetchResult.hitCap,
+    };
+  }
+);
+
+exports.setRoomGlobalPipelineMode = onCall(
+  { region: "us-west2" },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) throw new HttpsError("unauthenticated", "Sign in required.");
+
+    const roomId = String(request.data?.roomId || "").trim();
+    const rawMode = String(request.data?.mode || "").trim().toLowerCase();
+    const mode = normalizeGlobalPipelineMode(rawMode);
+
+    if (!roomId) throw new HttpsError("invalid-argument", "roomId is required.");
+    if (!rawMode || mode !== rawMode) {
+      throw new HttpsError("invalid-argument", 'mode must be "legacy", "shadow", or "global".');
+    }
+
+    const roomRef = db.doc(`rooms/${roomId}`);
+    const roomSnap = await roomRef.get();
+    if (!roomSnap.exists) throw new HttpsError("not-found", "Room not found.");
+
+    const room = roomSnap.data() || {};
+    if (!isHost(room, uid)) throw new HttpsError("permission-denied", "Host only.");
+
+    const pipeline = buildDefaultGlobalPipeline(mode);
+
+    await roomRef.set(
+      {
+        globalPipeline: pipeline,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    return {
+      ok: true,
+      roomId,
+      mode: getGlobalPipelineMode({ globalPipeline: pipeline }),
+      globalPipeline: pipeline,
     };
   }
 );
@@ -1494,6 +1707,152 @@ async function ensureDefaultLineupsForRoom(roomId, memberUids) {
   return { writes };
 }
 
+exports.saveLineupSubstitution = onCall(
+  { region: "us-west2" },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) throw new HttpsError("unauthenticated", "Sign in required.");
+
+    const roomId = String(request.data?.roomId || "").trim();
+    const starterOutId = String(request.data?.starterOutId || "").trim();
+    const benchInId = String(request.data?.benchInId || "").trim();
+    const targetUid = String(request.data?.targetUid || uid).trim() || uid;
+
+    if (!roomId || !starterOutId || !benchInId) {
+      throw new HttpsError(
+        "invalid-argument",
+        "roomId, starterOutId, and benchInId are required."
+      );
+    }
+
+    const roomRef = db.doc(`rooms/${roomId}`);
+    const roomSnap = await roomRef.get();
+    if (!roomSnap.exists) throw new HttpsError("not-found", "Room not found.");
+
+    const room = roomSnap.data() || {};
+    if (uid !== targetUid && !isHost(room, uid)) {
+      throw new HttpsError("permission-denied", "Not allowed to edit this lineup.");
+    }
+
+    const lineupRef = db.doc(`rooms/${roomId}/lineups/${targetUid}`);
+    let lineupSnap = await lineupRef.get();
+
+    if (!lineupSnap.exists) {
+      await ensureDefaultLineupsForRoom(roomId, [targetUid]);
+      lineupSnap = await lineupRef.get();
+    }
+
+    const lineup = lineupSnap.exists ? (lineupSnap.data() || {}) : {};
+    const starters = Array.isArray(lineup?.starters)
+      ? lineup.starters.map((id) => String(id))
+      : [];
+    const bench = Array.isArray(lineup?.bench)
+      ? lineup.bench.map((id) => String(id))
+      : [];
+    const startingXI = Array.isArray(lineup?.startingXI) ? lineup.startingXI : null;
+    const benchXI = Array.isArray(lineup?.benchXI) ? lineup.benchXI : null;
+
+    if (!starters.includes(starterOutId)) {
+      throw new HttpsError("failed-precondition", "starterOutId is not in starters.");
+    }
+
+    if (!bench.includes(benchInId)) {
+      throw new HttpsError("failed-precondition", "benchInId is not in bench.");
+    }
+
+    const nextStarters = starters.map((id) =>
+      id === starterOutId ? benchInId : id
+    );
+    const nextBench = bench.map((id) =>
+      id === benchInId ? starterOutId : id
+    );
+    const entryIdOf = (entry) => {
+      if (entry == null) return "";
+      if (typeof entry === "string") return String(entry);
+      return String(
+        entry.id ??
+        entry.playerId ??
+        entry.apiPlayerId ??
+        entry.name ??
+        ""
+      );
+    };
+    let nextStartingXI = startingXI;
+    let nextBenchXI = benchXI;
+
+    if (Array.isArray(startingXI) && Array.isArray(benchXI)) {
+      const starterOutEntry = startingXI.find(
+        (entry) => entryIdOf(entry) === starterOutId
+      );
+      const benchInEntry = benchXI.find(
+        (entry) => entryIdOf(entry) === benchInId
+      );
+
+      if (starterOutEntry && benchInEntry) {
+        nextStartingXI = startingXI.map((entry) =>
+          entryIdOf(entry) === starterOutId ? benchInEntry : entry
+        );
+        nextBenchXI = benchXI.map((entry) =>
+          entryIdOf(entry) === benchInId ? starterOutEntry : entry
+        );
+      }
+    }
+    const nowMs = Date.now();
+
+    const lineupPatch = {
+      uid: targetUid,
+      starters: nextStarters,
+      bench: nextBench,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAtMs: nowMs,
+      updatedBy: uid,
+    };
+
+    if (Array.isArray(nextStartingXI)) {
+      lineupPatch.startingXI = nextStartingXI;
+    }
+
+    if (Array.isArray(nextBenchXI)) {
+      lineupPatch.benchXI = nextBenchXI;
+    }
+
+    await lineupRef.set(lineupPatch, { merge: true });
+
+    return {
+      ok: true,
+      starters: nextStarters,
+      bench: nextBench,
+    };
+  }
+);
+
+exports.repairDefaultLineupsForRoom = onCall(
+  { region: "us-west2" },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) throw new HttpsError("unauthenticated", "Sign in required.");
+
+    const roomId = String(request.data?.roomId || "").trim();
+    if (!roomId) throw new HttpsError("invalid-argument", "roomId is required.");
+
+    const roomRef = db.doc(`rooms/${roomId}`);
+    const roomSnap = await roomRef.get();
+    if (!roomSnap.exists) throw new HttpsError("not-found", "Room not found.");
+
+    const room = roomSnap.data() || {};
+    if (!isHost(room, uid)) throw new HttpsError("permission-denied", "Host only.");
+
+    const membersSnap = await db.collection(`rooms/${roomId}/members`).get();
+    const memberUids = membersSnap.docs.map((d) => d.id).filter(Boolean);
+
+    const result = await ensureDefaultLineupsForRoom(roomId, memberUids);
+    return {
+      ok: true,
+      writes: Number(result?.writes || 0),
+    };
+  }
+);
+
 exports.createNextWeek = onCall(
   { region: "us-west2", secrets: [APIFOOTBALL_KEY] },
   async (request) => {
@@ -1568,8 +1927,39 @@ exports.createNextWeek = onCall(
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     };
 
+    const nowMs = Date.now();
+
     await db.doc(`rooms/${roomId}/weeks/${String(weekIndex)}`).set(weekDoc, { merge: true });
-    await roomRef.set({ currentWeekIndex: weekIndex, competition }, { merge: true });
+    const pollInfo = getNextPollAtMsFromFixtures(window.fixtures, nowMs);
+
+    await roomRef.set(
+      {
+        currentWeekIndex: weekIndex,
+        competition,
+      },
+      { merge: true }
+    );
+
+    await setCompetitionState(
+      roomRef,
+      {
+        weekStatus: "scheduled",
+        nextPollAtMs: pollInfo.nextPollAtMs,
+        nextKickoffMs: pollInfo.nextKickoffMs,
+      },
+      {
+        roomData: room,
+        nowMs,
+      }
+    );
+
+    await upsertTournamentPollTask({
+      roomId,
+      phase: "RegularSeason",
+      nextPollAtMs: pollInfo.nextPollAtMs,
+      reason: "week-created",
+      nowMs,
+    });
 
     return { ok: true, weekIndex, ...window };
   }
@@ -1830,16 +2220,30 @@ function buildPlayerStatsMapFromFixturePlayersResponse(responseArr, fixtureMeta)
       // raw from API (mostly only useful for GK)
       const rawConceded = toNum(st?.goals?.conceded);
 
-      // fixture-based conceded (correct for DEF/MID too)
+      // fixture-based score/conceded
       let teamConceded = rawConceded;
+      let teamScore = null;
+      let opponentScore = null;
+
       const homeTeamId = fixtureMeta?.homeTeamId ?? null;
       const awayTeamId = fixtureMeta?.awayTeamId ?? null;
       const goalsHome = toNum(fixtureMeta?.goalsHome);
       const goalsAway = toNum(fixtureMeta?.goalsAway);
 
-      if (teamId && homeTeamId && awayTeamId) {
-        if (teamId === homeTeamId) teamConceded = goalsAway;
-        else if (teamId === awayTeamId) teamConceded = goalsHome;
+      const teamIdStr = teamId != null ? String(teamId) : "";
+      const homeTeamIdStr = homeTeamId != null ? String(homeTeamId) : "";
+      const awayTeamIdStr = awayTeamId != null ? String(awayTeamId) : "";
+
+      if (teamIdStr && homeTeamIdStr && awayTeamIdStr) {
+        if (teamIdStr === homeTeamIdStr) {
+          teamConceded = goalsAway;
+          teamScore = goalsHome;
+          opponentScore = goalsAway;
+        } else if (teamIdStr === awayTeamIdStr) {
+          teamConceded = goalsHome;
+          teamScore = goalsAway;
+          opponentScore = goalsHome;
+        }
       }
 
       // Use teamConceded for clean sheet + conceded scoring
@@ -1852,9 +2256,23 @@ function buildPlayerStatsMapFromFixturePlayersResponse(responseArr, fixtureMeta)
         teamId: teamId ? String(teamId) : "",
         teamName,
         opponentName,
+
+        teamScore,
+        opponentScore,
+        teamGoals: teamScore,
+        opponentGoals: opponentScore,
+        fixtureStatus: fixtureMeta?.fixtureStatus || fixtureMeta?.statusShort || null,
+        matchStatus: fixtureMeta?.statusShort || fixtureMeta?.fixtureStatus || null,
+        statusShort: fixtureMeta?.statusShort || fixtureMeta?.fixtureStatus || null,
+        statusLong: fixtureMeta?.statusLong || null,
+        elapsed: fixtureMeta?.elapsed ?? null,
+        extra: fixtureMeta?.extra ?? null,
+        statusUpdatedAtMs: fixtureMeta?.statusUpdatedAtMs ?? null,
+        kickoffMs: fixtureMeta?.kickoffMs ?? null,
         minutes, 
         goals, 
         assists, 
+
         passesCompleted,
         saves,
         goalsConceded,
@@ -1891,6 +2309,15 @@ async function getFixturePlayersStatsMapCached({ fixtureId, apiKey, ttlMs, timeZ
     awayTeamId: metaDoc.awayTeamId ?? null,
     goalsHome: toNum(metaDoc.goalsHome),
     goalsAway: toNum(metaDoc.goalsAway),
+
+    // Timer/status info for Cup + Regular player stat cards
+    statusShort: metaDoc.short || metaDoc.statusShort || null,
+    fixtureStatus: metaDoc.short || metaDoc.statusShort || null,
+    statusLong: metaDoc.statusLong || null,
+    elapsed: Number.isFinite(Number(metaDoc.elapsed)) ? Number(metaDoc.elapsed) : null,
+    extra: Number.isFinite(Number(metaDoc.extra)) ? Number(metaDoc.extra) : null,
+    statusUpdatedAtMs: Number.isFinite(Number(metaDoc.updatedAtMs)) ? Number(metaDoc.updatedAtMs) : null,
+    kickoffMs: Number.isFinite(Number(metaDoc.kickoffMs)) ? Number(metaDoc.kickoffMs) : null,
   };
 
   try {
@@ -2032,9 +2459,12 @@ async function getFixtureStatusMap({ fixtureIds, timezone, apiKey }) {
       const awayTeamLogo = f?.teams?.away?.logo || "";
       const goalsHome = toNum(f?.goals?.home);
       const goalsAway = toNum(f?.goals?.away);
+
       const statusLong = f?.fixture?.status?.long ?? null;
       const elapsed = toNum(f?.fixture?.status?.elapsed);
+      const extra = toNum(f?.fixture?.status?.extra);
       const leagueId = f?.league?.id ?? null;
+
       const leagueName = f?.league?.name || "";
       const leagueRound = f?.league?.round || null;
 
@@ -2048,6 +2478,7 @@ async function getFixtureStatusMap({ fixtureIds, timezone, apiKey }) {
             short,
             statusLong,
             elapsed,
+            extra,
             kickoffMs: Number.isFinite(kickoffMs) ? kickoffMs : null,
             updatedAtMs: now,
             homeTeamId,
@@ -2091,13 +2522,7 @@ function hasFixtureStarted(short) {
 }
 
 function getRoomPhaseLabel(room) {
-  return (
-    room?.competitionState?.phaseLabel ??
-    room?.["competitionState.phaseLabel"] ??
-    room?.competitionState?.phaseLable ??
-    room?.["competitionState.phaseLable"] ??
-    null
-  );
+  return getCompetitionState(room)?.phaseLabel ?? null;
 }
 
 function extractFixtureIdsFromWeekDoc(week) {
@@ -2133,6 +2558,912 @@ async function loadFixtureStatusDetailsMap(fixtureIds = []) {
   return out;
 }
 
+function deriveRoomSeasonContext(room = {}) {
+  const competition = room?.competition || {};
+  const league = Number(competition?.league);
+  const season = Number(competition?.season);
+
+  return deriveSeasonContext({
+    roomSeasonKey: room?.seasonKey,
+    roomCompetitionKey: room?.competitionKey,
+    roomCompetitionType: room?.competitionType,
+    roomCompetitionName:
+      room?.competitionMeta?.name ||
+      room?.competition?.name ||
+      null,
+    league,
+    season,
+    phaseLabel: getRoomPhaseLabel(room),
+  });
+}
+
+async function loadGlobalLiveFixturesForSeason({ db, seasonKey, fixtureIds }) {
+  const ids = [...new Set((fixtureIds || []).map((id) => String(id || "").trim()).filter(Boolean))];
+  if (!db || !seasonKey || !ids.length) {
+    return { liveFixturesById: {}, missingFixtureIds: ids };
+  }
+
+  const refs = ids.map((fixtureId) => getSeasonLiveFixtureRef(db, seasonKey, fixtureId));
+  const snaps = await db.getAll(...refs);
+  const liveFixturesById = {};
+  const missingFixtureIds = [];
+
+  for (let i = 0; i < snaps.length; i += 1) {
+    const snap = snaps[i];
+    const fixtureId = ids[i];
+
+    if (!snap.exists) {
+      missingFixtureIds.push(fixtureId);
+      continue;
+    }
+
+    liveFixturesById[fixtureId] = {
+      ...(snap.data() || {}),
+      fixtureId,
+    };
+  }
+
+  return { liveFixturesById, missingFixtureIds };
+}
+
+async function loadGlobalFixtureSummariesForSeason({ db, seasonKey, fixtureIds }) {
+  const ids = [...new Set((fixtureIds || []).map((id) => String(id || "").trim()).filter(Boolean))];
+  if (!db || !seasonKey || !ids.length) return {};
+
+  const refs = ids.map((fixtureId) => getSeasonFixtureSummaryRef(db, seasonKey, fixtureId));
+  const snaps = await db.getAll(...refs);
+  const summariesById = {};
+
+  for (let i = 0; i < snaps.length; i += 1) {
+    const snap = snaps[i];
+    if (!snap.exists) continue;
+    const fixtureId = ids[i];
+    summariesById[fixtureId] = {
+      ...(snap.data() || {}),
+      fixtureId,
+    };
+  }
+
+  return summariesById;
+}
+
+async function loadRoomUsersLineupsForGlobalAggregation({ db, roomId }) {
+  function inferOwnerUid(d) {
+    const v =
+      d?.ownerUid ?? d?.ownerId ?? d?.ownedBy ?? d?.managerUid ??
+      d?.userId ?? d?.uid ?? d?.pickedByUid ?? d?.pickedBy ??
+      d?.owner?.uid ?? d?.owner?.id;
+
+    if (!v) return null;
+    if (typeof v === "string") return v;
+    if (typeof v === "object") return v.uid || v.id || null;
+    return null;
+  }
+
+  const [membersSnap, lineupsSnap, picksSnap, playersSnap] = await Promise.all([
+    db.collection(`rooms/${roomId}/members`).get(),
+    db.collection(`rooms/${roomId}/lineups`).get(),
+    db.collection(`rooms/${roomId}/picks`).get(),
+    db.collection(`rooms/${roomId}/players`).get(),
+  ]);
+
+  const membersByUid = new Map();
+  membersSnap.forEach((doc) => {
+    const data = doc.data() || {};
+    const uid = String(doc.id || data.uid || "").trim();
+    if (!uid) return;
+    membersByUid.set(uid, {
+      uid,
+      displayName: String(data.displayName || data.name || uid),
+    });
+  });
+
+  const playersById = new Map();
+  playersSnap.forEach((doc) => {
+    const d = doc.data() || {};
+    const pid = String(d.id ?? d.playerId ?? doc.id);
+    if (!pid) return;
+
+    playersById.set(pid, {
+      id: pid,
+      name: d.name || d.playerName || "Unknown",
+      position: toPos(d.position || d.pos || d.role),
+      teamName: d.teamName || "",
+      nationality: d.nationality || "",
+      teamLogo: d.teamLogo || "",
+    });
+  });
+
+  const pickDocToPlayer = new Map();
+  const rosterByUid = {};
+
+  picksSnap.forEach((doc) => {
+    const d = doc.data() || {};
+    const owner = inferOwnerUid(d);
+    const pid = String(d.playerId ?? d.pid ?? d.apiPlayerId ?? d.player?.id ?? d.player?.playerId ?? "");
+    if (!owner || !pid) return;
+
+    const player = {
+      id: pid,
+      name: d.playerName || d.name || playersById.get(pid)?.name || "Unknown",
+      position: toPos(d.position || d.pos || d.role || playersById.get(pid)?.position || ""),
+      teamName: d.teamName || playersById.get(pid)?.teamName || "",
+      nationality: d.nationality || playersById.get(pid)?.nationality || "",
+      teamLogo: d.teamLogo || playersById.get(pid)?.teamLogo || "",
+    };
+
+    if (!playersById.has(pid)) {
+      playersById.set(pid, player);
+    }
+
+    (rosterByUid[String(owner)] ||= []).push(player);
+    pickDocToPlayer.set(doc.id, player);
+  });
+
+  const lineupsByUid = new Map();
+  lineupsSnap.forEach((doc) => lineupsByUid.set(String(doc.id), doc.data() || {}));
+
+  const memberUids = Array.from(
+    new Set([
+      ...membersByUid.keys(),
+      ...lineupsByUid.keys(),
+      ...Object.keys(rosterByUid),
+    ])
+  ).filter(Boolean).sort();
+
+  const users = [];
+
+  for (const uid of memberUids) {
+    const lineup = lineupsByUid.get(uid) || null;
+
+    const resolveLineupEntry = (entry) => {
+      const raw = String(entry?.id ?? entry?.playerId ?? entry ?? "");
+      if (!raw) return null;
+
+      const fromPick = pickDocToPlayer.get(raw) || null;
+      const pid = String(fromPick?.id ?? raw);
+      const known = playersById.get(pid) || fromPick || null;
+
+      return {
+        id: pid,
+        name:
+          known?.name ||
+          entry?.name ||
+          entry?.fullName ||
+          entry?.displayName ||
+          "Unknown",
+        position: toPos(known?.position || entry?.position || entry?.pos || entry?.role || ""),
+        teamName: known?.teamName || "",
+        nationality: known?.nationality || "",
+        teamLogo: known?.teamLogo || "",
+      };
+    };
+
+    const starters = extractStarters(lineup).map(resolveLineupEntry).filter(Boolean);
+    let bench = extractBench(lineup).map(resolveLineupEntry).filter(Boolean);
+
+    if (!bench.length) {
+      const roster = rosterByUid[String(uid)] || [];
+      const starterSet = new Set(starters.map((p) => String(p.id)));
+      bench = roster.filter((p) => p?.id && !starterSet.has(String(p.id)));
+    } else {
+      const starterSet = new Set(starters.map((p) => String(p.id)));
+      bench = bench.filter((p) => p?.id && !starterSet.has(String(p.id)));
+    }
+
+    users.push({
+      uid,
+      displayName: membersByUid.get(uid)?.displayName || uid,
+      starters,
+      bench,
+    });
+  }
+
+  return users;
+}
+
+function mergeShadowAccumulatorValue(existingValue, incomingValue) {
+  if (incomingValue == null) return existingValue;
+
+  if (typeof incomingValue === "number" && Number.isFinite(incomingValue)) {
+    const current = typeof existingValue === "number" && Number.isFinite(existingValue)
+      ? existingValue
+      : 0;
+    return current + incomingValue;
+  }
+
+  if (typeof incomingValue === "boolean") {
+    return Boolean(existingValue) || incomingValue;
+  }
+
+  if (Array.isArray(incomingValue)) {
+    return Array.isArray(existingValue) && existingValue.length > 0
+      ? existingValue
+      : incomingValue.slice();
+  }
+
+  if (incomingValue && typeof incomingValue === "object") {
+    const out = existingValue && typeof existingValue === "object" && !Array.isArray(existingValue)
+      ? { ...existingValue }
+      : {};
+
+    for (const [key, value] of Object.entries(incomingValue)) {
+      out[key] = mergeShadowAccumulatorValue(out[key], value);
+    }
+    return out;
+  }
+
+  return existingValue == null || existingValue === "" ? incomingValue : existingValue;
+}
+
+function buildAggregatedGlobalFantasyByPlayerId(liveFixturesById = {}) {
+  const aggregated = {};
+
+  for (const fixture of Object.values(liveFixturesById || {})) {
+    const fantasyByPlayerId =
+      fixture?.fantasyByPlayerId && typeof fixture.fantasyByPlayerId === "object"
+        ? fixture.fantasyByPlayerId
+        : {};
+    const rawStatsByPlayerId =
+      fixture?.rawStatsByPlayerId && typeof fixture.rawStatsByPlayerId === "object"
+        ? fixture.rawStatsByPlayerId
+        : {};
+
+    for (const [rawPlayerId, fantasy] of Object.entries(fantasyByPlayerId)) {
+      const playerId = String(rawPlayerId || "").trim();
+      if (!playerId) continue;
+
+      const current = aggregated[playerId] || {
+        id: playerId,
+        points: 0,
+        breakdown: {},
+        stats: {},
+        position: "",
+        teamName: "",
+        opponentName: "",
+      };
+
+      current.points += Number(fantasy?.points || 0);
+      current.breakdown = mergeShadowAccumulatorValue(current.breakdown, fantasy?.breakdown || {});
+      current.stats = mergeShadowAccumulatorValue(
+        current.stats,
+        fantasy?.stats || rawStatsByPlayerId[playerId] || {}
+      );
+      current.position = current.position || toPos(fantasy?.position || "");
+      current.teamName = current.teamName || fantasy?.teamName || "";
+      current.opponentName = current.opponentName || fantasy?.opponentName || "";
+
+      aggregated[playerId] = current;
+    }
+  }
+
+  return aggregated;
+}
+
+function mergeGlobalRawPlayerStats(prev = {}, next = {}, fixtureId = "") {
+  const out = { ...(prev || {}) };
+
+  const sumKeys = [
+    "minutes",
+    "goals",
+    "assists",
+    "passesCompleted",
+    "saves",
+    "goalsConceded",
+    "yellow",
+    "red",
+    "pensSaved",
+    "pensMissed",
+    "pensCommitted",
+    "ownGoals",
+    "tackles",
+    "duelsWon",
+    "dribblesSuccess",
+    "foulsCommitted",
+    "offsides",
+    "shotsOnTarget",
+  ];
+
+  for (const key of sumKeys) {
+    out[key] = toNum(out[key]) + toNum(next?.[key]);
+  }
+
+  out.cleanSheet = Boolean(out.cleanSheet) || Boolean(next?.cleanSheet);
+  out.rating = Math.max(toNum(out.rating), toNum(next?.rating));
+
+  const preferNextKeys = [
+    "teamId",
+    "teamName",
+    "opponentName",
+    "teamScore",
+    "opponentScore",
+    "teamGoals",
+    "opponentGoals",
+    "fixtureStatus",
+    "matchStatus",
+    "statusShort",
+    "statusLong",
+    "kickoffMs",
+    "elapsed",
+    "extra",
+    "statusUpdatedAtMs",
+  ];
+
+  for (const key of preferNextKeys) {
+    if (next?.[key] !== undefined && next?.[key] !== null && next?.[key] !== "") {
+      out[key] = next[key];
+    } else if (out[key] === undefined) {
+      out[key] = null;
+    }
+  }
+
+  // Keep API position for debugging only.
+  // Room/fantasy position will be used later when scoring.
+  out.position = out.position || next?.position || "";
+
+  const ids = new Set(Array.isArray(out.fixtureIds) ? out.fixtureIds.map(String) : []);
+  const fid = String(fixtureId || next?.fixtureId || "").trim();
+  if (fid) ids.add(fid);
+  out.fixtureIds = Array.from(ids);
+  out.fixtureId = out.fixtureId || fid || null;
+
+  return out;
+}
+
+function buildAggregatedGlobalRawStatsByPlayerId(liveFixturesById = {}) {
+  const aggregated = {};
+
+  for (const fixture of Object.values(liveFixturesById || {})) {
+    const fixtureId = String(fixture?.fixtureId || "").trim();
+
+    const rawStatsByPlayerId =
+      fixture?.rawStatsByPlayerId && typeof fixture.rawStatsByPlayerId === "object"
+        ? fixture.rawStatsByPlayerId
+        : {};
+
+    for (const [rawPlayerId, stats] of Object.entries(rawStatsByPlayerId)) {
+      const playerId = String(rawPlayerId || "").trim();
+      if (!playerId) continue;
+
+      const current = aggregated[playerId] || {
+        id: playerId,
+        stats: {},
+        teamName: "",
+        opponentName: "",
+        position: "",
+      };
+
+      const mergedStats = mergeGlobalRawPlayerStats(
+        current.stats || {},
+        stats || {},
+        fixtureId
+      );
+
+      aggregated[playerId] = {
+        id: playerId,
+        stats: mergedStats,
+        teamName: mergedStats.teamName || current.teamName || "",
+        opponentName: mergedStats.opponentName || current.opponentName || "",
+        position: mergedStats.position || current.position || "",
+      };
+    }
+  }
+
+  return aggregated;
+}
+
+async function computeGlobalCupShadowResults({ db, roomId, nowMs }) {
+  const roomRef = db.doc(`rooms/${roomId}`);
+  const roomSnap = await roomRef.get();
+  if (!roomSnap.exists) throw new HttpsError("not-found", "Room not found.");
+
+  const room = roomSnap.data() || {};
+  if (getRoomPhaseLabel(room) !== "Cup") {
+    throw new HttpsError("failed-precondition", "Room is not in Cup phase.");
+  }
+
+  const cupRef = roomRef.collection("cup").doc("current");
+  const cupSnap = await cupRef.get();
+  const cup = cupSnap.exists ? (cupSnap.data() || {}) : {};
+  const fixtureIds = [...new Set((Array.isArray(cup?.currentWindowFixtureIds) ? cup.currentWindowFixtureIds : [])
+    .map((id) => String(id || "").trim())
+    .filter(Boolean))];
+
+  const seasonContext = deriveRoomSeasonContext(room);
+  if (!seasonContext?.seasonKey) {
+    throw new HttpsError("failed-precondition", "Could not resolve seasonKey for room.");
+  }
+
+  const { liveFixturesById, missingFixtureIds } = await loadGlobalLiveFixturesForSeason({
+    db,
+    seasonKey: seasonContext.seasonKey,
+    fixtureIds,
+  });
+
+  const users = await loadRoomUsersLineupsForGlobalAggregation({ db, roomId });
+  const globalRawStatsByPlayerId = buildAggregatedGlobalRawStatsByPlayerId(liveFixturesById);
+
+  const globalTotalsByUid = {};
+  const globalBreakdownByUserId = {};
+  const globalBenchTotalsByUid = {};
+  const missingPlayerIdsByUid = {};
+
+  for (const user of users) {
+    const uid = String(user.uid);
+    const perPlayer = {};
+    const startersOut = [];
+    const benchOut = [];
+    const missing = new Set();
+    let starterTotal = 0;
+    let benchTotal = 0;
+
+    const consumePlayer = (player, counted) => {
+      const pid = String(player?.id || "").trim();
+      if (!pid) return;
+
+      const aggregated = globalRawStatsByPlayerId[pid] || null;
+      const rawStats = aggregated?.stats || null;
+
+      // IMPORTANT:
+      // Score global raw stats using the room/fantasy player position,
+      // not API-Football's fixture position.
+      const scorePosition = toPos(
+        player?.position ||
+        aggregated?.position ||
+        rawStats?.position ||
+        "MID"
+      );
+
+      const scored = rawStats
+        ? scorePlayer(rawStats, scorePosition)
+        : { points: 0, breakdown: {} };
+
+      const entry = {
+        id: pid,
+        name: player?.name || "Unknown",
+        position: scorePosition,
+        teamName: rawStats?.teamName || aggregated?.teamName || player?.teamName || "",
+        nationality: player?.nationality || "",
+        opponentName: rawStats?.opponentName || aggregated?.opponentName || "",
+        points: Number(scored?.points ?? scored?.total ?? 0),
+        breakdown: scored?.breakdown || scored?.parts || scored?.pointsBreakdown || {},
+        stats: rawStats || { teamName: player?.teamName || "" },
+        counted,
+      };
+
+      perPlayer[pid] = entry;
+
+      if (aggregated) {
+        if (counted) starterTotal += entry.points;
+        else benchTotal += entry.points;
+      } else {
+        missing.add(pid);
+      }
+
+      if (counted) startersOut.push(entry);
+      else benchOut.push(entry);
+    };
+
+    for (const player of Array.isArray(user.starters) ? user.starters : []) {
+      consumePlayer(player, true);
+    }
+
+    for (const player of Array.isArray(user.bench) ? user.bench : []) {
+      consumePlayer(player, false);
+    }
+
+    globalTotalsByUid[uid] = starterTotal;
+    globalBenchTotalsByUid[uid] = benchTotal;
+    globalBreakdownByUserId[uid] = {
+      uid,
+      displayName: user.displayName || uid,
+      total: starterTotal,
+      benchTotal,
+      starters: startersOut,
+      bench: benchOut,
+      perPlayer,
+    };
+    missingPlayerIdsByUid[uid] = Array.from(missing);
+  }
+
+  const legacyCupTotalsByUid =
+    cup?.cupTotalsByUid && typeof cup.cupTotalsByUid === "object"
+      ? cup.cupTotalsByUid
+      : {};
+
+  const legacyProjectedTotalsByUid =
+    cup?.projectedTotalsByUid && typeof cup.projectedTotalsByUid === "object"
+      ? cup.projectedTotalsByUid
+      : {};
+
+  const legacyWindowPointsByUid =
+    cup?.windowPointsByUid && typeof cup.windowPointsByUid === "object"
+      ? cup.windowPointsByUid
+      : {};
+
+  const legacyLivePointsByUid =
+    cup?.livePointsByUid && typeof cup.livePointsByUid === "object"
+      ? cup.livePointsByUid
+      : {};
+
+  // Shadow comparison should be current window vs current window.
+  // Global reads cup.currentWindowFixtureIds, so compare it against
+  // legacy windowPointsByUid + livePointsByUid, not full Cup totals.
+  const legacyCurrentWindowTotalsByUid = {};
+  const legacyTotalUsedByUid = {};
+  const legacyCompareSourceByUid = {};
+  const diffsByUid = {};
+
+  const allUids = new Set([
+    ...Object.keys(globalTotalsByUid || {}),
+    ...Object.keys(legacyWindowPointsByUid || {}),
+    ...Object.keys(legacyLivePointsByUid || {}),
+  ]);
+
+  for (const uid of allUids) {
+    const legacyTotal =
+      Number(legacyWindowPointsByUid[uid] || 0) +
+      Number(legacyLivePointsByUid[uid] || 0);
+
+    legacyCurrentWindowTotalsByUid[uid] = legacyTotal;
+    legacyTotalUsedByUid[uid] = legacyTotal;
+    legacyCompareSourceByUid[uid] = "windowPointsByUid+livePointsByUid";
+
+    diffsByUid[uid] = Number(globalTotalsByUid[uid] || 0) - legacyTotal;
+  }
+
+  const payload = {
+    mode: "cup-shadow-aggregator",
+    source: "global-live-fixtures",
+    compareScope: "current-cup-window",
+
+    roomId,
+    seasonKey: seasonContext.seasonKey,
+    fixtureIds,
+
+    globalTotalsByUid,
+    globalBreakdownByUserId,
+    globalBenchTotalsByUid,
+
+    // Kept for debugging full Cup state
+    legacyCupTotalsByUid,
+    legacyProjectedTotalsByUid,
+
+    // Used for the actual shadow diff
+    legacyWindowPointsByUid,
+    legacyLivePointsByUid,
+    legacyCurrentWindowTotalsByUid,
+
+    diffsByUid,
+    missingFixtureIds,
+    missingPlayerIdsByUid,
+
+    updatedAtMs: nowMs,
+    updatedAt: FieldValue.serverTimestamp(),
+
+    legacyTotalUsedByUid,
+    legacyCompareSourceByUid,
+  };
+
+  await roomRef.collection("globalShadowResults").doc("cup-current").set(payload, { merge: false });
+
+  return {
+    ...payload,
+    userCount: users.length,
+  };
+}
+
+async function computeGlobalRegularShadowResults({ db, roomId, weekIndex, nowMs }) {
+  const roomRef = db.doc(`rooms/${roomId}`);
+  const roomSnap = await roomRef.get();
+  if (!roomSnap.exists) throw new HttpsError("not-found", "Room not found.");
+
+  const room = roomSnap.data() || {};
+  const phase = getRoomPhaseLabel(room);
+
+  if (phase === "Cup") {
+    throw new HttpsError("failed-precondition", "Room is Cup phase. Use Cup shadow test instead.");
+  }
+
+  const resolvedWeekIndex = Number(
+    Number.isFinite(Number(weekIndex)) && Number(weekIndex) > 0
+      ? weekIndex
+      : room?.currentWeekIndex
+  );
+
+  if (!Number.isFinite(resolvedWeekIndex) || resolvedWeekIndex <= 0) {
+    throw new HttpsError("failed-precondition", "Room does not have a currentWeekIndex.");
+  }
+
+  const weekRef = roomRef.collection("weeks").doc(String(resolvedWeekIndex));
+  const weekSnap = await weekRef.get();
+  if (!weekSnap.exists) {
+    throw new HttpsError("failed-precondition", `Week ${resolvedWeekIndex} does not exist.`);
+  }
+
+  const week = weekSnap.data() || {};
+  const fixtureIds = extractFixtureIdsFromWeekDoc(week);
+
+  const seasonContext = deriveRoomSeasonContext(room);
+  if (!seasonContext?.seasonKey) {
+    throw new HttpsError("failed-precondition", "Could not resolve seasonKey for room.");
+  }
+
+  const { liveFixturesById, missingFixtureIds } = await loadGlobalLiveFixturesForSeason({
+    db,
+    seasonKey: seasonContext.seasonKey,
+    fixtureIds,
+  });
+  const fixtureSummariesById = await loadGlobalFixtureSummariesForSeason({
+    db,
+    seasonKey: seasonContext.seasonKey,
+    fixtureIds,
+  });
+
+  const fixtureCoverage = fixtureIds.map((fixtureId) => {
+    const live = liveFixturesById[String(fixtureId)] || null;
+    const summary = fixtureSummariesById[String(fixtureId)] || null;
+    const fantasyByPlayerId =
+      live?.fantasyByPlayerId && typeof live.fantasyByPlayerId === "object"
+        ? live.fantasyByPlayerId
+        : {};
+    const rawStatsByPlayerId =
+      live?.rawStatsByPlayerId && typeof live.rawStatsByPlayerId === "object"
+        ? live.rawStatsByPlayerId
+        : {};
+
+    return {
+      fixtureId: String(fixtureId),
+      hasLivePayload: Boolean(live),
+      hasSummary: Boolean(summary),
+      statusShort: live?.statusShort || summary?.short || summary?.statusShort || null,
+      statusLong: live?.statusLong || summary?.statusLong || null,
+      kickoffMs: Number(live?.kickoffMs ?? summary?.kickoffMs ?? 0) || null,
+      fantasyPlayerCount: Object.keys(fantasyByPlayerId).length,
+      rawStatsPlayerCount: Object.keys(rawStatsByPlayerId).length,
+    };
+  });
+
+  const users = await loadRoomUsersLineupsForGlobalAggregation({ db, roomId });
+  const globalRawStatsByPlayerId = buildAggregatedGlobalRawStatsByPlayerId(liveFixturesById);
+
+  const globalTotalsByUid = {};
+  const globalBenchTotalsByUid = {};
+  const globalBreakdownByUserId = {};
+  const missingPlayerIdsByUid = {};
+
+  for (const user of users) {
+    const uid = String(user.uid);
+    const perPlayer = {};
+    const startersOut = [];
+    const benchOut = [];
+    const missing = new Set();
+
+    let starterTotal = 0;
+    let benchTotal = 0;
+
+    const consumePlayer = (player, counted) => {
+      const pid = String(player?.id || "").trim();
+      if (!pid) return;
+
+      const aggregated = globalRawStatsByPlayerId[pid] || null;
+      const rawStats = aggregated?.stats || null;
+
+      // Score global raw stats using the room/fantasy player position,
+      // not API-Football's fixture position.
+      const scorePosition = toPos(
+        player?.position ||
+        aggregated?.position ||
+        rawStats?.position ||
+        "MID"
+      );
+
+      const scored = rawStats
+        ? scorePlayer(rawStats, scorePosition)
+        : { points: 0, breakdown: {} };
+
+      const entry = {
+        id: pid,
+        name: player?.name || "Unknown",
+        position: scorePosition,
+        teamName: rawStats?.teamName || aggregated?.teamName || player?.teamName || "",
+        nationality: player?.nationality || "",
+        opponentName: rawStats?.opponentName || aggregated?.opponentName || "",
+        points: Number(scored?.points ?? scored?.total ?? 0),
+        breakdown: scored?.breakdown || scored?.parts || scored?.pointsBreakdown || {},
+        stats: rawStats || { teamName: player?.teamName || "" },
+        counted,
+      };
+
+      perPlayer[pid] = entry;
+
+      if (aggregated) {
+        if (counted) starterTotal += entry.points;
+        else benchTotal += entry.points;
+      } else {
+        missing.add(pid);
+      }
+
+      if (counted) startersOut.push(entry);
+      else benchOut.push(entry);
+    };
+
+    for (const player of Array.isArray(user.starters) ? user.starters : []) {
+      consumePlayer(player, true);
+    }
+
+    for (const player of Array.isArray(user.bench) ? user.bench : []) {
+      consumePlayer(player, false);
+    }
+
+    globalTotalsByUid[uid] = starterTotal;
+    globalBenchTotalsByUid[uid] = benchTotal;
+    globalBreakdownByUserId[uid] = {
+      uid,
+      displayName: user.displayName || uid,
+      total: starterTotal,
+      benchTotal,
+      starters: startersOut,
+      bench: benchOut,
+      perPlayer,
+    };
+
+    missingPlayerIdsByUid[uid] = Array.from(missing);
+  }
+
+  const weekResultsRef = roomRef.collection("weekResults").doc(String(resolvedWeekIndex));
+  const weekResultsSnap = await weekResultsRef.get();
+  const weekResults = weekResultsSnap.exists ? (weekResultsSnap.data() || {}) : {};
+  const legacyBreakdownByUserId =
+    weekResults?.breakdownByUserId && typeof weekResults.breakdownByUserId === "object"
+      ? weekResults.breakdownByUserId
+      : {};
+
+  const legacyTotalsByUid =
+    weekResults?.teamScoresByUserId && typeof weekResults.teamScoresByUserId === "object"
+      ? weekResults.teamScoresByUserId
+      : {};
+
+  const diffsByUid = {};
+  const allUids = new Set([
+    ...Object.keys(globalTotalsByUid || {}),
+    ...Object.keys(legacyTotalsByUid || {}),
+  ]);
+
+  for (const uid of allUids) {
+    diffsByUid[uid] =
+      Number(globalTotalsByUid[uid] || 0) -
+      Number(legacyTotalsByUid[uid] || 0);
+  }
+
+  function flattenLegacyPerPlayer(legacyUserBreakdown = {}) {
+    const out = {};
+    const directCandidates = [
+      legacyUserBreakdown?.perPlayer,
+      legacyUserBreakdown?.partsByPlayerId,
+      legacyUserBreakdown?.playersById,
+    ];
+
+    for (const candidate of directCandidates) {
+      if (!candidate || typeof candidate !== "object") continue;
+      for (const [playerId, value] of Object.entries(candidate)) {
+        out[String(playerId)] = value || {};
+      }
+    }
+
+    const addList = (list) => {
+      for (const entry of Array.isArray(list) ? list : []) {
+        const pid = String(entry?.id ?? entry?.playerId ?? entry?.apiPlayerId ?? "").trim();
+        if (!pid || out[pid]) continue;
+        out[pid] = entry || {};
+      }
+    };
+
+    addList(legacyUserBreakdown?.starters);
+    addList(legacyUserBreakdown?.bench);
+
+    return out;
+  }
+
+  function hasMeaningfulStats(value) {
+    return Boolean(value && typeof value === "object" && Object.keys(value).length > 0);
+  }
+
+  const playerMismatches = [];
+  const statMismatches = [];
+
+  for (const uid of allUids) {
+    const legacyUserBreakdown = legacyBreakdownByUserId?.[uid] || {};
+    const legacyPerPlayer = flattenLegacyPerPlayer(legacyUserBreakdown);
+    const globalPerPlayer =
+      globalBreakdownByUserId?.[uid]?.perPlayer &&
+      typeof globalBreakdownByUserId[uid].perPlayer === "object"
+        ? globalBreakdownByUserId[uid].perPlayer
+        : {};
+    const playerIds = new Set([
+      ...Object.keys(legacyPerPlayer),
+      ...Object.keys(globalPerPlayer),
+    ]);
+
+    for (const playerId of playerIds) {
+      const legacyEntry = legacyPerPlayer[playerId] || {};
+      const globalEntry = globalPerPlayer[playerId] || {};
+      const legacyPoints = Number(legacyEntry.points ?? legacyEntry.total ?? legacyEntry.fantasyPoints ?? 0);
+      const globalPoints = Number(globalEntry.points ?? 0);
+      const diff = globalPoints - legacyPoints;
+      const legacyStats = legacyEntry.stats || {};
+      const globalStats = globalEntry.stats || {};
+      const legacyHasStats = hasMeaningfulStats(legacyStats);
+      const globalHasStats = hasMeaningfulStats(globalStats);
+
+      if (diff !== 0 || legacyHasStats !== globalHasStats) {
+        playerMismatches.push({
+          uid,
+          playerId,
+          name: globalEntry.name || legacyEntry.name || "Unknown",
+          legacyPoints,
+          globalPoints,
+          diff,
+          legacyBreakdown: legacyEntry.breakdown || {},
+          globalBreakdown: globalEntry.breakdown || {},
+          legacyStats,
+          globalStats,
+        });
+      }
+
+      if (legacyHasStats !== globalHasStats) {
+        statMismatches.push({
+          uid,
+          playerId,
+          name: globalEntry.name || legacyEntry.name || "Unknown",
+          legacyHasStats,
+          globalHasStats,
+        });
+      }
+    }
+  }
+
+  const payload = {
+    mode: "regular-shadow-aggregator",
+    source: "global-live-fixtures",
+    compareScope: "current-regular-week",
+
+    roomId,
+    weekIndex: resolvedWeekIndex,
+    seasonKey: seasonContext.seasonKey,
+    fixtureIds,
+
+    globalTotalsByUid,
+    globalBenchTotalsByUid,
+    globalBreakdownByUserId,
+
+    legacyTotalsByUid,
+    diffsByUid,
+    fixtureCoverage,
+    playerMismatches,
+    statMismatches,
+
+    missingFixtureIds,
+    missingPlayerIdsByUid,
+
+    weekStatus: weekResults.status || week.status || null,
+    roundLabel: week.roundLabel || null,
+
+    updatedAtMs: nowMs,
+    updatedAt: FieldValue.serverTimestamp(),
+  };
+
+  await roomRef
+    .collection("globalShadowResults")
+    .doc(`week-${resolvedWeekIndex}`)
+    .set(payload, { merge: false });
+
+  return {
+    ...payload,
+    userCount: users.length,
+  };
+}
+
 async function collectActiveSeasonFixtureTargets() {
   const roomsSnap = await db.collection("rooms")
     .where("competitionState.weekStatus", "in", ["scheduled", "live", "resolving"])
@@ -2142,6 +3473,10 @@ async function collectActiveSeasonFixtureTargets() {
     roomsSnap.docs.map(async (roomDoc) => {
       const roomId = roomDoc.id;
       const room = roomDoc.data() || {};
+      if (!isGlobalLiveFixtureCacheEnabled(room)) {
+        return null;
+      }
+
       const competition = room?.competition || {};
 
       if (competition?.provider && competition.provider !== "api-football") {
@@ -2246,17 +3581,18 @@ function buildGlobalFantasyByPlayerId(rawStatsByPlayerId = {}) {
 
   for (const [playerId, stats] of Object.entries(rawStatsByPlayerId || {})) {
     const position = toPos(stats?.position || stats?.pos || stats?.role);
+
     const playerObj = {
       id: String(playerId),
       name: stats?.name || "Unknown",
       position,
     };
 
-    const scored = scorePlayer(playerObj, stats || {}, toPos);
+    const scored = scorePlayer(stats || {}, position);
 
     fantasyByPlayerId[String(playerId)] = {
       points: Number(scored?.points ?? scored?.total ?? 0),
-      breakdown: scored?.breakdown || scored?.parts || {},
+      breakdown: scored?.breakdown || scored?.parts || scored?.pointsBreakdown || {},
       stats: stats || {},
       position,
       teamName: stats?.teamName || stats?.realTeamName || "",
@@ -2375,6 +3711,114 @@ async function pollGlobalSeasonLiveFixturesOnce({ seasonTarget, apiKey, nowMs })
     payloadCount,
   };
 }
+async function recomputeRegularSeasonStandings({ roomId, users = [] }) {
+  const resultsSnap = await db.collection(`rooms/${roomId}/weekResults`).get();
+
+  const agg = {};
+
+  function ensure(uid, name = "") {
+    const key = String(uid || "");
+    if (!key) return null;
+
+    if (!agg[key]) {
+      agg[key] = {
+        userId: key,
+        uid: key,
+        name: name || key,
+        played: 0,
+        wins: 0,
+        draws: 0,
+        losses: 0,
+        tablePoints: 0,
+        totalFantasyPoints: 0,
+      };
+    }
+
+    if (name) agg[key].name = name;
+    return agg[key];
+  }
+
+  for (const u of users || []) {
+    ensure(u.userId || u.uid, u.name || u.displayName || "");
+  }
+
+  const finalWeeks = resultsSnap.docs
+    .map((d) => {
+      const data = d.data() || {};
+      return {
+        ...data,
+        id:d.id,
+        weekIndex: Number(data.weekIndex ?? d.id),
+      };
+    })
+    .filter((w) => {
+      const status = String(w.status || "").toLowerCase();
+      const hasFinalMatchups = Array.isArray(w.matchups) && w.matchups.some((m) => {
+        const ms = String(m?.status || "").toLowerCase();
+        return ms === "final";
+      });
+
+      const hasScores = Object.values(w.teamScoresByUserId || {}).some((v) => Number(v || 0) !== 0);
+
+      return status === "final" || (hasFinalMatchups && hasScores);
+    });
+
+  for (const w of finalWeeks) {
+    const matchups = Array.isArray(w.matchups) ? w.matchups : [];
+
+    for (const m of matchups) {
+      const home = ensure(m.homeUserId);
+      const away = ensure(m.awayUserId);
+      if (!home || !away) continue;
+
+      home.played += 1;
+      away.played += 1;
+
+      const homeResult = String(m.homeResult || "").toUpperCase();
+      const awayResult = String(m.awayResult || "").toUpperCase();
+
+      const homePts = homeResult === "W" ? 3 : homeResult === "D" ? 1 : 0;
+      const awayPts = awayResult === "W" ? 3 : awayResult === "D" ? 1 : 0;
+
+      home.tablePoints += homePts;
+      away.tablePoints += awayPts;
+
+      if (homeResult === "W") home.wins += 1;
+      else if (homeResult === "D") home.draws += 1;
+      else home.losses += 1;
+
+      if (awayResult === "W") away.wins += 1;
+      else if (awayResult === "D") away.draws += 1;
+      else away.losses += 1;
+    }
+
+    for (const [uid, score] of Object.entries(w.teamScoresByUserId || {})) {
+      const row = ensure(uid);
+      if (row) row.totalFantasyPoints += Number(score || 0);
+    }
+  }
+
+  const standings = Object.values(agg).sort(
+    (a, b) =>
+      Number(b.tablePoints || 0) - Number(a.tablePoints || 0) ||
+      Number(b.totalFantasyPoints || 0) - Number(a.totalFantasyPoints || 0)
+  );
+
+  await db.doc(`rooms/${roomId}/standings/current`).set(
+    {
+      roomId,
+      source: "regular-season",
+      includesLivePoints: false,
+      finalWeekCount: finalWeeks.length,
+      standings,
+      updatedAtMs: Date.now(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+
+  return standings;
+}
 
 // ---------------- Live Week Compute (API stats) ----------------
 async function computeAndWriteLiveWeek({ roomId, weekIndex, apiKey }) {
@@ -2421,6 +3865,9 @@ async function computeAndWriteLiveWeek({ roomId, weekIndex, apiKey }) {
 
   // 1) Fetch live statuses (single API hit usually)
   const statusByFixtureId = await getFixtureStatusMap({ fixtureIds, timezone, apiKey });
+
+  // Timer/score details from apiCache/fixtureStatus_{fixtureId}
+  const fixtureStatusDetailsById = await loadFixtureStatusDetailsMap(fixtureIds);
 
   // Fill missing statuses from previous write (prevents flapping on sparse API returns)
   // We always carry forward stable statuses (NS / finished).
@@ -2613,6 +4060,11 @@ async function computeAndWriteLiveWeek({ roomId, weekIndex, apiKey }) {
     const inPlay = isInPlay(short);
     const ko = kickoffMsByFixtureId[fid] ?? null;
 
+    const fixtureDetail = fixtureStatusDetailsById[fid] || {};
+    const elapsed = Number(fixtureDetail.elapsed);
+    const extra = Number(fixtureDetail.extra);
+    const statusUpdatedAtMs = Number(fixtureDetail.updatedAtMs);
+
     const ttlMs = inPlay ? LIVE_TTL_MS : (isFinished(short) ? FINISHED_TTL_MS : LIVE_TTL_MS);
     const map = await getFixturePlayersStatsMapCached({ fixtureId: fid, apiKey, ttlMs, timeZone: timezone });
 
@@ -2638,12 +4090,24 @@ async function computeAndWriteLiveWeek({ roomId, weekIndex, apiKey }) {
 
         teamName: "",
         opponentName: "",
+        teamGoals: null,
+        opponentGoals: null,
+
         isLive: false,
         fixtureStatus: null,
+        matchStatus: null,
+        statusShort: null,
+        statusLong: null,
+        elapsed: null,
+        extra: null,
+        statusUpdatedAtMs: null,
         fixtureId: null,
         kickoffMs: null,
       };
-            
+      
+      const stTeamScore = st.teamScore ?? st.teamGoals ?? null;
+      const stOpponentScore = st.opponentScore ?? st.opponentGoals ?? null;
+
       aggStatsByPlayerId[pid] = {
         minutes: prev.minutes + (st.minutes || 0),
         goals: prev.goals + (st.goals || 0),
@@ -2675,8 +4139,24 @@ async function computeAndWriteLiveWeek({ roomId, weekIndex, apiKey }) {
         teamName: st.teamName || prev.teamName || "",
         opponentName: st.opponentName || prev.opponentName || "",
 
+        teamScore: stTeamScore ?? prev.teamScore ?? null,
+        opponentScore: stOpponentScore ?? prev.opponentScore ?? null,
+        teamGoals: stTeamScore ?? prev.teamGoals ?? null,
+        opponentGoals: stOpponentScore ?? prev.opponentGoals ?? null,
+
         isLive: Boolean(prev.isLive) || inPlay,
-        fixtureStatus: prev.fixtureStatus || short || null,
+
+        fixtureStatus: short || prev.fixtureStatus || null,
+        matchStatus: short || prev.matchStatus || null,
+        statusShort: short || prev.statusShort || null,
+        statusLong: fixtureDetail.statusLong || prev.statusLong || null,
+
+        elapsed: Number.isFinite(elapsed) ? elapsed : (prev.elapsed ?? null),
+        extra: Number.isFinite(extra) ? extra : (prev.extra ?? null),
+        statusUpdatedAtMs: Number.isFinite(statusUpdatedAtMs)
+          ? statusUpdatedAtMs
+          : (prev.statusUpdatedAtMs ?? now),
+
         fixtureId: prev.fixtureId || fid,
         kickoffMs: prev.kickoffMs || ko || null,
       };
@@ -2685,17 +4165,37 @@ async function computeAndWriteLiveWeek({ roomId, weekIndex, apiKey }) {
 
   const haveAnyStats = Object.keys(aggStatsByPlayerId).length > 0;
   if (!forceRecompute && !haveAnyStats && prevHadPoints && !anyInPlay) {
-    // Keep previous points; only update status/timing
-    await weekResultsRef.set(
-      {
-        status: statusValue,
-        nextKickoffMs: nextKickoffMs ?? null,
-        fixtureStatusById: statusByFixtureId,
-        updatedAtMs: Date.now(),
-        computedAt: admin.firestore.FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
+    const keepPatch = {
+      status: statusValue,
+      nextKickoffMs: nextKickoffMs ?? null,
+      fixtureStatusById: statusByFixtureId,
+      updatedAtMs: Date.now(),
+      computedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    if (shouldFinalize) {
+      keepPatch.status = "final";
+      keepPatch.teamScoresByUserId = prevResults.teamScoresByUserId || {};
+      keepPatch.breakdownByUserId = prevResults.breakdownByUserId || {};
+      keepPatch.matchups = prevResults.matchups || [];
+      keepPatch.weekLeaderboard = prevResults.weekLeaderboard || [];
+    }
+
+    await weekResultsRef.set(keepPatch, { merge: true });
+
+    if (shouldFinalize) {
+      await weekRef.set(
+        {
+          status: "final",
+          finalizedAt: admin.firestore.FieldValue.serverTimestamp(),
+          finalizedAtMs: Date.now(),
+        },
+        { merge: true }
+      );
+
+      await recomputeRegularSeasonStandings({ roomId, users });
+    }
+
     return;
   }
 
@@ -2892,6 +4392,8 @@ async function computeAndWriteLiveWeek({ roomId, weekIndex, apiKey }) {
       },
       { merge: true }
     );
+
+    await recomputeRegularSeasonStandings({ roomId, users });
   }
 
   // Clear force flag if it was set
@@ -2949,7 +4451,31 @@ async function autoAdvanceWeekIfFinal({ roomId, room, currentWeekIndex, apiKey }
 
   const nextExisting = indices.find((i) => i > Number(currentWeekIndex));
   if (nextExisting) {
+    const nextWeekSnap = await db.doc(`rooms/${roomId}/weeks/${String(nextExisting)}`).get();
+    const nextWeek = nextWeekSnap.exists ? (nextWeekSnap.data() || {}) : {};
+    const nextFixtures = Array.isArray(nextWeek.fixtures) ? nextWeek.fixtures : [];
+    const pollInfo = getNextPollAtMsFromFixtures(nextFixtures, nowMs);
+
     await db.doc(`rooms/${roomId}`).set({ currentWeekIndex: nextExisting }, { merge: true });
+    await setCompetitionState(
+      db.doc(`rooms/${roomId}`),
+      {
+        weekStatus: "scheduled",
+        nextPollAtMs: pollInfo.nextPollAtMs,
+        nextKickoffMs: pollInfo.nextKickoffMs,
+      },
+      {
+        roomData: room,
+        nowMs,
+      }
+    );
+    await upsertTournamentPollTask({
+      roomId,
+      phase: "RegularSeason",
+      nextPollAtMs: pollInfo.nextPollAtMs,
+      reason: "advance-existing-week",
+      nowMs,
+    });
     return nextExisting;
   }
 
@@ -2986,12 +4512,32 @@ async function autoAdvanceWeekIfFinal({ roomId, room, currentWeekIndex, apiKey }
   };
 
   await db.doc(`rooms/${roomId}/weeks/${String(nextWeekIndex)}`).set(weekDoc, { merge: true });
+  const pollInfo = getNextPollAtMsFromFixtures(window.fixtures, nowMs);
 
   // Move the room forward ✅
   await db.doc(`rooms/${roomId}`).set(
     { currentWeekIndex: nextWeekIndex, competition, advancedAtMs: nowMs },
     { merge: true }
   );
+  await setCompetitionState(
+    db.doc(`rooms/${roomId}`),
+    {
+      weekStatus: "scheduled",
+      nextPollAtMs: pollInfo.nextPollAtMs,
+      nextKickoffMs: pollInfo.nextKickoffMs,
+    },
+    {
+      roomData: room,
+      nowMs,
+    }
+  );
+  await upsertTournamentPollTask({
+    roomId,
+    phase: "RegularSeason",
+    nextPollAtMs: pollInfo.nextPollAtMs,
+    reason: "advance-created-week",
+    nowMs,
+  });
 
   // Create a weekResults doc so UI immediately has something
   await db.doc(`rooms/${roomId}/weekResults/${String(nextWeekIndex)}`).set(
@@ -3023,6 +4569,7 @@ async function autoAdvanceWeekIfFinal({ roomId, room, currentWeekIndex, apiKey }
 
 
 async function ensureCurrentWeekIfMissing({ roomId, room, apiKey }) {
+  const nowMs = Date.now();
   const currentIdx = Number(room?.currentWeekIndex);
   if (Number.isFinite(currentIdx) && currentIdx > 0) return currentIdx;
 
@@ -3066,7 +4613,27 @@ async function ensureCurrentWeekIfMissing({ roomId, room, apiKey }) {
   };
 
   await db.doc(`rooms/${roomId}/weeks/${String(weekIndex)}`).set(weekDoc, { merge: true });
+  const pollInfo = getNextPollAtMsFromFixtures(window.fixtures, nowMs);
   await db.doc(`rooms/${roomId}`).set({ currentWeekIndex: weekIndex, competition }, { merge: true });
+  await setCompetitionState(
+    db.doc(`rooms/${roomId}`),
+    {
+      weekStatus: "scheduled",
+      nextPollAtMs: pollInfo.nextPollAtMs,
+      nextKickoffMs: pollInfo.nextKickoffMs,
+    },
+    {
+      roomData: room,
+      nowMs,
+    }
+  );
+  await upsertTournamentPollTask({
+    roomId,
+    phase: "RegularSeason",
+    nextPollAtMs: pollInfo.nextPollAtMs,
+    reason: "ensure-current-week",
+    nowMs,
+  });
 
   // Create an empty weekResults doc so the UI has something immediately.
   await db.doc(`rooms/${roomId}/weekResults/${String(weekIndex)}`).set(
@@ -3324,6 +4891,87 @@ exports.debugForceUpdateWeek = onCall(
   }
 );
 
+exports.debugRecomputeRegularSeasonStandings = onCall(
+  { region: "us-west2" },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) throw new HttpsError("unauthenticated", "Sign in required.");
+
+    const roomId = String(request.data?.roomId || "").trim();
+    if (!roomId) {
+      throw new HttpsError("invalid-argument", "roomId is required.");
+    }
+
+    const roomRef = db.doc(`rooms/${roomId}`);
+    const roomSnap = await roomRef.get();
+    if (!roomSnap.exists) {
+      throw new HttpsError("not-found", "Room not found.");
+    }
+
+    const room = roomSnap.data() || {};
+    if (!isHost(room, uid)) {
+      throw new HttpsError("permission-denied", "Host only.");
+    }
+
+    const phase = getRoomPhaseLabel(room);
+    if (phase === "Cup") {
+      throw new HttpsError(
+        "failed-precondition",
+        "This repair is only for regular season rooms."
+      );
+    }
+
+    const memberUids = await getRoomMemberUids(roomRef, room);
+
+    const users = [];
+
+    for (const mUid of memberUids.sort()) {
+      const [userSnap, memberSnap, teamNameSnap] = await Promise.all([
+        db.doc(`users/${mUid}`).get(),
+        db.doc(`rooms/${roomId}/members/${mUid}`).get(),
+        db.doc(`rooms/${roomId}/teamNames/${mUid}`).get(),
+      ]);
+
+      const profile = userSnap.exists ? userSnap.data() || {} : {};
+      const member = memberSnap.exists ? memberSnap.data() || {} : {};
+      const teamNameDoc = teamNameSnap.exists ? teamNameSnap.data() || {} : {};
+
+      const displayName = String(
+        profile.displayName ||
+          profile.name ||
+          member.displayName ||
+          member.name ||
+          mUid
+      ).trim();
+
+      const teamName = String(teamNameDoc.teamName || member.teamName || "").trim();
+
+      users.push({
+        userId: String(mUid),
+        uid: String(mUid),
+        displayName,
+        name: teamName ? `${displayName} — ${teamName}` : displayName,
+      });
+    }
+
+    const standings = await recomputeRegularSeasonStandings({
+      roomId,
+      users,
+    });
+
+    const standingsSnap = await db.doc(`rooms/${roomId}/standings/current`).get();
+
+    return {
+      ok: true,
+      roomId,
+      userCount: users.length,
+      standingsCount: standings.length,
+      standingsDoc: standingsSnap.exists ? standingsSnap.data() || null : null,
+      standings,
+    };
+  }
+);
+
 exports.debugForceRunCup = onCall(
   { region: "us-west2", secrets: [APIFOOTBALL_KEY] },
   async (request) => {
@@ -3340,12 +4988,7 @@ exports.debugForceRunCup = onCall(
     const room = roomSnap.data() || {};
     if (!isHost(room, uid)) throw new HttpsError("permission-denied", "Host only.");
 
-    const phase =
-      room?.competitionState?.phaseLabel ??
-      room?.["competitionState.phaseLabel"] ??
-      room?.competitionState?.phaseLable ??
-      room?.["competitionState.phaseLable"] ??
-      null;
+    const phase = getRoomPhaseLabel(room);
 
     if (phase !== "Cup") {
       throw new HttpsError("failed-precondition", "Room is not in Cup phase.");
@@ -3354,50 +4997,65 @@ exports.debugForceRunCup = onCall(
     const apiKey = APIFOOTBALL_KEY.value();
     const nowMs = Date.now();
 
-    await roomRef.set(
+    await setCompetitionState(
+      roomRef,
       {
-        "competitionState.weekStatus": "scheduled",
-        "competitionState.updatedAtMs": nowMs,
-        "competitionState.isDone": false,
+        weekStatus: "scheduled",
+        isDone: false,
+        nextPollAtMs: null,
+        nextCupPollAtMs: null,
       },
-      { merge: true }
+      {
+        roomData: room,
+        nowMs,
+      }
     );
+
+    // Clear false Cup podium/final snapshot before re-arming.
+    await db.doc(`rooms/${roomId}/finalResults/current`).delete().catch(() => {});
 
     await db.doc(`rooms/${roomId}/cup/current`).set(
       {
         status: "scheduled",
         completed: false,
+        completedAtMs: FieldValue.delete(),
         updatedAtMs: nowMs,
         lastManualDebugAtMs: nowMs,
         lastError: FieldValue.delete(),
         lastErrorAtMs: FieldValue.delete(),
 
-        // Force the engine to re-arm the current Cup window
         currentWindowId: null,
         currentWindowLabel: null,
         currentWindowFixtureIds: [],
+        currentWindowFixtures: [],
         currentWindowStartAtMs: null,
         currentWindowEndAtMs: null,
 
+        windowPointsByUid: {},
+        creditedFixtures: {},
+        breakdownByUserId: {},
         livePointsByUid: {},
         liveBreakdownByUserId: {},
         projectedTotalsByUid: {},
         projectedIncludesLivePoints: false,
+
       },
       { merge: true }
     );
+    
     await runCupEngine({
       db,
       roomId,
       room: {
         ...room,
         competitionState: {
-          ...(room.competitionState || {}),
+          ...(getCompetitionState(room) || {}),
           weekStatus: "scheduled",
           isDone: false,
         },
       },
       nowMs,
+      forceRun: true,
       apiKey,
       apiFootballGet,
       getFixtureStatusMap,
@@ -3414,8 +5072,188 @@ exports.debugForceRunCup = onCall(
       message: "Cup sync ran successfully.",
       cup: cupSnap.exists ? cupSnap.data() : null,
       competitionState: freshRoomSnap.exists
-        ? (freshRoomSnap.data()?.competitionState || null)
+        ? getCompetitionState(freshRoomSnap.data() || {})
         : null,
+    };
+  }
+);
+
+exports.debugComputeGlobalShadowRegularRoom = onCall(
+  { region: "us-west2" },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) throw new HttpsError("unauthenticated", "Sign in required.");
+
+    const roomId = String(request.data?.roomId || "").trim();
+    const weekIndexRaw = request.data?.weekIndex;
+
+    if (!roomId) throw new HttpsError("invalid-argument", "roomId is required.");
+
+    const roomRef = db.doc(`rooms/${roomId}`);
+    const roomSnap = await roomRef.get();
+    if (!roomSnap.exists) throw new HttpsError("not-found", "Room not found.");
+
+    const room = roomSnap.data() || {};
+    if (!isHost(room, uid)) throw new HttpsError("permission-denied", "Host only.");
+
+    const phase = getRoomPhaseLabel(room);
+    if (phase === "Cup") {
+      throw new HttpsError("failed-precondition", "Room is Cup phase. Use the Cup shadow test.");
+    }
+
+    const pipelineMode = getGlobalPipelineMode(room);
+    const liveFixtureCacheEnabled =
+      isGlobalLiveFixtureCacheEnabled(room) ||
+      pipelineMode === "shadow" ||
+      pipelineMode === "global";
+
+    if (!liveFixtureCacheEnabled) {
+      throw new HttpsError(
+        "failed-precondition",
+        "Room does not have global live fixture cache enabled."
+      );
+    }
+
+    const result = await computeGlobalRegularShadowResults({
+      db,
+      roomId,
+      weekIndex: weekIndexRaw,
+      nowMs: Date.now(),
+    });
+
+    const diffValues = Object.values(result.diffsByUid || {}).map((value) =>
+      Math.abs(Number(value || 0))
+    );
+    const maxAbsDiff = diffValues.length ? Math.max(...diffValues) : 0;
+
+    return {
+      ok: true,
+      roomId,
+      weekIndex: result.weekIndex,
+      seasonKey: result.seasonKey,
+      fixtureCount: Array.isArray(result.fixtureIds) ? result.fixtureIds.length : 0,
+      missingFixtureCount: Array.isArray(result.missingFixtureIds)
+        ? result.missingFixtureIds.length
+        : 0,
+      userCount: Number(result.userCount || 0),
+      maxAbsDiff,
+      diffsByUid: result.diffsByUid || {},
+      globalTotalsByUid: result.globalTotalsByUid || {},
+      legacyTotalsByUid: result.legacyTotalsByUid || {},
+      fixtureCoverage: result.fixtureCoverage || [],
+      playerMismatches: result.playerMismatches || [],
+      statMismatches: result.statMismatches || [],
+      compareScope: "current-regular-week",
+      source: "global-live-fixtures",
+    };
+  }
+);
+
+exports.debugComputeGlobalShadowCupRoom = onCall(
+  { region: "us-west2" },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) throw new HttpsError("unauthenticated", "Sign in required.");
+
+    const roomId = String(request.data?.roomId || "").trim();
+    if (!roomId) throw new HttpsError("invalid-argument", "roomId is required.");
+
+    const roomRef = db.doc(`rooms/${roomId}`);
+    const roomSnap = await roomRef.get();
+    if (!roomSnap.exists) throw new HttpsError("not-found", "Room not found.");
+
+    const room = roomSnap.data() || {};
+    if (!isHost(room, uid)) throw new HttpsError("permission-denied", "Host only.");
+
+    const phase = getRoomPhaseLabel(room);
+    if (phase !== "Cup") {
+      throw new HttpsError("failed-precondition", "Room is not in Cup phase.");
+    }
+
+    const pipelineMode = getGlobalPipelineMode(room);
+    const liveFixtureCacheEnabled =
+      isGlobalLiveFixtureCacheEnabled(room) ||
+      pipelineMode === "shadow" ||
+      pipelineMode === "global";
+
+    if (!liveFixtureCacheEnabled) {
+      throw new HttpsError(
+        "failed-precondition",
+        "Room does not have global live fixture cache enabled."
+      );
+    }
+
+    const result = await computeGlobalCupShadowResults({
+      db,
+      roomId,
+      nowMs: Date.now(),
+    });
+
+    const diffValues = Object.values(result.diffsByUid || {}).map((value) => Math.abs(Number(value || 0)));
+    const maxAbsDiff = diffValues.length ? Math.max(...diffValues) : 0;
+
+    return {
+      ok: true,
+      roomId,
+      seasonKey: result.seasonKey,
+      fixtureCount: Array.isArray(result.fixtureIds) ? result.fixtureIds.length : 0,
+      missingFixtureCount: Array.isArray(result.missingFixtureIds) ? result.missingFixtureIds.length : 0,
+      userCount: Number(result.userCount || 0),
+      maxAbsDiff,
+      diffsByUid: result.diffsByUid || {},
+    };
+  }
+);
+
+exports.repairCompetitionStateFields = onCall(
+  { region: "us-west2" },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) throw new HttpsError("unauthenticated", "Sign in required.");
+    if (!ADMIN_UIDS.has(uid)) {
+      throw new HttpsError("permission-denied", "Admin only.");
+    }
+
+    const nowMs = Date.now();
+    const roomsSnap = await db.collection("rooms").get();
+
+    let scanned = 0;
+    let repaired = 0;
+    let deletedFlatFields = 0;
+
+    for (const roomDoc of roomsSnap.docs) {
+      scanned += 1;
+
+      const room = roomDoc.data() || {};
+      const { competitionState, badFlatKeys } = buildCompetitionStateRepairData(room, nowMs);
+      const needsRepair =
+        badFlatKeys.length > 0 ||
+        !room.competitionState ||
+        room?.competitionState?.phaseLable !== undefined;
+
+      if (!needsRepair) continue;
+
+      await roomDoc.ref.set(
+        {
+          competitionState,
+          repairedCompetitionStateAtMs: nowMs,
+          repairedCompetitionStateAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      if (badFlatKeys.length) {
+        deletedFlatFields += await deleteBadFlatCompetitionStateFields(roomDoc.ref, badFlatKeys);
+      }
+
+      repaired += 1;
+    }
+
+    return {
+      ok: true,
+      scanned,
+      repaired,
+      deletedFlatFields,
     };
   }
 );
@@ -3611,7 +5449,11 @@ exports.pollGlobalSeasonLiveFixtures = onSchedule(
   async () => {
     const apiKey = APIFOOTBALL_KEY.value();
     const nowMs = Date.now();
-    const seasonTargets = await collectActiveSeasonFixtureTargets();
+    const seasonTargets = await collectActiveSeasonFixtureTargets();            //Temp for debuging -------------------------------------------------------------
+        console.log("[pollGlobalSeasonLiveFixtures] summary", {
+      seasonTargets: seasonTargets.length,
+      nowMs,
+    });
 
     for (const seasonTarget of seasonTargets) {
       try {
@@ -3634,35 +5476,213 @@ exports.pollGlobalSeasonLiveFixtures = onSchedule(
   }
 );
 
+const TOURNAMENT_PRE_MS = 20 * 60 * 1000;          // wake 20 min before kickoff
+const TOURNAMENT_ACTIVE_POLL_MS = 60 * 1000;       // every minute during active window
+const TOURNAMENT_UNKNOWN_RECHECK_MS = 60 * 60 * 1000; // check hourly if no kickoff time
+const TOURNAMENT_POST_MS = 3 * 60 * 60 * 1000;     // keep your current 3h post-kickoff
+const TOURNAMENT_SWEEP_MS = 60 * 60 * 1000;        // hourly safety sweep
+
+function kickoffMsFromFixture(g) {
+  return Number(
+    g?.kickoffMs ??
+    g?.fixtureId?.kickoffMs ??
+    (g?.fixture?.timestamp ? g.fixture.timestamp * 1000 : NaN)
+  );
+}
+
+function getFutureKickoffs(fixtures, nowMs) {
+  return (Array.isArray(fixtures) ? fixtures : [])
+    .map(kickoffMsFromFixture)
+    .filter(Number.isFinite)
+    .filter((ms) => ms > nowMs)
+    .sort((a, b) => a - b);
+}
+
+function getNextPollAtMsFromFixtures(fixtures, nowMs) {
+  const futureKickoffs = getFutureKickoffs(fixtures, nowMs);
+  const nextKickoffMs = futureKickoffs[0] || null;
+
+  // No kickoff known yet, or API did not give times. Recheck once per hour.
+  if (!nextKickoffMs) {
+    return {
+      nextKickoffMs: null,
+      nextPollAtMs: nowMs + TOURNAMENT_UNKNOWN_RECHECK_MS,
+      reason: "no-known-kickoff",
+    };
+  }
+
+  return {
+    nextKickoffMs,
+    nextPollAtMs: Math.max(nowMs + TOURNAMENT_ACTIVE_POLL_MS, nextKickoffMs - TOURNAMENT_PRE_MS),
+    reason: "next-kickoff-minus-20min",
+  };
+}
+
+async function upsertTournamentPollTask({
+  roomId,
+  phase = "",
+  nextPollAtMs,
+  reason = "",
+  nowMs = Date.now(),
+}) {
+  if (!roomId) return;
+
+  const safeNextPollAtMs = Number.isFinite(Number(nextPollAtMs))
+    ? Number(nextPollAtMs)
+    : nowMs + TOURNAMENT_UNKNOWN_RECHECK_MS;
+
+  await db.doc(`tournamentPollQueue/${roomId}`).set(
+    {
+      roomId,
+      phase,
+      nextPollAtMs: safeNextPollAtMs,
+      reason,
+      updatedAtMs: nowMs,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+}
+
+async function deleteTournamentPollTask(roomId) {
+  if (!roomId) return;
+  await db.doc(`tournamentPollQueue/${roomId}`).delete().catch(() => {});
+}
+
+// Runs only once per hour, so old rooms/missing queue docs can self-heal.
+async function shouldRunTournamentSweep(nowMs) {
+  const sweepRef = db.doc("system/tournamentPollSweep");
+  let shouldSweep = false;
+
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(sweepRef);
+    const lastSweepAtMs = snap.exists ? Number(snap.data()?.lastSweepAtMs || 0) : 0;
+
+    if (!lastSweepAtMs || nowMs - lastSweepAtMs >= TOURNAMENT_SWEEP_MS) {
+      shouldSweep = true;
+      tx.set(
+        sweepRef,
+        {
+          lastSweepAtMs: nowMs,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+    }
+  });
+
+  return shouldSweep;
+}
+
 exports.pollLiveTournamentWeeks = onSchedule(
   { schedule: "*/1 * * * *", timeZone: "America/Los_Angeles", region: "us-west2", secrets: [APIFOOTBALL_KEY] },
   async () => {
     const apiKey = APIFOOTBALL_KEY.value();
     const nowMs = Date.now();
 
-    // Get all rooms (you can add filters later if you store an "active" flag)
-    const roomsSnap = await db.collection("rooms")
-    .where("competitionState.weekStatus", "in", ["scheduled", "live", "resolving"])
-    .get();
+    const runSweep = await shouldRunTournamentSweep(nowMs);
 
-    for (const roomDoc of roomsSnap.docs) {
+    const [
+      queueSnap,
+      activeSnap,
+      sweepSnap,
+    ] = await Promise.all([
+      // ✅ Main cheap path: only rooms whose wake time is due.
+      db.collection("tournamentPollQueue")
+        .where("nextPollAtMs", "<=", nowMs)
+        .limit(50)
+        .get(),
+
+      // ✅ Live/resolving rooms stay watched.
+      db.collection("rooms")
+        .where("competitionState.weekStatus", "in", ["live", "resolving"])
+        .get(),
+
+      // ✅ Hourly safety check for scheduled rooms without queue/missing kickoff.
+      runSweep
+        ? db.collection("rooms")
+            .where("competitionState.weekStatus", "==", "scheduled")
+            .get()
+        : Promise.resolve({ docs: [], size: 0 }),
+    ]);
+
+    const roomDocsById = new Map();
+
+    // Queue tasks: read the room doc only when its wake time is due.
+    for (const taskDoc of queueSnap.docs) {
+      const task = taskDoc.data() || {};
+      const roomId = String(task.roomId || taskDoc.id || "");
+      if (!roomId) continue;
+
+      const roomSnap = await db.doc(`rooms/${roomId}`).get();
+      if (!roomSnap.exists) {
+        await taskDoc.ref.delete().catch(() => {});
+        continue;
+      }
+
+      roomDocsById.set(roomId, roomSnap);
+    }
+
+    // Active rooms: usually very small number.
+    for (const roomDoc of activeSnap.docs) {
+      roomDocsById.set(roomDoc.id, roomDoc);
+    }
+
+    // Hourly sweep: keeps old/missing queue rooms from being forgotten.
+    for (const roomDoc of sweepSnap.docs) {
+      roomDocsById.set(roomDoc.id, roomDoc);
+    }
+
+    const roomDocs = Array.from(roomDocsById.values());
+
+    console.log("[pollLiveTournamentWeeks] summary", {
+      roomsFound: roomDocs.length,
+      queueDue: queueSnap.size,
+      activeRooms: activeSnap.size,
+      sweepRooms: sweepSnap.size || 0,
+      runSweep,
+      nowMs,
+    });
+
+    for (const roomDoc of roomDocs) {
       const roomId = roomDoc.id;
+      const roomRef = roomDoc.ref;
       const room = roomDoc.data() || {};
 
       try {
-        // Check if this room is in a tournament phase (e.g. "Cup") that requires special handling
-        const phase =
-          room?.competitionState?.phaseLabel ??
-          room?.["competitionState.phaseLabel"] ??
-          room?.competitionState?.phaseLable ??
-          room?.["competitionState.phaseLable"] ??
-          null;
+        const competitionState = getCompetitionState(room);
+        const weekStatus = String(competitionState?.weekStatus || "").toLowerCase();
 
+        // If room is no longer active/scheduled, remove it from the queue.
+        if (!["scheduled", "live", "resolving"].includes(weekStatus)) {
+          await deleteTournamentPollTask(roomId);
+          continue;
+        }
+
+        const phase = getRoomPhaseLabel(room);
+
+        // -------------------------
+        // CUP ROOMS
+        // -------------------------
         if (phase === "Cup") {
-          await db.doc(`rooms/${roomId}`).set(
-            { "competitionState.lastCupPollAtMs": nowMs },
-            { merge: true }
-          );
+          const nextCupPollAtMs = Number(competitionState?.nextCupPollAtMs || 0);
+
+          if (Number.isFinite(nextCupPollAtMs) && nextCupPollAtMs > nowMs && !runSweep) {
+            await upsertTournamentPollTask({
+              roomId,
+              phase,
+              nextPollAtMs: nextCupPollAtMs,
+              reason: "cup-next-poll",
+              nowMs,
+            });
+            continue;
+          }
+
+          console.log("[pollLiveTournamentWeeks] running cup engine", {
+            roomId,
+            nextCupPollAtMs,
+            nowMs,
+          });
 
           await runCupEngine({
             db,
@@ -3675,65 +5695,263 @@ exports.pollLiveTournamentWeeks = onSchedule(
             getFixturePlayersStatsMapCached,
           });
 
+          // Read fresh room state because Cup engine may write nextCupPollAtMs.
+          const freshRoomSnap = await roomRef.get();
+          const freshRoom = freshRoomSnap.exists ? (freshRoomSnap.data() || {}) : {};
+          const freshState = getCompetitionState(freshRoom);
+          const freshNextCupPollAtMs = Number(freshState?.nextCupPollAtMs || 0);
+          const freshWeekStatus = String(freshState?.weekStatus || "scheduled").toLowerCase();
+
+          if (!["scheduled", "live", "resolving"].includes(freshWeekStatus)) {
+            await deleteTournamentPollTask(roomId);
+            continue;
+          }
+
+          await upsertTournamentPollTask({
+            roomId,
+            phase,
+            nextPollAtMs:
+              Number.isFinite(freshNextCupPollAtMs) && freshNextCupPollAtMs > nowMs
+                ? freshNextCupPollAtMs
+                : nowMs + TOURNAMENT_UNKNOWN_RECHECK_MS,
+            reason: "cup-engine-next",
+            nowMs,
+          });
+
           continue;
         }
 
-        // For regular season rooms, we run the normal live week logic
+        // -------------------------
+        // REGULAR SEASON ROOMS
+        // -------------------------
         let weekIndex = Number(room.currentWeekIndex);
+
         if (!Number.isFinite(weekIndex)) {
           const created = await ensureCurrentWeekIfMissing({ roomId, room, apiKey });
-          if (!created) continue;
+
+          if (!created) {
+            await upsertTournamentPollTask({
+              roomId,
+              phase: phase || "RegularSeason",
+              nextPollAtMs: nowMs + TOURNAMENT_UNKNOWN_RECHECK_MS,
+              reason: "no-current-week",
+              nowMs,
+            });
+            continue;
+          }
+
           weekIndex = Number(created);
         }
 
         let weekRef = db.doc(`rooms/${roomId}/weeks/${String(weekIndex)}`);
         let weekSnap = await weekRef.get();
-        if (!weekSnap.exists) continue;
+
+        if (!weekSnap.exists) {
+          await upsertTournamentPollTask({
+            roomId,
+            phase: phase || "RegularSeason",
+            nextPollAtMs: nowMs + TOURNAMENT_UNKNOWN_RECHECK_MS,
+            reason: "week-doc-missing",
+            nowMs,
+          });
+          continue;
+        }
+
         let week = weekSnap.data() || {};
 
-        // ✅ AUTO-ADVANCE: if current is FINAL, move to next week
+        // Auto-advance if current week is final.
         if (week.status === "final") {
-          const nextIdx = await autoAdvanceWeekIfFinal({ roomId, room, currentWeekIndex: weekIndex, apiKey });
-          if (!nextIdx) continue;
+          const nextIdx = await autoAdvanceWeekIfFinal({
+            roomId,
+            room,
+            currentWeekIndex: weekIndex,
+            apiKey,
+          });
+
+          if (!nextIdx) {
+            await upsertTournamentPollTask({
+              roomId,
+              phase: phase || "RegularSeason",
+              nextPollAtMs: nowMs + TOURNAMENT_UNKNOWN_RECHECK_MS,
+              reason: "final-no-next-week",
+              nowMs,
+            });
+            continue;
+          }
 
           weekIndex = Number(nextIdx);
           weekRef = db.doc(`rooms/${roomId}/weeks/${String(weekIndex)}`);
           weekSnap = await weekRef.get();
-          if (!weekSnap.exists) continue;
+
+          if (!weekSnap.exists) {
+            await upsertTournamentPollTask({
+              roomId,
+              phase: phase || "RegularSeason",
+              nextPollAtMs: nowMs + TOURNAMENT_UNKNOWN_RECHECK_MS,
+              reason: "next-week-doc-missing",
+              nowMs,
+            });
+            continue;
+          }
+
           week = weekSnap.data() || {};
         }
 
         const fixtures = Array.isArray(week.fixtures) ? week.fixtures : [];
-        if (!fixtures.length) continue;
 
-        // Smart time gate based on kickoff times (no API call needed to decide)
-        const PRE_MS = 20 * 60 * 1000;        // 20 min pre-kickoff
-        const POST_MS = 3 * 60 * 60 * 1000;   // 3 hrs post-kickoff
+        if (!fixtures.length) {
+          await upsertTournamentPollTask({
+            roomId,
+            phase: phase || "RegularSeason",
+            nextPollAtMs: nowMs + TOURNAMENT_UNKNOWN_RECHECK_MS,
+            reason: "no-fixtures",
+            nowMs,
+          });
+
+          await setCompetitionState(
+            roomRef,
+            {
+              weekStatus: "scheduled",
+              nextPollAtMs: nowMs + TOURNAMENT_UNKNOWN_RECHECK_MS,
+            },
+            {
+              roomData: { ...room, competitionState },
+              nowMs,
+            }
+          );
+
+          continue;
+        }
 
         let shouldRun = false;
+
         for (const g of fixtures) {
-          const koMs = Number(g?.kickoffMs ?? (g?.fixture?.timestamp ? g.fixture.timestamp * 1000 : NaN));
+          const koMs = kickoffMsFromFixture(g);
           if (!Number.isFinite(koMs)) continue;
-          if (nowMs >= koMs - PRE_MS && nowMs <= koMs + POST_MS) {
+
+          if (nowMs >= koMs - TOURNAMENT_PRE_MS && nowMs <= koMs + TOURNAMENT_POST_MS) {
             shouldRun = true;
             break;
           }
         }
 
+        const sleepInfo = getNextPollAtMsFromFixtures(fixtures, nowMs);
+
+        console.log("[pollLiveTournamentWeeks] time gate", {
+          roomId,
+          weekIndex,
+          shouldRun,
+          nowMs,
+          fixtureCount: fixtures.length,
+          nextKickoffMs: sleepInfo.nextKickoffMs,
+          nextPollAtMs: sleepInfo.nextPollAtMs,
+          reason: sleepInfo.reason,
+        });
+
         if (!shouldRun) {
           const endAtMs = Number(week.endAtMs || 0);
-          const POST_MS = 3 * 60 * 60 * 1000;
 
-          // If we're past the post-window and not final yet, run compute once to finalize + advance
-          if (week.status !== "final" && Number.isFinite(endAtMs) && nowMs >= endAtMs + POST_MS) {
-            await computeAndWriteLiveWeek({ roomId, weekIndex: Number(weekIndex), apiKey });
+          // If we're past the post-window and not final yet, run compute once to finalize + advance.
+          if (
+            week.status !== "final" &&
+            Number.isFinite(endAtMs) &&
+            endAtMs > 0 &&
+            nowMs >= endAtMs + TOURNAMENT_POST_MS
+          ) {
+            console.log("[pollLiveTournamentWeeks] running finalization compute", {
+              roomId,
+              weekIndex,
+            });
+
+            await computeAndWriteLiveWeek({
+              roomId,
+              weekIndex: Number(weekIndex),
+              apiKey,
+            });
+
+            await upsertTournamentPollTask({
+              roomId,
+              phase: phase || "RegularSeason",
+              nextPollAtMs: nowMs + TOURNAMENT_UNKNOWN_RECHECK_MS,
+              reason: "post-finalization-recheck",
+              nowMs,
+            });
+
+            continue;
           }
+
+          // ✅ Main read saver: room goes back to sleep.
+          await Promise.all([
+            upsertTournamentPollTask({
+              roomId,
+              phase: phase || "RegularSeason",
+              nextPollAtMs: sleepInfo.nextPollAtMs,
+              reason: sleepInfo.reason,
+              nowMs,
+            }),
+
+            setCompetitionState(
+              roomRef,
+              {
+                weekStatus: "scheduled",
+                nextPollAtMs: sleepInfo.nextPollAtMs,
+                nextKickoffMs: sleepInfo.nextKickoffMs,
+              },
+              {
+                roomData: { ...room, competitionState },
+                nowMs,
+              }
+            ),
+          ]);
+
           continue;
         }
 
-        await computeAndWriteLiveWeek({ roomId, weekIndex: Number(weekIndex), apiKey });
+        // ✅ Active window: now we actually compute.
+        console.log("[pollLiveTournamentWeeks] running computeAndWriteLiveWeek", {
+          roomId,
+          weekIndex,
+        });
+
+        await computeAndWriteLiveWeek({
+          roomId,
+          weekIndex: Number(weekIndex),
+          apiKey,
+        });
+
+        // Keep polling every minute while active.
+        await Promise.all([
+          upsertTournamentPollTask({
+            roomId,
+            phase: phase || "RegularSeason",
+            nextPollAtMs: nowMs + TOURNAMENT_ACTIVE_POLL_MS,
+            reason: "active-window",
+            nowMs,
+          }),
+
+          setCompetitionState(
+            roomRef,
+            {
+              weekStatus: "live",
+              nextPollAtMs: nowMs + TOURNAMENT_ACTIVE_POLL_MS,
+            },
+            {
+              roomData: { ...room, competitionState },
+              nowMs,
+            }
+          ),
+        ]);
       } catch (e) {
         console.error(`Error processing room ${roomId}`, e);
+
+        // Avoid hammering a broken room every minute.
+        await upsertTournamentPollTask({
+          roomId,
+          phase: "",
+          nextPollAtMs: nowMs + TOURNAMENT_UNKNOWN_RECHECK_MS,
+          reason: `error: ${String(e?.message || e).slice(0, 120)}`,
+          nowMs,
+        });
       }
     }
   }
@@ -3841,6 +6059,7 @@ exports.scheduleMarket = onCall({ region: "us-west2" }, async (request) => {
   const marketRef = db.doc(`rooms/${roomId}/market/current`);
   const marketSnap = await marketRef.get();
   const prevMarket = marketSnap.exists ? (marketSnap.data() || {}) : {};
+  const marketQueueRef = db.doc(`marketQueue/${roomId}`);
 
   const reminderSendAtMs = Number(scheduledAtMs) - 10 * 60 * 1000;
   const oldMarketReminderId = prevMarket.marketReminderId || null;
@@ -3863,6 +6082,7 @@ exports.scheduleMarket = onCall({ region: "us-west2" }, async (request) => {
   batch.set(
     marketRef,
     {
+      roomId,
       status: "scheduled",
       scheduledAt: Number(scheduledAtMs),
       durationMs: Number(durationMs),
@@ -3870,6 +6090,22 @@ exports.scheduleMarket = onCall({ region: "us-west2" }, async (request) => {
       closesAt: null,
       resolvedAt: null,
       marketReminderId: newMarketReminderRef.id,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+
+    batch.set(
+    marketQueueRef,
+    {
+      roomId,
+      status: "scheduled",
+      scheduledAt: Number(scheduledAtMs),
+      durationMs: Number(durationMs),
+      openedAt: null,
+      closesAt: null,
+      resolvedAt: null,
+      updatedAtMs: Date.now(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     },
     { merge: true }
@@ -3992,92 +6228,243 @@ exports.processReminders = onSchedule(
 /**
  * Market scheduler (auto open/close)
  */
+/**
+ * Market scheduler (auto open/close)
+ *
+ * Beta-safe version:
+ * - Scans rooms directly
+ * - Reads rooms/{roomId}/market/current
+ * - Avoids collectionGroup path issues
+ */
 exports.processMarketSchedule = onSchedule(
   { schedule: "*/1 * * * *", timeZone: "America/Los_Angeles", region: "us-west2" },
   async () => {
     const now = Date.now();
-    const activeMarketsSnap = await db.collectionGroup("market")
+
+    // ✅ Only read active market tasks.
+    // No more scanning every room.
+    const queueSnap = await db
+      .collection("marketQueue")
       .where("status", "in", ["scheduled", "open", "resolving"])
       .get();
 
-    for (const marketSnap of activeMarketsSnap.docs) {
-      const m = marketSnap.data() || {};
-      const marketRef = db.doc(`rooms/${roomId}/market/current`);
-      const roomId = marketRef.parent.parent.id; 
-      const status = m.status || "idle";
+    if (queueSnap.empty) {
+      console.log("[processMarketSchedule] no active market tasks");
+      return;
+    }
 
-      if (!marketSnap.exists) continue;
+    console.log("[processMarketSchedule] active market tasks:", queueSnap.size);
 
-      const scheduledAt = Number(m.scheduledAt);
-      const durationMs = Number(m.durationMs || 0);
-      const closesAt = Number(m.closesAt);
+    for (const taskDoc of queueSnap.docs) {
+      const task = taskDoc.data() || {};
+      const roomId = String(task.roomId || taskDoc.id || "");
 
-      // 1) scheduled -> open
-      if (status === "scheduled" && Number.isFinite(scheduledAt) && scheduledAt <= now) {
-        // IMPORTANT: compute closesAt from scheduledAt (not "now"), so cron delay doesn't extend market
-        const computedClosesAt = durationMs ? scheduledAt + durationMs : null;
-
-        await marketRef.set(
-          {
-            status: "open",
-            openedAt: now,
-            closesAt: computedClosesAt,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          },
-          { merge: true }
-        );
+      if (!roomId) {
+        console.warn("[processMarketSchedule] queue task missing roomId", taskDoc.id);
         continue;
       }
 
-      // 2) If open but missing closesAt (safety), compute it
+      const marketRef = db.doc(`rooms/${roomId}/market/current`);
+      const marketSnap = await marketRef.get();
+
+      if (!marketSnap.exists) {
+        console.warn("[processMarketSchedule] market doc missing, deleting queue task", {
+          roomId,
+          queueId: taskDoc.id,
+        });
+
+        await taskDoc.ref.delete();
+        continue;
+      }
+
+      const m = marketSnap.data() || {};
+      const status = String(m.status || task.status || "idle").toLowerCase();
+
+      if (!["scheduled", "open", "resolving"].includes(status)) {
+        await taskDoc.ref.delete();
+        continue;
+      }
+
+      const scheduledAt = Number(m.scheduledAt ?? task.scheduledAt);
+      const durationMs = Number(m.durationMs ?? task.durationMs ?? 0);
+      const closesAt = Number(m.closesAt ?? task.closesAt ?? 0);
+
+      console.log("[processMarketSchedule] market state", {
+        roomId,
+        status,
+        scheduledAt,
+        closesAt,
+        now,
+      });
+
+      // 1) scheduled -> open
+      if (
+        status === "scheduled" &&
+        Number.isFinite(scheduledAt) &&
+        scheduledAt > 0 &&
+        scheduledAt <= now
+      ) {
+        const computedClosesAt =
+          durationMs > 0 ? scheduledAt + durationMs : null;
+
+        console.log("[processMarketSchedule] opening market", {
+          roomId,
+          scheduledAt,
+          now,
+          durationMs,
+          computedClosesAt,
+        });
+
+        await Promise.all([
+          marketRef.set(
+            {
+              status: "open",
+              openedAt: now,
+              closesAt: computedClosesAt,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+          ),
+
+          taskDoc.ref.set(
+            {
+              status: "open",
+              openedAt: now,
+              closesAt: computedClosesAt,
+              updatedAtMs: now,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+          ),
+        ]);
+
+        continue;
+      }
+
+      // 2) open but missing closesAt
       if (
         status === "open" &&
         (!Number.isFinite(closesAt) || closesAt <= 0) &&
         Number.isFinite(scheduledAt) &&
+        scheduledAt > 0 &&
         durationMs > 0
       ) {
-        await marketRef.set(
-          {
-            closesAt: scheduledAt + durationMs,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          },
-          { merge: true }
-        );
-      }
+        const computedClosesAt = scheduledAt + durationMs;
 
-      // 3) open -> resolving (UI should show "Resolving…" immediately) + then resolve
-      if (status === "open" && Number.isFinite(closesAt) && closesAt <= now) {
-        // Set resolving FIRST so the UI doesn't sit at 0 looking stuck
-        await marketRef.set(
-          {
-            status: "resolving",
-            closedAt: now,
-            resolvingAt: now,
-            scheduledAt: null, // prevent reopening
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          },
-          { merge: true }
-        );
+        console.log("[processMarketSchedule] repairing closesAt", {
+          roomId,
+          computedClosesAt,
+        });
 
-        // Now actually resolve (server-side). If it fails, we keep "resolving" and retry next minute.
-        try {
-          await resolveMarketForRoom(roomId, { trigger: "scheduler" });
-        } catch (e) {
-          console.error("resolveMarketForRoom failed", roomId, e);
-        }
+        await Promise.all([
+          marketRef.set(
+            {
+              closesAt: computedClosesAt,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+          ),
+
+          taskDoc.ref.set(
+            {
+              closesAt: computedClosesAt,
+              updatedAtMs: now,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+          ),
+        ]);
+
         continue;
       }
 
-      // 4) Retry any stuck resolving markets (in case of transient errors)
-      if (status === "resolving" && !m.resolvedAtMs && !m.resolvedAt) {
-        const resolvingAt = Number(m.resolvingAt || m.closedAt || 0);
+      // 3) open -> resolved
+      if (
+        status === "open" &&
+        Number.isFinite(closesAt) &&
+        closesAt > 0 &&
+        closesAt <= now
+      ) {
+        console.log("[processMarketSchedule] closing/resolving market", {
+          roomId,
+          closesAt,
+          now,
+        });
 
-        // Wait at least 30s before retrying to avoid thrashing
+        try {
+          await resolveMarketForRoom(roomId, { trigger: "scheduler" });
+
+          // ✅ Done. Remove queue task so this room is not checked anymore.
+          await taskDoc.ref.delete();
+        } catch (e) {
+          console.error("resolveMarketForRoom failed", roomId, e);
+
+          await Promise.all([
+            marketRef.set(
+              {
+                status: "resolving",
+                closedAt: now,
+                resolvingAt: now,
+                lastResolveError: String(e?.message || e),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              },
+              { merge: true }
+            ),
+
+            taskDoc.ref.set(
+              {
+                status: "resolving",
+                closedAt: now,
+                resolvingAt: now,
+                lastResolveError: String(e?.message || e),
+                updatedAtMs: now,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              },
+              { merge: true }
+            ),
+          ]);
+        }
+
+        continue;
+      }
+
+      // 4) Retry stuck resolving markets
+      if (status === "resolving" && !m.resolvedAt) {
+        const resolvingAt = Number(m.resolvingAt || m.closedAt || task.resolvingAt || 0);
+
         if (!resolvingAt || now - resolvingAt > 30 * 1000) {
+          console.log("[processMarketSchedule] retrying resolving market", {
+            roomId,
+            resolvingAt,
+            now,
+          });
+
           try {
             await resolveMarketForRoom(roomId, { trigger: "scheduler-retry" });
+
+            // ✅ Done. Remove queue task.
+            await taskDoc.ref.delete();
           } catch (e) {
             console.error("resolveMarketForRoom retry failed", roomId, e);
+
+            await Promise.all([
+              marketRef.set(
+                {
+                  lastResolveError: String(e?.message || e),
+                  updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                },
+                { merge: true }
+              ),
+
+              taskDoc.ref.set(
+                {
+                  lastResolveError: String(e?.message || e),
+                  updatedAtMs: now,
+                  updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                },
+                { merge: true }
+              ),
+            ]);
           }
         }
       }
@@ -4142,8 +6529,14 @@ async function resolveMarketForRoom(roomId, { trigger = "scheduler" } = {}) {
     const status = m.status || "idle";
     const closesAt = Number(m.closesAt || 0);
 
-    if (status === "resolved" || m.resolvedAt) return { ok: false, reason: "already-resolved" };
-    if (status === "resolving") return { ok: false, reason: "already-resolving" };
+    // Allow scheduler retry OR manual button to recover stuck resolving markets.
+    const canRecoverResolving = ["scheduler-retry", "manual", "manual-retry"].includes(trigger);
+
+    if (status === "resolving" && !canRecoverResolving) {
+      return { ok: false, reason: "already-resolving" };
+    }
+
+    if (status === "scheduled") return { ok: false, reason: "market-not-open-yet" };
 
     // Only resolve after close time (or if already closed)
     if (status === "open" && closesAt && closesAt > now) {
@@ -4165,6 +6558,73 @@ async function resolveMarketForRoom(roomId, { trigger = "scheduler" } = {}) {
   });
 
   if (!locked.ok) return locked;
+  // Needed for display names and safe room context.
+  // Without this, memberNameByUid can crash with "room is not defined"
+  // after the market has already been set to resolving.
+  const roomSnap = await roomRef.get();
+  if (!roomSnap.exists) {
+    await marketRef.set(
+      {
+        status: "open",
+        lastResolveError: "Room not found during market resolve.",
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    return { ok: false, reason: "room-not-found" };
+  }
+
+  const room = roomSnap.data() || {};
+
+
+  function inferPickOwnerUid(d) {
+    const v =
+      d?.userId ??
+      d?.uid ??
+      d?.ownerUid ??
+      d?.ownerId ??
+      d?.ownedBy ??
+      d?.managerUid ??
+      d?.pickedByUid ??
+      d?.pickedBy ??
+      d?.owner?.uid ??
+      d?.owner?.id;
+
+    if (!v) return null;
+    if (typeof v === "string") return v;
+    if (typeof v === "object") return v.uid || v.id || null;
+    return String(v);
+  }
+
+  function inferPickPlayerId(d) {
+    const v =
+      d?.playerId ??
+      d?.pid ??
+      d?.apiPlayerId ??
+      d?.player?.id ??
+      d?.player?.playerId;
+
+    return v == null ? null : String(v);
+  }
+
+  function inferInterestOwnerUid(d, docId) {
+    const v =
+      d?.uid ??
+      d?.userId ??
+      d?.ownerUid ??
+      d?.ownerId ??
+      d?.managerUid ??
+      docId;
+
+    return v == null ? null : String(v);
+  }
+
+  const memberNameByUid = new Map(
+    (Array.isArray(room?.members) ? room.members : [])
+      .filter((m) => m?.uid)
+      .map((m) => [String(m.uid), String(m.displayName || m.uid)])
+  );
 
   // B) Load required data
   const [interestSnap, picksSnap, lineupsSnap, standingsByUid] = await Promise.all([
@@ -4176,15 +6636,19 @@ async function resolveMarketForRoom(roomId, { trigger = "scheduler" } = {}) {
 
   // C) Index picks: uid+playerId -> pickDocId, and roster set for validation
   const pickDocIdByUidPlayer = new Map();
+  const pickDataByUidPlayer = new Map();
   const rosterByUid = new Map(); // uid -> Set(playerId)
+  const ownerByPlayerId = new Map(); // playerId -> uid
 
   picksSnap.forEach((doc) => {
     const d = doc.data() || {};
-    const uid = String(d.userId ?? d.uid ?? "");
-    const playerId = String(d.playerId ?? "");
+    const uid = inferPickOwnerUid(d);
+    const playerId = inferPickPlayerId(d);
     if (!uid || !playerId) return;
 
     pickDocIdByUidPlayer.set(`${uid}:${playerId}`, doc.id);
+    pickDataByUidPlayer.set(`${uid}:${playerId}`, { id: doc.id, ...d });
+    ownerByPlayerId.set(playerId, uid);
 
     if (!rosterByUid.has(uid)) rosterByUid.set(uid, new Set());
     rosterByUid.get(uid).add(playerId);
@@ -4198,7 +6662,7 @@ async function resolveMarketForRoom(roomId, { trigger = "scheduler" } = {}) {
   const requests = [];
   interestSnap.forEach((doc) => {
     const d = doc.data() || {};
-    const uid = String(d.uid ?? doc.id);
+    const uid = inferInterestOwnerUid(d, doc.id);
     const choices = Array.isArray(d.choices) ? d.choices : [];
     const updatedAtMs =
       typeof d.updatedAtMs === "number"
@@ -4208,35 +6672,71 @@ async function resolveMarketForRoom(roomId, { trigger = "scheduler" } = {}) {
     for (const c of choices) {
       const wantId = c?.wantId != null ? String(c.wantId) : null;
       const swapOutId = c?.swapOutId != null ? String(c.swapOutId) : null;
-      if (!wantId || !swapOutId) continue;
-
       requests.push({ uid, wantId, swapOutId, updatedAtMs });
     }
   });
 
-  // F) Group by wantId and pick winners by priority (lowest matchPts, tie lowest totalFantasy, tie earliest submit)
+  const uniqueWantIds = Array.from(
+    new Set(requests.map((r) => r.wantId).filter(Boolean))
+  );
+  const wantPlayerDocs = await Promise.all(
+    uniqueWantIds.map(async (wantId) => {
+      const snap = await roomRef.collection("players").doc(String(wantId)).get();
+      return [String(wantId), snap.exists ? (snap.data() || null) : null];
+    })
+  );
+  const playerById = new Map(wantPlayerDocs);
+
+  function buildDecision(r, status, reason) {
+    return {
+      uid: r.uid,
+      wantId: r.wantId,
+      swapOutId: r.swapOutId,
+      status,
+      reason,
+    };
+  }
+
+  // F) Validate every request first so all submissions get a result doc.
   const byWant = new Map();
+  const decisions = []; // { wantId, uid, swapOutId, status, reason }
+
   for (const r of requests) {
+    const owned = r.uid ? rosterByUid.get(r.uid) : null;
+
+    if (!r.uid || !r.wantId || !r.swapOutId) {
+      decisions.push(buildDecision(r, "lost", "MISSING_FIELDS"));
+      continue;
+    }
+
+    if (!owned || !owned.has(r.swapOutId)) {
+      decisions.push(buildDecision(r, "lost", "SWAPOUT_NOT_OWNED"));
+      continue;
+    }
+
+    if (owned.has(r.wantId)) {
+      decisions.push(buildDecision(r, "lost", "SAME_PLAYER"));
+      continue;
+    }
+
+    if (!playerById.has(r.wantId) || !playerById.get(r.wantId)) {
+      decisions.push(buildDecision(r, "lost", "WANT_NOT_IN_POOL"));
+      continue;
+    }
+
+    const currentOwner = ownerByPlayerId.get(r.wantId);
+    if (currentOwner && currentOwner !== r.uid) {
+      decisions.push(buildDecision(r, "lost", "WANT_NOT_AVAILABLE"));
+      continue;
+    }
+
     if (!byWant.has(r.wantId)) byWant.set(r.wantId, []);
     byWant.get(r.wantId).push(r);
   }
 
-  const decisions = []; // {wantId, uid, swapOutId, status, reason}
+  // G) Award by priority and record explicit losers for the same target.
   for (const [wantId, list] of byWant.entries()) {
-    // Validate each candidate
-    const candidates = list.filter((r) => {
-      const owned = rosterByUid.get(r.uid);
-      if (!owned || !owned.has(r.swapOutId)) return false; // must own swapOut
-      if (owned.has(wantId)) return false; // already owns want
-      return true;
-    });
-
-    if (candidates.length === 0) {
-      // No one eligible for this wantId
-      continue;
-    }
-
-    candidates.sort((a, b) => {
+    list.sort((a, b) => {
       const pa = getPriority(standingsByUid, a.uid);
       const pb = getPriority(standingsByUid, b.uid);
       const cmp = comparePriority(pa, pb);
@@ -4245,27 +6745,70 @@ async function resolveMarketForRoom(roomId, { trigger = "scheduler" } = {}) {
       return String(a.uid).localeCompare(String(b.uid));
     });
 
-    const winner = candidates[0];
-    decisions.push({ wantId, uid: winner.uid, swapOutId: winner.swapOutId, status: "won" });
+    const winner = list[0];
+    decisions.push(buildDecision(winner, "won", "AWARDED"));
 
-    // record losers (optional, helps UI reasons)
-    for (let i = 1; i < candidates.length; i++) {
-      decisions.push({ wantId, uid: candidates[i].uid, swapOutId: candidates[i].swapOutId, status: "lost" });
+    for (let i = 1; i < list.length; i++) {
+      decisions.push(buildDecision(list[i], "lost", "WANT_NOT_AVAILABLE"));
     }
+  }
+
+  function entryIdOf(entry) {
+    if (entry == null) return "";
+    if (typeof entry === "string") return String(entry);
+    return String(
+      entry.id ??
+      entry.playerId ??
+      entry.apiPlayerId ??
+      entry.name ??
+      ""
+    );
+  }
+
+  function buildLineupPlayerEntry(playerId, playerMeta) {
+    const rawPos = String(playerMeta?.position || "MID").toUpperCase();
+    return {
+      id: String(playerId),
+      name: String(playerMeta?.name || "Unknown"),
+      position: rawPos === "ATT" ? "FWD" : rawPos,
+      teamId: playerMeta?.teamId ?? null,
+      apiPlayerId: playerMeta?.id ?? playerId,
+    };
   }
 
   // G) Apply changes + write results + cleanup
   const batch = db.batch();
+  const wonCount = decisions.filter((d) => d.status === "won").length;
 
   // Write marketResults
   for (const dec of decisions) {
+    const wantPlayer = dec.wantId ? playerById.get(String(dec.wantId)) : null;
+    const releasedPick = dec.uid && dec.swapOutId
+      ? pickDataByUidPlayer.get(`${dec.uid}:${dec.swapOutId}`)
+      : null;
+    const normalizedReason =
+      dec.reason || (dec.status === "won" ? "AWARDED" : "WANT_NOT_AVAILABLE");
     const resRef = roomRef.collection("marketResults").doc();
     batch.set(resRef, {
       uid: dec.uid,
+      displayName: memberNameByUid.get(String(dec.uid || "")) || dec.uid || "Unknown",
       wantId: dec.wantId,
       swapOutId: dec.swapOutId,
       gotId: dec.status === "won" ? dec.wantId : null,
+      releasedId: dec.swapOutId || null,
+      releasedName:
+        releasedPick?.playerName ||
+        releasedPick?.name ||
+        dec.swapOutId ||
+        null,
+      gotName:
+        dec.status === "won"
+          ? wantPlayer?.name || dec.wantId || null
+          : null,
       result: dec.status,
+      ok: dec.status === "won",
+      reason: normalizedReason,
+      resolvedAt: FieldValue.serverTimestamp(),
       resolvedAtMs: now,
       createdAt: FieldValue.serverTimestamp(),
     });
@@ -4275,22 +6818,72 @@ async function resolveMarketForRoom(roomId, { trigger = "scheduler" } = {}) {
     // Update pick: swapOut -> want
     const pickId = pickDocIdByUidPlayer.get(`${dec.uid}:${dec.swapOutId}`);
     if (pickId) {
-      batch.update(roomRef.collection("picks").doc(pickId), {
+      const pickPatch = {
         playerId: dec.wantId,
         updatedAt: FieldValue.serverTimestamp(),
         source: "market",
-      });
+      };
+
+      if (wantPlayer) {
+        if (wantPlayer.name || wantPlayer.playerName) {
+          pickPatch.playerName = wantPlayer.name || wantPlayer.playerName;
+          pickPatch.name = wantPlayer.name || wantPlayer.playerName;
+        }
+        if (wantPlayer.position) pickPatch.position = wantPlayer.position;
+        if (wantPlayer.teamName) pickPatch.teamName = wantPlayer.teamName;
+        if (wantPlayer.teamId) pickPatch.teamId = wantPlayer.teamId;
+        if (wantPlayer.teamLogo) pickPatch.teamLogo = wantPlayer.teamLogo;
+        if (wantPlayer.nationality) pickPatch.nationality = wantPlayer.nationality;
+        pickPatch.provider = wantPlayer.provider || "api-football";
+      }
+
+      batch.update(roomRef.collection("picks").doc(pickId), pickPatch);
     }
 
-    // Update lineup starters if needed
+    // Update lineup starters/bench if needed
     const lineup = lineupByUid.get(dec.uid);
-    if (lineup && Array.isArray(lineup.starters)) {
-      const starters = lineup.starters.map(String);
-      const idx = starters.indexOf(String(dec.swapOutId));
-      if (idx >= 0) {
-        starters[idx] = String(dec.wantId);
-        batch.set(roomRef.collection("lineups").doc(dec.uid), { starters, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
+    if (lineup) {
+      const lineupPatch = {
+        updatedAt: FieldValue.serverTimestamp(),
+      };
+
+      if (Array.isArray(lineup.starters)) {
+        const starters = lineup.starters.map(String);
+        const idx = starters.indexOf(String(dec.swapOutId));
+        if (idx >= 0) {
+          starters[idx] = String(dec.wantId);
+          lineupPatch.starters = starters;
+        }
       }
+
+      if (Array.isArray(lineup.bench)) {
+        const bench = lineup.bench.map(String);
+        const idx = bench.indexOf(String(dec.swapOutId));
+        if (idx >= 0) {
+          bench[idx] = String(dec.wantId);
+          lineupPatch.bench = bench;
+        }
+      }
+
+      if (Array.isArray(lineup.startingXI) && wantPlayer) {
+        const replacement = buildLineupPlayerEntry(dec.wantId, wantPlayer);
+        lineupPatch.startingXI = lineup.startingXI.map((entry) =>
+          entryIdOf(entry) === String(dec.swapOutId) ? replacement : entry
+        );
+      }
+
+      if (Array.isArray(lineup.benchXI) && wantPlayer) {
+        const replacement = buildLineupPlayerEntry(dec.wantId, wantPlayer);
+        lineupPatch.benchXI = lineup.benchXI.map((entry) =>
+          entryIdOf(entry) === String(dec.swapOutId) ? replacement : entry
+        );
+      }
+
+      batch.set(
+        roomRef.collection("lineups").doc(dec.uid),
+        lineupPatch,
+        { merge: true }
+      );
     }
   }
 
@@ -4302,12 +6895,28 @@ async function resolveMarketForRoom(roomId, { trigger = "scheduler" } = {}) {
     marketRef,
     {
       status: "resolved",
+      resolvedAt: FieldValue.serverTimestamp(),
       resolvedAtMs: now,
+      lastResolveSummary: {
+        interestDocs: interestSnap.size,
+        requestCount: requests.length,
+        decisionCount: decisions.length,
+        wonCount,
+        resolvedAtMs: now,
+      },
       updatedAt: FieldValue.serverTimestamp(),
     },
     { merge: true }
   );
 
+  console.log("[resolveMarketForRoom] committing market resolution", {
+    roomId,
+    trigger,
+    interestDocs: interestSnap.size,
+    requestCount: requests.length,
+    decisionCount: decisions.length,
+    wonCount,
+  });
   await batch.commit();
   return { ok: true, resolvedCount: decisions.length };
 }

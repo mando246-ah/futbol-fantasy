@@ -116,8 +116,14 @@ export async function uploadUserAvatar(uid, file) {
   if (!file) throw new Error("No file selected");
 
   const allowed = ["image/png", "image/jpeg", "image/webp"];
-  if (!allowed.includes(file.type)) throw new Error("Please upload a PNG, JPG, or WEBP.");
-  if (file.size > 2 * 1024 * 1024) throw new Error("Max file size is 2MB.");
+  if (!allowed.includes(file.type)) {
+    throw new Error("Please upload a PNG, JPG, or WEBP.");
+  }
+
+  const MAX_AVATAR_SIZE = 8 * 1024 * 1024; // 8MB
+  if (file.size > MAX_AVATAR_SIZE) {
+    throw new Error("Max file size is 8MB.");
+  }
 
   const storage = getStorage(app);
 
@@ -255,7 +261,45 @@ export function watchAuth(cb) {
   return onAuthStateChanged(auth, cb);
 }
 
+const LAST_ROOM_PREFIX = "lastRoomId:";
+
+function lastRoomKey(uid) {
+  return `${LAST_ROOM_PREFIX}${uid}`;
+}
+
+export function setLastRoomId(roomId, uid = auth.currentUser?.uid) {
+  if (!roomId || !uid) return;
+
+  try {
+    // New safe version: room is saved per user account
+    localStorage.setItem(lastRoomKey(uid), roomId);
+
+    // Remove old unsafe global key if it exists
+    localStorage.removeItem("lastRoomId");
+
+    window.dispatchEvent(new Event("lastRoomIdChanged"));
+  } catch {}
+}
+
+export function getLastRoomId(uid = auth.currentUser?.uid) {
+  if (!uid) return "";
+
+  try {
+    return localStorage.getItem(lastRoomKey(uid)) || "";
+  } catch {
+    return "";
+  }
+}
+
 export async function signOutNow() {
+  try {
+    // Clear the old unsafe shared room key
+    localStorage.removeItem("lastRoomId");
+
+    // Tell navbar to refresh
+    window.dispatchEvent(new Event("lastRoomIdChanged"));
+  } catch {}
+
   await signOut(auth);
 }
 
@@ -294,45 +338,142 @@ export function watchUserProfile(uid, cb) {
 /* =========================
    Room helpers
    ========================= */
-export function setLastRoomId(roomId) {
-  if (roomId){
-    localStorage.setItem("lastRoomId", roomId);
-    window.dispatchEvent(new Event("lastRoomIdChanged"));
-  } 
-}
-export function getLastRoomId() {
-  return localStorage.getItem("lastRoomId");
-}
 
-export async function joinRoom(roomId, { displayName }) {
+export async function joinRoom(roomId, { displayName } = {}) {
   const user = auth.currentUser;
   if (!user) throw new Error("Not signed in");
   if (!roomId) throw new Error("Missing roomId");
 
   const roomRef = doc(db, "rooms", roomId);
-  const snap = await getDoc(roomRef);
-  if (!snap.exists()) throw new Error("Room not found");
+  const memberRef = doc(db, "rooms", roomId, "members", user.uid);
+  const userRoomRef = doc(db, "users", user.uid, "rooms", roomId);
 
-  const room = snap.data();
-  const members = Array.isArray(room.members) ? room.members : [];
+  let joinedRoom = null;
 
-  const name =
-    displayName ||
-    user.displayName ||
-    user.email ||
-    "Manager";
+  await runTransaction(db, async (tx) => {
+    const snap = await tx.get(roomRef);
+    if (!snap.exists()) throw new Error("Room not found");
 
-  const exists = members.some(m => m.uid === user.uid);
-  const nextMembers = exists
-    ? members.map(m => m.uid === user.uid ? { ...m, displayName: name } : m)
-    : [...members, { uid: user.uid, displayName: name, joinedAt: Date.now() }];
+    const room = snap.data();
+    const members = Array.isArray(room.members) ? room.members : [];
 
-  await updateDoc(roomRef, {
-    members: nextMembers,
-    updatedAt: serverTimestamp(),
+    const name =
+      displayName ||
+      user.displayName ||
+      user.email ||
+      "Manager";
+
+    const alreadyMember = members.some((m) => {
+      const uid = typeof m === "string" ? m : m?.uid;
+      return String(uid) === String(user.uid);
+    });
+
+    // ✅ Main protection:
+    // Existing members can reopen the room.
+    // New users cannot join after the draft started.
+    if (room.started && !alreadyMember) {
+      throw new Error("This draft has already started. New users can no longer join.");
+    }
+
+    // Only change room.members before the draft starts.
+    // After started, existing members can open the room without mutating the draft order.
+    if (!room.started) {
+      const nextMembers = alreadyMember
+        ? members.map((m) => {
+            const uid = typeof m === "string" ? m : m?.uid;
+            if (String(uid) !== String(user.uid)) return m;
+            return { ...(typeof m === "object" ? m : {}), uid: user.uid, displayName: name };
+          })
+        : [...members, { uid: user.uid, displayName: name, joinedAt: Date.now() }];
+
+      tx.update(roomRef, {
+        members: nextMembers,
+        updatedAt: serverTimestamp(),
+      });
+
+      tx.set(
+        memberRef,
+        {
+          uid: user.uid,
+          displayName: name,
+          joinedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+    }
+
+    const userRoomData = {
+      roomId,
+      code: room.code || roomId,
+      name: room.name || "Room",
+      hostUid: room.hostUid || "",
+      lastSeenAt: serverTimestamp(),
+    };
+
+    if (!alreadyMember) {
+      userRoomData.joinedAt = serverTimestamp();
+    }
+
+    tx.set(userRoomRef, userRoomData, { merge: true });
+
+    joinedRoom = {
+      roomId,
+      code: room.code || roomId,
+      name: room.name || "Room",
+      hostUid: room.hostUid || "",
+      started: !!room.started,
+      alreadyMember,
+    };
   });
 
-  setLastRoomId(roomId);
+  setLastRoomId(roomId, user.uid);
+  return { ok: true, room: joinedRoom };
+}
+
+export async function kickMemberFromRoom(roomId, targetUid) {
+  const user = auth.currentUser;
+  if (!user) throw new Error("Not signed in");
+  if (!roomId) throw new Error("Missing roomId");
+  if (!targetUid) throw new Error("Missing target user");
+
+  const roomRef = doc(db, "rooms", roomId);
+  const memberRef = doc(db, "rooms", roomId, "members", targetUid);
+  const userRoomRef = doc(db, "users", targetUid, "rooms", roomId);
+
+  await runTransaction(db, async (tx) => {
+    const snap = await tx.get(roomRef);
+    if (!snap.exists()) throw new Error("Room not found");
+
+    const room = snap.data();
+
+    if (room.hostUid !== user.uid) {
+      throw new Error("Only the host can kick users.");
+    }
+
+    if (room.started) {
+      throw new Error("You cannot kick users after the draft has started.");
+    }
+
+    if (targetUid === room.hostUid) {
+      throw new Error("The host cannot be kicked.");
+    }
+
+    const members = Array.isArray(room.members) ? room.members : [];
+
+    const nextMembers = members.filter((m) => {
+      const uid = typeof m === "string" ? m : m?.uid;
+      return String(uid) !== String(targetUid);
+    });
+
+    tx.update(roomRef, {
+      members: nextMembers,
+      updatedAt: serverTimestamp(),
+    });
+
+    tx.delete(memberRef);
+    tx.delete(userRoomRef);
+  });
+
   return { ok: true };
 }
 

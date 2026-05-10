@@ -38,18 +38,24 @@ import "./styles/appShell.css";
 
 
 function Nav({ user, displayName, photoURL }) {
-  const [lastRoomId, setLastRoomIdState] = useState(() => getLastRoomId());
+  const [lastRoomId, setLastRoomIdState] = useState("");
   const [open, setOpen] = useState(false);
 
   useEffect(() => {
-    const refresh = () => setLastRoomIdState(getLastRoomId());
+    const refresh = () => {
+      setLastRoomIdState(user?.uid ? getLastRoomId(user.uid) : "");
+    };
+
+    refresh();
+
     window.addEventListener("lastRoomIdChanged", refresh);
     window.addEventListener("storage", refresh);
+
     return () => {
       window.removeEventListener("lastRoomIdChanged", refresh);
       window.removeEventListener("storage", refresh);
     };
-  }, []);
+  }, [user?.uid]);
 
   // close mobile menu on route change (basic)
   useEffect(() => {

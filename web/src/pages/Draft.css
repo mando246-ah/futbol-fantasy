@@ -517,3 +517,161 @@
   gap: 7px;
   font-size: 0.95rem;
 }
+/* ===== More visible Draft Player Pool search ===== */
+.draftPage .draftPlayerSearchInput{
+  height: 42px;
+  width: 100%;
+  border-radius: 14px;
+  padding: 0 14px;
+
+  border: 1px solid rgba(34, 211, 238, 0.62) !important;
+  background:
+    linear-gradient(135deg, rgba(34, 211, 238, 0.08), rgba(168, 85, 247, 0.08)),
+    rgba(2, 6, 23, 0.72) !important;
+
+  color: rgba(255,255,255,0.96) !important;
+  box-shadow:
+    0 0 0 1px rgba(168, 85, 247, 0.18),
+    0 10px 24px rgba(0,0,0,0.20),
+    inset 0 1px 0 rgba(255,255,255,0.06);
+
+  outline: none;
+  font-weight: 700;
+}
+
+.draftPage .draftPlayerSearchInput::placeholder{
+  color: rgba(226, 232, 240, 0.72) !important;
+  font-weight: 600;
+}
+
+.draftPage .draftPlayerSearchInput:hover{
+  border-color: rgba(34, 211, 238, 0.82) !important;
+  box-shadow:
+    0 0 0 1px rgba(34, 211, 238, 0.24),
+    0 12px 28px rgba(0,0,0,0.24),
+    inset 0 1px 0 rgba(255,255,255,0.07);
+}
+
+.draftPage .draftPlayerSearchInput:focus{
+  border-color: rgba(34, 211, 238, 0.98) !important;
+  box-shadow:
+    0 0 0 3px rgba(34, 211, 238, 0.28),
+    0 0 0 1px rgba(168, 85, 247, 0.34),
+    0 14px 30px rgba(0,0,0,0.26) !important;
+}
+
+/* ===== Competition search + mobile date visibility ===== */
+.draftPage .draftCompetitionSearchInput,
+.draftPage .draftSeasonInput {
+  width: 100%;
+  min-height: 42px;
+  border-radius: 14px;
+  padding: 0 14px;
+  border: 1px solid rgba(34, 211, 238, 0.7) !important;
+  background:
+    linear-gradient(135deg, rgba(34, 211, 238, 0.1), rgba(168, 85, 247, 0.1)),
+    rgba(2, 6, 23, 0.84) !important;
+  color: #ffffff !important;
+  font-weight: 800;
+  outline: none;
+  box-shadow:
+    0 0 0 1px rgba(168, 85, 247, 0.22),
+    0 10px 24px rgba(0, 0, 0, 0.22),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+.draftPage .draftSeasonInput {
+  width: 112px;
+  flex: 0 0 112px;
+}
+
+.draftPage .draftCompetitionSearchInput::placeholder,
+.draftPage .draftSeasonInput::placeholder {
+  color: rgba(255, 255, 255, 0.74) !important;
+  font-weight: 700;
+}
+
+.draftPage .draftCompetitionSearchInput:focus,
+.draftPage .draftSeasonInput:focus {
+  border-color: rgba(34, 211, 238, 1) !important;
+  box-shadow:
+    0 0 0 3px rgba(34, 211, 238, 0.3),
+    0 0 0 1px rgba(168, 85, 247, 0.35) !important;
+}
+
+/* Make datetime-local text readable on phones */
+.draftPage .draftScheduleInput {
+  min-height: 42px;
+  color: #ffffff !important;
+  font-weight: 800;
+  background:
+    linear-gradient(135deg, rgba(34, 211, 238, 0.1), rgba(168, 85, 247, 0.1)),
+    rgba(2, 6, 23, 0.84) !important;
+}
+
+.draftPage .draftScheduleInput::-webkit-datetime-edit,
+.draftPage .draftScheduleInput::-webkit-datetime-edit-fields-wrapper,
+.draftPage .draftScheduleInput::-webkit-datetime-edit-text,
+.draftPage .draftScheduleInput::-webkit-datetime-edit-month-field,
+.draftPage .draftScheduleInput::-webkit-datetime-edit-day-field,
+.draftPage .draftScheduleInput::-webkit-datetime-edit-year-field,
+.draftPage .draftScheduleInput::-webkit-datetime-edit-hour-field,
+.draftPage .draftScheduleInput::-webkit-datetime-edit-minute-field,
+.draftPage .draftScheduleInput::-webkit-datetime-edit-ampm-field {
+  color: #ffffff !important;
+}
+
+@media (max-width: 640px) {
+  .draftPage .draftCompetitionSearchInput,
+  .draftPage .draftScheduleInput {
+    font-size: 16px; /* prevents iPhone zoom */
+  }
+}
+
+/* ===== Drafted position tracker ===== */
+.draftPage .draftPositionTrackerCard {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 16px;
+  border: 1px solid rgba(34, 211, 238, 0.28);
+  background: linear-gradient(
+    135deg,
+    rgba(34, 211, 238, 0.12),
+    rgba(168, 85, 247, 0.12),
+    rgba(15, 23, 42, 0.2)
+  );
+}
+
+.draftPage .draftPositionTrackerTitle {
+  font-size: 12px;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: rgba(226, 232, 240, 0.82);
+  margin-bottom: 8px;
+}
+
+.draftPage .draftPositionTrackerPills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.draftPage .draftPositionTrackerPill {
+  display: inline-flex;
+  align-items: center;
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(34, 211, 238, 0.32);
+  background: rgba(2, 6, 23, 0.38);
+  color: #ffffff;
+  font-size: 12px;
+  font-weight: 900;
+  line-height: 1;
+}
+
+.draftPage .draftPositionTrackerNote {
+  margin-top: 8px;
+  font-size: 12px;
+  color: rgba(226, 232, 240, 0.78);
+}

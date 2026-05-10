@@ -28,7 +28,24 @@ service cloud.firestore {
       allow delete: if false;
     }
     match /users/{uid}/rooms/{roomId} {
-      allow read, write: if request.auth != null && request.auth.uid == uid;
+      allow read: if request.auth != null && request.auth.uid == uid;
+
+      // User can save a room before draft starts.
+      // Existing saved rooms can still update lastSeenAt later.
+      allow create, update: if request.auth != null
+        && request.auth.uid == uid
+        && (
+          roomDoc(roomId).data.started == false ||
+          exists(/databases/$(database)/documents/users/$(uid)/rooms/$(roomId))
+        );
+
+      // User can remove it from their own list.
+      // Host can remove it when kicking someone.
+      allow delete: if request.auth != null
+        && (
+          request.auth.uid == uid ||
+          isHostUid(roomId)
+        );
     }
 
     /*user changing team name*/
@@ -57,7 +74,14 @@ service cloud.firestore {
       //  - Update market field on the room doc: change only 'market' (+ updatedAt)
       allow update: if authed() && (
         isHostUid(roomId) ||
-        changedOnly(['members','updatedAt']) ||
+
+        // Users can only join/leave/edit members BEFORE the draft starts.
+        (
+          resource.data.started == false &&
+          request.resource.data.started == false &&
+          changedOnly(['members', 'updatedAt'])
+        ) ||
+
         changedOnly(['turnIndex','turnDeadlineAt','updatedAt']) ||
         (isHostUid(roomId) && changedOnly(['name', 'updatedAt'])) ||
         (isHostUid(roomId) && changedOnly(['market','updatedAt']))
@@ -122,7 +146,19 @@ service cloud.firestore {
       // presence mirror (optional)
       match /members/{uid} {
         allow read: if authed();
-        allow create, update, delete: if authed() && uid == request.auth.uid;
+
+        // Users can add/update their own member mirror only before draft starts.
+        allow create, update: if authed()
+          && uid == request.auth.uid
+          && roomDoc(roomId).data.started == false;
+
+        // User can leave before start, or host can kick before start.
+        allow delete: if authed()
+          && roomDoc(roomId).data.started == false
+          && (
+            uid == request.auth.uid ||
+            isHostUid(roomId)
+          );
       }
 
       // players pool — host writes, all read

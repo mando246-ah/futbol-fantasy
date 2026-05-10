@@ -50,6 +50,8 @@ const STAT_LABELS = {
   dribbles: "Dribbles",
   duels: "Duels",
   shotsOn: "Shots on target",
+  kickoffMs: "Kickoff",
+  kickoffAtMs: "Kickoff",
 };
 
 function prettyStatLabel(key) {
@@ -375,6 +377,7 @@ export default function TournamentPage() {
   const [showScoring, setShowScoring] = useState(false);
   const [forcingUpdate, setForcingUpdate] = useState(false);
   const [creatingNextWeek, setCreatingNextWeek] = useState(false);
+  const [shadowTestBusy, setShadowTestBusy] = useState(false);
   // Week history (previous weeks dropdown)
   const [weekHistory, setWeekHistory] = useState([]);
   const [historyWeekIndex, setHistoryWeekIndex] = useState(null);
@@ -434,6 +437,11 @@ export default function TournamentPage() {
   const clearFinalResultsFn = httpsCallable(functions, "debugClearFinalResults");
   const scoringRef = useRef(null);
 
+  const recomputeStandingsFn = httpsCallable(
+    functions,
+    "debugRecomputeRegularSeasonStandings"
+  );
+
   const totalRoundsDisplay =
     totalRounds ??
     (() => {
@@ -464,6 +472,7 @@ export default function TournamentPage() {
 
   //Add previous weeeks 
   const [repairing, setRepairing] = useState(false);
+  const [recomputingStandings, setRecomputingStandings] = useState(false);
 
     async function repairThisWeek() {
       if (!isHost) return;
@@ -485,7 +494,45 @@ export default function TournamentPage() {
       }
     }
 
+  async function debugRunGlobalShadowRegularTest() {
+    if (!isHost) return;
+    if (!roomId) return;
+    if (currentWeekIndex == null) return alert("No current weekIndex yet.");
 
+    try {
+      setShadowTestBusy(true);
+
+      const fn = httpsCallable(functions, "debugComputeGlobalShadowRegularRoom");
+      const res = await fn({ roomId, weekIndex: currentWeekIndex });
+
+      console.log("====================================");
+      console.log("GLOBAL SHADOW REGULAR TEST RESULT");
+      console.log("Room:", roomId);
+      console.log("Week:", currentWeekIndex);
+      console.log("Season:", res.data?.seasonKey);
+      console.log("Summary:", res.data);
+      console.table(res.data?.fixtureCoverage || []);
+      console.table(
+        Object.entries(res.data?.diffsByUid || {}).map(([uid, diff]) => ({
+          uid,
+          diff,
+        }))
+      );
+      console.table(res.data?.playerMismatches || []);
+      console.log("Max Abs Diff:", res.data?.maxAbsDiff);
+      console.log("Missing Fixtures:", res.data?.missingFixtureCount);
+      console.log("====================================");
+
+      alert(
+        `Shadow test complete: maxAbsDiff=${res.data?.maxAbsDiff ?? 0}, missingFixtures=${res.data?.missingFixtureCount ?? 0}`
+      );
+    } catch (e) {
+      console.error("GLOBAL SHADOW REGULAR TEST FAILED", e);
+      alert(e?.message || "Global regular shadow test failed. Check console.");
+    } finally {
+      setShadowTestBusy(false);
+    }
+  }
 
   async function forceUpdateThisWeek() {
     if (!isHost) return;
@@ -505,6 +552,31 @@ export default function TournamentPage() {
       setForcingUpdate(false);
     }
   }
+
+  async function recomputeRegularStandingsNow() {
+    if (!isHost) return;
+
+    try {
+      setRecomputingStandings(true);
+
+      const res = await recomputeStandingsFn({ roomId });
+
+      console.log("debugRecomputeRegularSeasonStandings:", res?.data);
+
+      const count = res?.data?.standingsCount ?? 0;
+      const finalWeekCount = res?.data?.standingsDoc?.finalWeekCount ?? "?";
+
+      alert(
+        `Leaderboard rebuilt. Rows: ${count}. Final weeks counted: ${finalWeekCount}.`
+      );
+    } catch (e) {
+      console.error("debugRecomputeRegularSeasonStandings failed", e);
+      alert("Error: " + (e?.message || "Unknown error"));
+    } finally {
+      setRecomputingStandings(false);
+    }
+  }
+
   async function syncTotalRounds() {
     if (!isHost) return;
     try {
@@ -1039,7 +1111,10 @@ export default function TournamentPage() {
   let liveStandings = [...baseStandings];
 
   // If there is an active week that is NOT final yet, project the live points onto the base standings
-  if (activeResults && activeResults.status !== "final") {
+  const activeStatus = String(activeResults?.status || "").toLowerCase();
+  const shouldProjectActiveWeek = activeResults && ["live", "resolving"].includes(activeStatus);
+
+  if (shouldProjectActiveWeek) {
     const map = {};
     
     // 1. Copy the base standings into a map
@@ -1117,13 +1192,17 @@ export default function TournamentPage() {
   });
 
   //Status label with color 
-  const statusRaw = activeResults?.status
-  const statusLower = String(statusRaw).toLowerCase();
+  const statusRaw = activeResults?.status || "idle";
+  const statusLowerRaw = String(statusRaw).toLowerCase();
+
+  // Keep the UI consistent: scheduled/sleeping should look like IDLE.
+  const statusLower = statusLowerRaw === "scheduled" ? "idle" : statusLowerRaw;
+
   const isLive = statusLower === "live";
   const isResolving = statusLower === "resolving";
-  const isScheduled = statusLower === "scheduled"; 
-  const statusClass = isLive ? "live" : isResolving ? "resolving" : isScheduled ? "scheduled" : "idle";
-  const statusLabel = isLive ? "LIVE" : isResolving ? "RESOLVING" : isScheduled ? "SCHEDULED" : "IDLE";
+
+  const statusClass = isLive ? "live" : isResolving ? "resolving" : "idle";
+  const statusLabel = isLive ? "LIVE" : isResolving ? "RESOLVING" : "IDLE";
 
   return (
     <div className="tpPage">
@@ -1209,6 +1288,21 @@ export default function TournamentPage() {
                   <button
                     type="button"
                     className="tpToolsItem"
+                    onClick={debugRunGlobalShadowRegularTest}
+                    disabled={
+                      shadowTestBusy ||
+                      forcingUpdate ||
+                      creatingNextWeek ||
+                      repairing ||
+                      recomputingStandings
+                    }
+                  >
+                    {shadowTestBusy ? "Running Shadow Test..." : "DEV: Test Global Shadow"}
+                  </button>
+
+                  <button
+                    type="button"
+                    className="tpToolsItem"
                     onClick={forceUpdateThisWeek}
                     disabled={forcingUpdate || creatingNextWeek || repairing}
                   >
@@ -1222,6 +1316,15 @@ export default function TournamentPage() {
                     disabled={syncingRounds || forcingUpdate || creatingNextWeek || repairing}
                   >
                     {syncingRounds ? "Syncing..." : "Sync Total Rounds"}
+                  </button>
+
+                  <button
+                    type="button"
+                    className="tpToolsItem"
+                    onClick={recomputeRegularStandingsNow}
+                    disabled={recomputingStandings || forcingUpdate || creatingNextWeek || repairing}
+                  >
+                    {recomputingStandings ? "Rebuilding..." : "DEV: Rebuild Leaderboard"}
                   </button>
 
                   <button className="tpToolsItem" onClick={forceFinalizeSeason} disabled={forcingFinalize}>
@@ -2172,9 +2275,125 @@ export default function TournamentPage() {
   );
 }
 
+const LIVE_TIMER_STATUSES = new Set(["1H", "2H", "ET"]);
+const HOLD_TIMER_STATUSES = new Set(["HT", "BT", "P"]);
+const FINISHED_TIMER_STATUSES = new Set(["FT", "AET", "PEN"]);
+
+function timerStatusOf(stats = {}) {
+  return String(
+    stats?.statusShort ||
+    stats?.fixtureStatus ||
+    stats?.matchStatus ||
+    ""
+  ).toUpperCase();
+}
+
+function formatClockSeconds(totalSeconds) {
+  const safe = Math.max(0, Math.floor(Number(totalSeconds) || 0));
+  const mins = Math.floor(safe / 60);
+  const secs = safe % 60;
+
+  return `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+}
+
+function getLiveTimerDisplay(stats, nowMs) {
+  const status = timerStatusOf(stats);
+
+  if (!status || status === "NS" || status === "TBD") return null;
+
+  if (FINISHED_TIMER_STATUSES.has(status)) {
+    return { main: "FINAL SCORE", extra: "", kind: "final" };
+  }
+
+  if (status === "HT") {
+    return { main: "HT 45:00", extra: "", kind: "hold" };
+  }
+
+  if (status === "BT") {
+    return { main: "ET 90:00", extra: "", kind: "hold" };
+  }
+
+  if (status === "P") {
+    return { main: "PENS", extra: "", kind: "hold" };
+  }
+
+  const apiElapsed = Number(
+    stats?.elapsed ??
+    stats?.timerElapsed ??
+    stats?.matchElapsed
+  );
+
+  if (!Number.isFinite(apiElapsed)) return null;
+
+  const updatedAtMs = Number(
+    stats?.statusUpdatedAtMs ??
+    stats?.timerUpdatedAtMs ??
+    stats?.updatedAtMs
+  );
+
+  const apiExtra = Number(stats?.extra ?? stats?.stoppageTime ?? 0);
+
+  let seconds = Math.max(0, Math.floor(apiElapsed * 60));
+
+  // Local display timer only. This does NOT call the API.
+  if (
+    LIVE_TIMER_STATUSES.has(status) &&
+    Number.isFinite(updatedAtMs) &&
+    updatedAtMs > 0 &&
+    nowMs > updatedAtMs
+  ) {
+    seconds += Math.floor((nowMs - updatedAtMs) / 1000);
+  }
+
+  let capSeconds = null;
+  if (status === "1H") capSeconds = 45 * 60;
+  if (status === "2H") capSeconds = 90 * 60;
+  if (status === "ET") capSeconds = 120 * 60;
+
+  let extra = "";
+
+  if (capSeconds && (seconds > capSeconds || apiExtra > 0)) {
+    const computedExtra = seconds > capSeconds
+      ? Math.ceil((seconds - capSeconds) / 60)
+      : 0;
+
+    const bestExtra = Math.max(
+      Number.isFinite(apiExtra) ? apiExtra : 0,
+      computedExtra
+    );
+
+    seconds = capSeconds;
+    extra = bestExtra > 0 ? `+${bestExtra}` : "";
+  }
+
+  return {
+    main: formatClockSeconds(seconds),
+    extra,
+    kind: "live",
+  };
+}
+
 function PlayerStatsCard({ stats, breakdown, teamName, opponentName, labels }) {
   const hasStats = stats && Object.keys(stats).length > 0;
   const hasBD = breakdown && Object.keys(breakdown).length > 0;
+
+  const [timerNowMs, setTimerNowMs] = useState(Date.now());
+  const timerStatus = timerStatusOf(stats);
+
+  useEffect(() => {
+    if (!LIVE_TIMER_STATUSES.has(timerStatus)) return;
+
+    const id = window.setInterval(() => {
+      setTimerNowMs(Date.now());
+    }, 1000);
+
+    return () => window.clearInterval(id);
+  }, [
+    timerStatus,
+    stats?.elapsed,
+    stats?.extra,
+    stats?.statusUpdatedAtMs,
+  ]);
   
   const showMatchHeader = Boolean(teamName || opponentName);
 
@@ -2182,6 +2401,14 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName, labels }) {
   const tScore = stats?.teamScore ?? stats?.teamGoals ?? null;
   const oScore = stats?.opponentScore ?? stats?.opponentGoals ?? null;
   const hasScore = tScore !== null && oScore !== null;
+  const timerDisplay = getLiveTimerDisplay(stats, timerNowMs);
+  const isLiveStatus =
+    LIVE_TIMER_STATUSES.has(timerStatus) ||
+    HOLD_TIMER_STATUSES.has(timerStatus);
+
+  const dividerLabel =
+    timerDisplay?.main ||
+    (isLiveStatus ? "LIVE" : hasScore ? "FINAL SCORE" : "VS");
 
   if (!hasStats && !hasBD) {
     return (
@@ -2248,22 +2475,55 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName, labels }) {
   // Helper to fallback to pretty text if STAT_LABELS is missing a key
   const prettyLabel = (k) => {
     if (labels && labels[k]) return labels[k];
-    return k.replace(/([A-Z])/g, " $1").replace(/^./, str => str.toUpperCase());
+    if (STAT_LABELS[k]) return STAT_LABELS[k];
+
+    return k
+      .replace(/_/g, " ")
+      .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+      .replace(/^./, str => str.toUpperCase());
   };
+
+  function formatStatValue(key, value) {
+    if (key === "kickoffMs" || key === "kickoffAtMs") {
+      const ms = Number(value);
+      if (!Number.isFinite(ms) || ms <= 0) return "—";
+
+      return new Date(ms).toLocaleTimeString("en-US", {
+        hour: "numeric",
+        minute: "2-digit",
+        hour12: true,
+      });
+    }
+
+    return String(value);
+  }
 
   return (
     <div className="tpStatsCard">
       {showMatchHeader && (
-        <div className="tpCardHeader">
-          <span className="tpCardTeam">{teamName || "Unknown Team"}</span>
-          {opponentName && (
-            <span className="tpCardVs">
-              {hasScore ? ` ${tScore} - ${oScore} ` : " vs "}
-              {opponentName}
-            </span>
-          )}
+      <div className="tpCardHeader">
+        <div className="tpMatchHeaderTeam tpMatchHeaderTeamTop">
+          <span className="tpMatchHeaderName">{teamName || "Unknown Team"}</span>
+          {hasScore && <span className="tpMatchHeaderScore">{tScore}</span>}
         </div>
-      )}
+
+        {opponentName && (
+          <>
+            <div className={`tpMatchHeaderDivider ${timerDisplay?.kind ? `tpMatchHeaderDivider-${timerDisplay.kind}` : ""}`}>
+              <span>{dividerLabel}</span>
+              {timerDisplay?.extra ? (
+                <span className="tpMatchTimerExtra">{timerDisplay.extra}</span>
+              ) : null}
+            </div>
+
+            <div className="tpMatchHeaderTeam">
+              <span className="tpMatchHeaderName">{opponentName}</span>
+              {hasScore && <span className="tpMatchHeaderScore">{oScore}</span>}
+            </div>
+          </>
+        )}
+      </div>
+    )}
 
       <div className="tpStatsGrid">
         <div className="tpStatsCol">
@@ -2273,12 +2533,28 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName, labels }) {
             
             // Hide the stat completely if the value is 0, false, null, or an internal API flag
             if (v == null || v === false || v === 0 || v === "0") return null;
-            if (k === "isLive" || k === "teamId" || k === "fixtureId" || k === "teamScore" || k === "opponentScore" || k === "teamGoals" || k === "opponentGoals") return null;
+            if (
+              k === "isLive" ||
+              k === "teamId" ||
+              k === "fixtureId" ||
+              k === "fixtureStatus" ||
+              k === "matchStatus" ||
+              k === "statusShort" ||
+              k === "statusLong" ||
+              k === "elapsed" ||
+              k === "extra" ||
+              k === "statusUpdatedAtMs" ||
+              k === "timerUpdatedAtMs" ||
+              k === "teamScore" ||
+              k === "opponentScore" ||
+              k === "teamGoals" ||
+              k === "opponentGoals"
+            ) return null;
 
             return (
               <div key={k} className="tpStatRow">
                 <span>{prettyLabel(k)}</span>
-                <span>{String(v)}</span>
+                <span>{formatStatValue(k, v)}</span>
               </div>
             );
           })}

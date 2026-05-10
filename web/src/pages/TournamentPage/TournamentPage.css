@@ -1375,31 +1375,93 @@
   margin-bottom: 8px;
 }
 
-/* Scoring popover: more compact + 2 columns */
+
+/* Scoring popover: compact + scrollable */
 .tpScoringPopover{
-  width: 520px;
+  width: min(520px, calc(100vw - 32px));
+  max-height: min(70dvh, 620px);
+  overflow: hidden;
+
+  display: flex;
+  flex-direction: column;
 }
 
 .tpScoringList{
   grid-template-columns: 1fr 1fr;
   gap: 8px;
+
+  overflow-y: auto;
+  padding-right: 4px;
+  -webkit-overflow-scrolling: touch;
 }
 
 .tpScoringItem{
   padding: 8px;
+  min-height: 0;
 }
 
 .tpScoringLabel{
   font-size: 0.9rem;
+  line-height: 1.15;
 }
 
 .tpScoringDetail{
   font-size: 0.8rem;
+  line-height: 1.25;
 }
 
+/* Phone layout */
 @media (max-width: 720px){
-  .tpScoringPopover{ width: 360px; }
-  .tpScoringList{ grid-template-columns: 1fr; }
+  .tpScoringPopover{
+    position: fixed;
+    left: 16px;
+    right: 16px;
+    top: max(92px, calc(env(safe-area-inset-top) + 70px));
+    width: auto;
+    max-width: none;
+    max-height: calc(100dvh - 125px - env(safe-area-inset-bottom));
+    padding: 10px;
+    border-radius: 18px;
+    z-index: 999;
+  }
+
+  .tpScoringTitle{
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    margin-bottom: 8px;
+    padding-bottom: 8px;
+    background: rgba(10,12,22,0.96);
+  }
+
+  .tpScoringList{
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+    overflow-y: auto;
+    padding-right: 3px;
+  }
+
+  .tpScoringItem{
+    padding: 7px 8px;
+    border-radius: 12px;
+  }
+
+  .tpScoringLabel{
+    font-size: 0.72rem;
+    line-height: 1.1;
+  }
+
+  .tpScoringDetail{
+    font-size: 0.68rem;
+    line-height: 1.2;
+  }
+}
+
+/* Very small phones: use 1 column so text does not get crushed */
+@media (max-width: 390px){
+  .tpScoringList{
+    grid-template-columns: 1fr;
+  }
 }
 
 .tpCompetitionLabel {
@@ -1724,3 +1786,73 @@
     letter-spacing: 0.12em;
   }
 }
+
+.tpMatchHeaderDivider-live{
+  color: rgba(255,255,255,0.92);
+}
+
+.tpMatchHeaderDivider-live span:first-child{
+  font-size: 0.82rem;
+  letter-spacing: 0.12em;
+}
+
+.tpMatchHeaderDivider-hold span:first-child{
+  color: rgba(251, 191, 36, 0.95);
+  font-size: 0.78rem;
+}
+
+.tpMatchHeaderDivider-final span:first-child{
+  color: rgba(255,255,255,0.45);
+}
+
+.tpMatchTimerExtra{
+  color: #4ade80;
+  font-size: 0.82rem;
+  font-weight: 950;
+  letter-spacing: 0.08em;
+  text-shadow: 0 0 10px rgba(74, 222, 128, 0.35);
+}
+
+/* Header status should match the player LIVE/IDLE pill behavior */
+.tpLiveHeaderLine .tpLivePill {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  font-size: 12px;
+  font-weight: 900;
+  letter-spacing: .10em;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.tpLivePill.live {
+  color: rgb(255, 255, 255);
+  animation: pulseRed 1.5s infinite;
+  text-shadow:
+    0 0 5px #fff,
+    0 0 10px #ff0000,
+    0 0 20px #ff0000,
+    0 0 30px #ff0000,
+    0 0 40px #ff0000,
+    0 0 50px #ff0000;
+}
+
+.tpLivePill.idle,
+.tpLivePill.scheduled {
+  color: rgba(255,255,255,0.75);
+  animation: none;
+  text-shadow: none;
+}
+
+.tpLivePill.resolving {
+  color: rgba(251, 191, 36, 0.95);
+  animation: none;
+  text-shadow: 0 0 10px rgba(251, 191, 36, 0.35);
+}
+
+.tpLivePill.error {
+  color: rgba(248, 113, 113, 0.95);
+  animation: none;
+  text-shadow: 0 0 10px rgba(248, 113, 113, 0.30);
+}
+

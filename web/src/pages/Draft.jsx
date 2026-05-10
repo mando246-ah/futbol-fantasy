@@ -6,7 +6,7 @@ import {
   getUserProfile,
   watchRoom,
   joinRoom,
-  leaveRoom,
+  kickMemberFromRoom,
   getLastRoomId,
   setLastRoomId,
   callMakePick,
@@ -19,6 +19,7 @@ import {
   doc,
   setDoc,
   getDoc,
+  getDocs,
   onSnapshot,
   collection,
   serverTimestamp,
@@ -43,6 +44,24 @@ import FlagIcon from "@/components/FlagIcon";
 
 // ----- Config -----
 const TURN_SECONDS = 120;
+
+const NEW_ROOM_GLOBAL_PIPELINE_MODE = "legacy";
+// For testing, I may temporarily change this to "shadow".
+// For public/stable rooms, it should stay "legacy".
+
+function buildClientGlobalPipeline(mode = "legacy") {
+  const normalized = ["legacy", "shadow", "global"].includes(String(mode).toLowerCase())
+    ? String(mode).toLowerCase()
+    : "legacy";
+
+  return {
+    mode: normalized,
+    playerPool: normalized === "shadow" || normalized === "global",
+    liveFixtureCache: normalized === "shadow" || normalized === "global",
+    roomAggregator: normalized === "global",
+    version: 1,
+  };
+}
 
 // ----- Mock pool (30 players) -----
 const MOCK_PLAYERS = [
@@ -139,7 +158,7 @@ function managerPillStyle(uid, isMine) {
   };
 }
 
-// ----- Draft rules (Starting XI formation) -----
+// ----- Draft rules (Starting XI formation) ----- and tracker
 // Matches the View Roster rules pills: GK:1, DEF:3–5, MID:3–5, ATT:1–3
 const STARTING_XI_FORMATION_RULES = [
   { pos: "GK", range: "1" },
@@ -164,6 +183,27 @@ function DraftFormationRules({ compact = false }) {
   );
 }
 
+const DRAFT_POSITION_TRACKER_ORDER = ["GK", "DEF", "MID", "ATT"];
+
+function DraftPositionTracker({ counts = {}, total = 0 }) {
+  return (
+    <div className="draftPositionTrackerCard">
+      <div className="draftPositionTrackerTitle">Your drafted players</div>
+
+      <div className="draftPositionTrackerPills">
+        {DRAFT_POSITION_TRACKER_ORDER.map((pos) => (
+          <span key={pos} className="draftPositionTrackerPill">
+            {pos}: {Number(counts[pos] || 0)}
+          </span>
+        ))}
+      </div>
+
+      <div className="draftPositionTrackerNote">
+        Total drafted: <b>{total}</b>
+      </div>
+    </div>
+  );
+}
 
 
 // Returns next occurrence of a weekday as YYYY-MM-DD in a given IANA timezone.
@@ -218,8 +258,27 @@ export default function DraftWithPresence() {
   // Routing / room selection
   const [roomId, setRoomId] = useState(() => {
     const url = new URL(window.location.href);
-    return url.searchParams.get("room") || getLastRoomId() || "";
+    return url.searchParams.get("room") || "";
   });
+
+  useEffect(() => {
+    if (!user?.uid) return;
+
+    const url = new URL(window.location.href);
+    const roomFromUrl = url.searchParams.get("room");
+
+    // If user came from an actual room link, use that.
+    if (roomFromUrl) {
+      setRoomId(roomFromUrl);
+      return;
+    }
+
+    // Otherwise only load the saved room for THIS signed-in user.
+    const savedRoom = getLastRoomId(user.uid);
+    if (savedRoom) {
+      setRoomId(savedRoom);
+    }
+  }, [user?.uid]);
   const [roomKeyInput, setRoomKeyInput] = useState("");
 
   // Live room state
@@ -240,6 +299,10 @@ export default function DraftWithPresence() {
   const [allPicksPos, setAllPicksPos] = useState("ALL");
   const [allPicksQuery, setAllPicksQuery] = useState("");
   const [memberLabelByUid, setMemberLabelByUid] = useState({});
+
+  // User in room 
+  const [joinAttempted, setJoinAttempted] = useState(false);
+
   const managerLabel = (uid, fallback = "Someone") => {
     const key = String(uid || "");
     return memberLabelByUid[key] || fallback;
@@ -336,12 +399,13 @@ useEffect(() => {
 
   // Watch room doc (members live in the room doc's `members` array)
   useEffect(() => {
-    if(roomId) setLastRoomId(roomId);
-  }, [roomId]);
+    if (roomId && user?.uid) setLastRoomId(roomId, user.uid);
+  }, [roomId, user?.uid]);
 
   useEffect(() => {
-    if (!roomId) return;
-    setLastRoomId(roomId);
+    if (!roomId || !user?.uid) return;
+    setLastRoomId(roomId, user.uid);
+    setJoinAttempted(false);
 
     const unsubRoom = watchRoom(roomId, (data) => {
       setRoom(data);
@@ -369,14 +433,11 @@ useEffect(() => {
         console.error("joinRoom failed:", e);
       } finally {
         setJoining(false);
+        setJoinAttempted(true);
       }
     };
     const unAuth = watchAuth(() => tryJoin());
     tryJoin();
-
-    // Leave on unload (best effort)
-    const onBye = () => leaveRoom(roomId);
-    window.addEventListener("beforeunload", onBye);
 
     // Picks stream
     const unsubPicks = onSnapshot(
@@ -385,12 +446,41 @@ useEffect(() => {
     );
 
     return () => {
-      window.removeEventListener("beforeunload", onBye);
       unAuth && unAuth();
       unsubRoom && unsubRoom();
       unsubPicks && unsubPicks();
     };
-  }, [roomId]);
+  }, [roomId, user?.uid]);
+
+  // If host kicks this user out, remove the room from their UI.
+  useEffect(() => {
+    if (!roomId || !user?.uid || !room || joining || !joinAttempted) return;
+
+    const roomMembers = Array.isArray(room.members) ? room.members : [];
+    const isStillMember = roomMembers.some((m) => {
+      const uid = typeof m === "string" ? m : m?.uid ?? m?.userId ?? m?.id;
+      return String(uid || "") === String(user.uid);
+    });
+
+    if (isStillMember) return;
+
+    setRoomId("");
+    setRoomKeyInput("");
+    setRoom(null);
+    setMembers([]);
+    setPicks([]);
+
+    localStorage.removeItem("lastRoomId");
+    window.dispatchEvent(new Event("lastRoomIdChanged"));
+
+    const url = new URL(window.location.href);
+    if (url.searchParams.has("room")) {
+      url.searchParams.delete("room");
+      window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+    }
+
+    alert("You were removed from this room by the host.");
+  }, [roomId, user?.uid, room, joining, joinAttempted]);
 
   // Create a room (host)
   async function createRoom() {
@@ -420,8 +510,10 @@ useEffect(() => {
         started: false,
         startAt: null,
         turnDeadlineAt: null,
+        globalPipeline: buildClientGlobalPipeline(NEW_ROOM_GLOBAL_PIPELINE_MODE),
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
+        
       });
 
       // Create the fast “mirrors” (these are quick)
@@ -473,44 +565,55 @@ useEffect(() => {
   // Join by code
   async function joinByCode() {
     if (!user) return alert("Sign in first");
+
     const key = roomKeyInput.trim().toUpperCase();
     if (!key) return alert("Enter a room key");
-    const ref = doc(db, "rooms", key);
-    const snap = await getDoc(ref);
-    if (!snap.exists()) return alert("Room not found");
 
-    const profile = await getUserProfile(user.uid).catch(() => null);
-    const displayName = profile?.displayName || user.displayName || user.email || "User";
+    try {
+      const profile = await getUserProfile(user.uid).catch(() => null);
+      const displayName =
+        profile?.displayName ||
+        user.displayName ||
+        user.email ||
+        "User";
 
-    // Subcollection mirror (optional)
-    await setDoc(doc(db, "rooms", key, "members", user.uid), {
-      uid: user.uid,
-      displayName,
-      joinedAt: serverTimestamp(),
-    }, { merge: true });
+      await joinRoom(key, { displayName });
 
-    // Update room.members array if not present
-    const data = snap.data();
-    const arr = Array.isArray(data.members) ? data.members : [];
-    if (!arr.find(m => m.uid === user.uid)) {
-      await updateDoc(ref, { members: [...arr, { uid: user.uid, displayName }], updatedAt: serverTimestamp() });
+      setRoomId(key);
+
+      logAnalyticsEvent("join_room", {
+        room_id: key,
+        join_method: "code",
+      });
+    } catch (e) {
+      alert(e?.message || "Could not join room.");
+    }
+  }
+
+  //Host kick users
+  async function handleKickMember(member) {
+    if (!isHost || !roomId || room?.started) return;
+
+    const targetUid = member?.uid;
+    if (!targetUid) return;
+
+    if (targetUid === room.hostUid) {
+      return alert("You cannot kick the host.");
     }
 
-    await setDoc(doc(db, "users", user.uid, "rooms", key), {
-      roomId: key,
-      code: data.code || key,
-      name: data.name || "Room",
-      hostUid: data.hostUid || "",
-      joinedAt: serverTimestamp(),
-      lastSeenAt: serverTimestamp(),
-    }, { merge: true });
+    const name = displayNameOf(member, "this user");
 
+    const ok = window.confirm(
+      `Kick ${name} from this room?\n\nThey will be removed from the waiting room and will not be part of the draft.`
+    );
 
-    setRoomId(key);
-      logAnalyticsEvent("join_room", {
-      room_id: key,
-      join_method: "code",
-    });
+    if (!ok) return;
+
+    try {
+      await kickMemberFromRoom(roomId, targetUid);
+    } catch (e) {
+      alert(e?.message || "Failed to kick user.");
+    }
   }
 
   // Host: schedule start
@@ -684,7 +787,6 @@ useEffect(() => {
   }, [picks, allPicksQuery]);
 
 
-  // Put this ABOVE your availablePlayers useMemo
   function normalizeDraftPos(pos) {
     const p = String(pos || "").toUpperCase();
 
@@ -698,6 +800,23 @@ useEffect(() => {
 
     return p;
   }
+
+  const myDraftPositionCounts = useMemo(() => {
+    const counts = { GK: 0, DEF: 0, MID: 0, ATT: 0 };
+
+    for (const p of picks || []) {
+      if (String(p.uid || "") !== String(user?.uid || "")) continue;
+
+      const pos = normalizeDraftPos(p.position);
+      if (counts[pos] !== undefined) counts[pos] += 1;
+    }
+
+    return counts;
+  }, [picks, user?.uid]);
+
+  const myDraftedCount = useMemo(() => {
+    return Object.values(myDraftPositionCounts).reduce((sum, n) => sum + Number(n || 0), 0);
+  }, [myDraftPositionCounts]);
 
   // If you have poolPlayers from Firestore, use them; otherwise fall back to MOCK_PLAYERS
   const ALL_PLAYERS = (poolPlayers?.length ? poolPlayers : MOCK_PLAYERS).map((p) => ({
@@ -1013,11 +1132,28 @@ useEffect(() => {
                               </Avatar>
                             );
                           })()}
+
                           <span className="font-medium">{displayNameOf(m)}</span>
                         </div>
-                        {m.uid === room.hostUid && <Badge className="bg-goal text-ball">Host</Badge>}
+
+                        <div className="flex items-center gap-2">
+                          {m.uid === room.hostUid && (
+                            <Badge className="bg-goal text-ball">Host</Badge>
+                          )}
+
+                          {isHost && !room.started && m.uid !== room.hostUid && (
+                            <button
+                              type="button"
+                              onClick={() => handleKickMember(m)}
+                              className="rounded-md border border-red-400/60 bg-red-500/15 px-2 py-1 text-xs font-semibold text-red-100 hover:bg-red-500/25"
+                            >
+                              Kick
+                            </button>
+                          )}
+                        </div>
                       </div>
                     ))}
+
                     {(!room.members || room.members.length === 0) && (
                       <p className="text-sm opacity-80">No members yet.</p>
                     )}
@@ -1136,7 +1272,13 @@ useEffect(() => {
                     </span>
                   </div>
                 ) : null}
+
                 <DraftFormationRules />
+                <DraftPositionTracker
+                  counts={myDraftPositionCounts}
+                  total={myDraftedCount}
+                />
+
                 <div className="draftTurnBanner">
                   <div className="draftTurnMain">
                     <Avatar className="draftTurnAvatar">
@@ -1404,8 +1546,8 @@ function PlayerPool({
         </select>
 
         <input
-          className="border px-3 py-2 rounded flex-1 min-w-[200px]"
-          placeholder="Search player…"
+          className="draftPlayerSearchInput flex-1 min-w-[200px]"
+          placeholder="Search player, club, nation, or position…"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
         />
@@ -1600,20 +1742,32 @@ function LeagueSelector({ roomId, room, isHost, poolCount, setSeedingPlayers }) 
       const written = res.data?.written ?? 0;
 
       await updateDoc(doc(db, "rooms", roomId), {
+        competitionLocked: true,
         status: "ready_to_draft",
         playerCount: written,
         updatedAt: serverTimestamp(),
       });
     } catch (e) {
       console.error(e);
-      setError(e?.message || "Failed to seed players.");
+      const playersSnap = await getDocs(collection(db, "rooms", roomId, "players")).catch(() => null);
+      const loadedCount = playersSnap?.size || 0;
 
-      // unlock if failed
-      await updateDoc(doc(db, "rooms", roomId), {
-        competitionLocked: false,
-        status: "waiting_competition",
-        updatedAt: serverTimestamp(),
-      }).catch(() => {});
+      if (loadedCount > 0) {
+        setError("Players loaded, but the backend returned a non-critical error. Room is ready to draft.");
+        await updateDoc(doc(db, "rooms", roomId), {
+          competitionLocked: true,
+          status: "ready_to_draft",
+          playerCount: loadedCount,
+          updatedAt: serverTimestamp(),
+        }).catch(() => {});
+      } else {
+        setError(e?.message || "Failed to seed players.");
+        await updateDoc(doc(db, "rooms", roomId), {
+          competitionLocked: false,
+          status: "waiting_competition",
+          updatedAt: serverTimestamp(),
+        }).catch(() => {});
+      }
     } finally {
       setSeedingPlayers(false);
     }
@@ -1678,7 +1832,7 @@ function LeagueSelector({ roomId, room, isHost, poolCount, setSeedingPlayers }) 
       ) : (
         <>
           <input
-            className="w-full bg-black text-white border border-gray-600 rounded px-3 py-2 text-sm"
+            className="draftCompetitionSearchInput"
             placeholder="Search leagues/cups…"
             value={queryText}
             onChange={(e) => setQueryText(e.target.value)}
@@ -1687,7 +1841,7 @@ function LeagueSelector({ roomId, room, isHost, poolCount, setSeedingPlayers }) 
 
           <div className="mt-2 flex gap-2 items-center">
             <input
-              className="bg-black text-white border border-gray-600 rounded px-3 py-2 text-sm w-28"
+              className="draftSeasonInput"
               value={season}
               onChange={(e) => setSeason(e.target.value)}
               placeholder="Season"
@@ -1759,4 +1913,3 @@ function LeagueSelector({ roomId, room, isHost, poolCount, setSeedingPlayers }) 
     </div>
   );
 }
-

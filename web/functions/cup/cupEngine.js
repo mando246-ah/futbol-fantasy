@@ -1,14 +1,157 @@
 "use strict";
 
+const admin = require("firebase-admin");
+const { FieldValue } = admin.firestore;
 const { scorePlayer, scoreTeam } = require("../shared/scoringCore");
 const { pickCupWindow } = require("./cupWindows");
 const { cupCurrentRef, cupFixtureRef, getCreditedMap } = require("./cupLedger");
+const { getCompetitionState, setCompetitionState } = require("../shared/competitionState");
 
 function isInPlay(short) {
   return ["1H", "HT", "2H", "ET", "BT", "P"].includes(short);
 }
 function isFinished(short) {
   return ["FT", "AET", "PEN"].includes(short);
+}
+
+function isTrueCupFinalLabel(label) {
+  const s = String(label || "").toLowerCase().trim();
+  if (!s) return false;
+
+  // Avoid false matches like "Semi-finals"
+  if (s.includes("semi")) return false;
+  if (s.includes("quarter")) return false;
+  if (s.includes("round of")) return false;
+  if (s.includes("play-off") || s.includes("playoff")) return false;
+
+  return s === "final" || s.startsWith("final ") || s.endsWith(" final");
+}
+
+function normalizeCupWindowFixtures(fixtures = [], currentIds = []) {
+  const byId = new Map();
+
+  for (const raw of Array.isArray(fixtures) ? fixtures : []) {
+    const id = String(raw?.id || raw?.fixtureId || "").trim();
+    if (!id) continue;
+
+    const kickoffMs = Number(raw?.kickoffMs || 0);
+    byId.set(id, {
+      id,
+      kickoffMs: Number.isFinite(kickoffMs) && kickoffMs > 0 ? kickoffMs : null,
+      round: raw?.round || null,
+    });
+  }
+
+  const ids = Array.isArray(currentIds) ? currentIds.map(String).filter(Boolean) : [];
+  if (!ids.length) {
+    return Array.from(byId.values());
+  }
+
+  return ids.map((id) => (
+    byId.get(id) || {
+      id,
+      kickoffMs: null,
+      round: null,
+    }
+  ));
+}
+
+function buildCupCompetitionStatePatch({
+  weekStatus,
+  nextCupPollAtMs,
+  nowMs,
+  currentLabel,
+  isDone,
+}) {
+  const nextPollNumber = Number(nextCupPollAtMs);
+  const normalizedNextPollAtMs =
+    nextCupPollAtMs === null || nextCupPollAtMs === undefined
+      ? null
+      : Number.isFinite(nextPollNumber)
+        ? nextPollNumber
+        : null;
+
+  const patch = {
+    weekStatus,
+    updatedAtMs: nowMs,
+    lastCupPollAtMs: nowMs,
+    nextPollAtMs: normalizedNextPollAtMs,
+    nextCupPollAtMs: normalizedNextPollAtMs,
+  };
+
+  if (currentLabel !== undefined) {
+    patch.currentLabel = currentLabel;
+  }
+
+  if (isDone !== undefined) {
+    patch.isDone = Boolean(isDone);
+  }
+
+  return patch;
+}
+
+function computeNextCupPollAtMs({ cup, currentIds, shortById, creditedMap, nowMs }) {
+  const PRE_MS = 20 * 60 * 1000;
+  const MATCH_RUNTIME_MS = 135 * 60 * 1000;
+  const POST_MS = 2 * 60 * 60 * 1000;
+  const POLL_MS = 60 * 1000;
+  const FALLBACK_MS = 60 * 60 * 1000;
+
+  const ids = Array.isArray(currentIds) ? currentIds.map(String).filter(Boolean) : [];
+  if (!ids.length) return nowMs + FALLBACK_MS;
+
+  const fixtures = normalizeCupWindowFixtures(cup?.currentWindowFixtures, ids);
+
+  if (ids.some((fixtureId) => isInPlay(shortById?.[fixtureId]))) {
+    return nowMs + POLL_MS;
+  }
+
+  if (ids.some((fixtureId) => isFinished(shortById?.[fixtureId]) && !creditedMap?.[fixtureId])) {
+    return nowMs + POLL_MS;
+  }
+
+  let earliestWakeAtMs = null;
+
+  for (const fixture of fixtures) {
+    const fixtureId = String(fixture?.id || "").trim();
+    if (!fixtureId) continue;
+
+    const kickoffMs = Number(fixture?.kickoffMs || 0);
+    if (!Number.isFinite(kickoffMs) || kickoffMs <= 0) continue;
+
+    const short = shortById?.[fixtureId] || null;
+    const credited = Boolean(creditedMap?.[fixtureId]);
+    const wakeAtMs = kickoffMs - PRE_MS;
+    const settleUntilMs = kickoffMs + MATCH_RUNTIME_MS + POST_MS;
+
+    if (isFinished(short)) {
+      if (nowMs < settleUntilMs) {
+        return nowMs + POLL_MS;
+      }
+      continue;
+    }
+
+    if (!credited) {
+      if (nowMs >= wakeAtMs && nowMs < settleUntilMs) {
+        return nowMs + POLL_MS;
+      }
+
+      if (wakeAtMs > nowMs) {
+        earliestWakeAtMs =
+          earliestWakeAtMs === null
+            ? wakeAtMs
+            : Math.min(earliestWakeAtMs, wakeAtMs);
+      }
+    }
+  }
+
+  if (Number.isFinite(earliestWakeAtMs)) {
+    return earliestWakeAtMs > nowMs
+      ? earliestWakeAtMs
+      : nowMs + POLL_MS;
+  }
+
+  return nowMs + FALLBACK_MS;
 }
 
 function toPos(pos) {
@@ -349,6 +492,56 @@ async function discoverFixtures({ apiFootballGet, apiKey, league, season, timezo
   return parsed;
 }
 
+async function maybeBackfillCurrentWindowFixtures({
+  cup,
+  currentIds,
+  cupRef,
+  apiFootballGet,
+  apiKey,
+  league,
+  season,
+  timezone,
+  nowMs,
+}) {
+  const ids = Array.isArray(currentIds) ? currentIds.map(String).filter(Boolean) : [];
+  if (!ids.length) {
+    return Array.isArray(cup?.currentWindowFixtures) ? cup.currentWindowFixtures : [];
+  }
+
+  const existing = normalizeCupWindowFixtures(cup?.currentWindowFixtures, ids);
+  const missingIds = existing.filter((fixture) => !Number.isFinite(Number(fixture?.kickoffMs))).map((fixture) => fixture.id);
+
+  if (!missingIds.length) {
+    return existing;
+  }
+
+  const candidates = await discoverFixtures({ apiFootballGet, apiKey, league, season, timezone });
+  const byId = new Map(
+    candidates.map((fixture) => [
+      String(fixture.id),
+      {
+        id: String(fixture.id),
+        kickoffMs: Number(fixture.kickoffMs) || null,
+        round: fixture.round || null,
+      },
+    ])
+  );
+
+  const merged = existing.map((fixture) => byId.get(fixture.id) || fixture);
+
+  if (merged.some((fixture) => Number.isFinite(Number(fixture?.kickoffMs)))) {
+    await cupRef.set(
+      {
+        currentWindowFixtures: merged,
+        updatedAtMs: nowMs,
+      },
+      { merge: true }
+    );
+  }
+
+  return merged;
+}
+
 function sortCupRows(rows) {
   rows.sort((a, b) => {
     const aPts = Number(a.totalFantasyPoints || 0);
@@ -644,6 +837,7 @@ async function armNextCupWindow({
   db,
   roomId,
   roomRef,
+  roomCompetitionState,
   cupRef,
   apiFootballGet,
   apiKey,
@@ -651,9 +845,13 @@ async function armNextCupWindow({
   season,
   timezone,
   nowMs,
+  afterMs = null,
+  excludeFixtureIds = [],
 }) {
+
+  const PRE_MS = 20 * 60 * 1000;
   const candidates = await discoverFixtures({ apiFootballGet, apiKey, league, season, timezone });
-  const nextWindow = pickCupWindow(candidates, { nowMs, gapHours: 12 });
+  const nextWindow = pickCupWindow(candidates, { nowMs, gapHours: 36, afterMs, excludeFixtureIds });
 
   if (!nextWindow || !Array.isArray(nextWindow.fixtureIds) || !nextWindow.fixtureIds.length) {
     return null;
@@ -665,6 +863,7 @@ async function armNextCupWindow({
       currentWindowId: nextWindow.windowId,
       currentWindowLabel: nextWindow.label || "Cup",
       currentWindowFixtureIds: nextWindow.fixtureIds.map(String),
+      currentWindowFixtures: Array.isArray(nextWindow.fixtures) ? nextWindow.fixtures : [],
       currentWindowStartAtMs: Number(nextWindow.startAtMs || 0) || null,
       currentWindowEndAtMs: Number(nextWindow.endAtMs || 0) || null,
       windowPointsByUid: {},
@@ -681,22 +880,41 @@ async function armNextCupWindow({
     { merge: true }
   );
 
-  await roomRef.set(
+  const earliestKickoffMs = Math.min(
+    ...((Array.isArray(nextWindow.fixtures) ? nextWindow.fixtures : [])
+      .map((fixture) => Number(fixture?.kickoffMs || 0))
+      .filter((kickoffMs) => Number.isFinite(kickoffMs) && kickoffMs > 0))
+  );
+  const nextCupPollAtMs =
+    Number.isFinite(earliestKickoffMs) && earliestKickoffMs > 0
+      ? Math.max(nowMs, earliestKickoffMs - PRE_MS)
+      : nowMs + (60 * 60 * 1000);
+
+  const nextCompetitionState = await setCompetitionState(
+    roomRef,
+    buildCupCompetitionStatePatch({
+      currentLabel: nextWindow.label || "Cup",
+      weekStatus: "scheduled",
+      nextCupPollAtMs,
+      nowMs,
+    }),
     {
-      "competitionState.currentLabel": nextWindow.label || "Cup",
-      "competitionState.weekStatus": "scheduled",
-      "competitionState.updatedAtMs": nowMs,
-    },
-    { merge: true }
+      roomData: { competitionState: roomCompetitionState || {} },
+      nowMs,
+    }
   );
 
-  return nextWindow;
+  return {
+    ...nextWindow,
+    competitionState: nextCompetitionState,
+  };
 }
 
 async function finalizeCupCompetition({
   db,
   roomId,
   roomRef,
+  roomCompetitionState,
   cupRef,
   memberUids,
   memberMetaByUid,
@@ -722,6 +940,7 @@ async function finalizeCupCompetition({
       currentWindowId: null,
       currentWindowLabel: "Final",
       currentWindowFixtureIds: [],
+      currentWindowFixtures: [],
       currentWindowStartAtMs: null,
       currentWindowEndAtMs: null,
       windowPointsByUid: {},
@@ -736,17 +955,25 @@ async function finalizeCupCompetition({
     { merge: true }
   );
 
-  await roomRef.set(
+  const nextCompetitionState = await setCompetitionState(
+    roomRef,
+    buildCupCompetitionStatePatch({
+      currentLabel: "Final",
+      weekStatus: "final",
+      nextCupPollAtMs: null,
+      nowMs,
+      isDone: true,
+    }),
     {
-      "competitionState.currentLabel": "Final",
-      "competitionState.weekStatus": "final",
-      "competitionState.isDone": true,
-      "competitionState.updatedAtMs": nowMs,
-    },
-    { merge: true }
+      roomData: { competitionState: roomCompetitionState || {} },
+      nowMs,
+    }
   );
 
-  return standings;
+  return {
+    competitionState: nextCompetitionState,
+    standings,
+  };
 }
 
 async function runCupEngine({
@@ -754,6 +981,7 @@ async function runCupEngine({
   roomId,
   room,
   nowMs,
+  forceRun = false,
   apiKey,
   apiFootballGet,
   getFixtureStatusMap,
@@ -766,6 +994,7 @@ async function runCupEngine({
 
   const roomRef = db.doc(`rooms/${roomId}`);
   const cupRef = cupCurrentRef(db, roomId);
+  let roomCompetitionState = getCompetitionState(room);
 
   
 
@@ -776,31 +1005,13 @@ async function runCupEngine({
     const season = Number(competition.season);
     const timezone = String(competition.timezone || "America/Los_Angeles");
 
-    if (Boolean(room?.competitionState?.isDone)) return;
+    if (Boolean(roomCompetitionState?.isDone)) return;
 
     const cupSnap = await cupRef.get();
     let cup = cupSnap.exists ? (cupSnap.data() || {}) : null;
-
-    // Sleep only BEFORE kickoff of the currently armed window.
-    // Do NOT sleep after a window ended, because the engine still needs
-    // to resolve/advance into the next Cup window.
     if (cup) {
       const status = String(cup.status || "").toLowerCase();
-      const startAtMs = Number(cup.currentWindowStartAtMs || 0);
-
-      const PRE_MS = 20 * 60 * 1000; // 20 min pre-kickoff
-
       if (cup.completed || status === "final") return;
-
-      if (
-        startAtMs > 0 &&
-        status !== "resolving" &&
-        status !== "live" &&
-        status !== "final" &&
-        nowMs < startAtMs - PRE_MS
-      ) {
-        return;
-      }
     }
 
     await cupRef.set({ lastPollAtMs: nowMs, updatedAtMs: nowMs }, { merge: true });
@@ -814,6 +1025,7 @@ async function runCupEngine({
         currentWindowId: null,
         currentWindowLabel: null,
         currentWindowFixtureIds: [],
+        currentWindowFixtures: [],
         updatedAtMs: nowMs,
       };
       await cupRef.set(cup, { merge: true });
@@ -830,6 +1042,7 @@ async function runCupEngine({
         db,
         roomId,
         roomRef,
+        roomCompetitionState,
         cupRef,
         apiFootballGet,
         apiKey,
@@ -840,27 +1053,54 @@ async function runCupEngine({
       });
 
       if (!armed) {
+        const nextCupPollAtMs = nowMs + (60 * 60 * 1000);
         await cupRef.set({ status: "scheduled", updatedAtMs: nowMs }, { merge: true });
-        await roomRef.set(
+        roomCompetitionState = await setCompetitionState(
+          roomRef,
+          buildCupCompetitionStatePatch({
+            weekStatus: "scheduled",
+            nextCupPollAtMs,
+            nowMs,
+          }),
           {
-            "competitionState.weekStatus": "scheduled",
-            "competitionState.updatedAtMs": nowMs,
-          },
-          { merge: true }
+            roomData: { competitionState: roomCompetitionState },
+            nowMs,
+          }
         );
         return;
       }
 
+      roomCompetitionState = armed.competitionState || roomCompetitionState;
       currentIds = armed.fixtureIds.map(String);
       cup = {
         ...(cup || {}),
         currentWindowId: armed.windowId,
         currentWindowLabel: armed.label || "Cup",
+        currentWindowFixtures: Array.isArray(armed.fixtures) ? armed.fixtures : [],
         currentWindowStartAtMs: Number(armed.startAtMs || 0) || null,
         currentWindowEndAtMs: Number(armed.endAtMs || 0) || null,
         currentWindowFixtureIds: currentIds,
         windowPointsByUid: {},
         creditedFixtures: {},
+      };
+    }
+
+    if (currentIds.length) {
+      const currentWindowFixtures = await maybeBackfillCurrentWindowFixtures({
+        cup,
+        currentIds,
+        cupRef,
+        apiFootballGet,
+        apiKey,
+        league,
+        season,
+        timezone,
+        nowMs,
+      });
+
+      cup = {
+        ...(cup || {}),
+        currentWindowFixtures,
       };
     }
 
@@ -870,6 +1110,13 @@ async function runCupEngine({
     const anyFin = currentIds.some((fid) => isFinished(shortById[fid]));
     const allFin = currentIds.length > 0 && currentIds.every((fid) => isFinished(shortById[fid]));
     const creditedMap = cup.creditedFixtures || {};
+    const nextCupPollAtMs = computeNextCupPollAtMs({
+      cup,
+      currentIds,
+      shortById,
+      creditedMap,
+      nowMs,
+    });
     const allFinAndCredited =
       currentIds.length > 0 && currentIds.every((fid) => isFinished(shortById[fid]) && creditedMap[fid]);
 
@@ -904,10 +1151,26 @@ async function runCupEngine({
         nowMs,
       });
 
+      const afterCurrentWindowMs = Number(
+        cup?.currentWindowEndAtMs ||
+        Math.max(
+          ...currentIds
+            .map((fid) => {
+              const fixture = (cup?.currentWindowFixtures || []).find(
+                (f) => String(f?.id || f?.fixtureId || "") === String(fid)
+              );
+              return Number(fixture?.kickoffMs || 0);
+            })
+            .filter((ms) => Number.isFinite(ms) && ms > 0)
+        ) ||
+        0
+      );
+
       const armed = await armNextCupWindow({
         db,
         roomId,
         roomRef,
+        roomCompetitionState,
         cupRef,
         apiFootballGet,
         apiKey,
@@ -915,19 +1178,61 @@ async function runCupEngine({
         season,
         timezone,
         nowMs,
+        afterMs: afterCurrentWindowMs,
+        excludeFixtureIds: currentIds,
       });
 
       if (!armed) {
-        await finalizeCupCompetition({
-          db,
-          roomId,
-          roomRef,
-          cupRef,
-          memberUids,
-          memberMetaByUid,
-          totalsByUid: creditedTotalsByUid,
-          nowMs,
-        });
+        const currentWindowLabel =
+          cup?.currentWindowLabel ||
+          roomCompetitionState?.currentLabel ||
+          "";
+
+        // Only end the Cup if the window that just finished was the actual Final.
+        // If we just finished Semi-finals and the API does not return the future Final yet,
+        // keep the room scheduled and recheck later.
+        if (isTrueCupFinalLabel(currentWindowLabel)) {
+          const finalized = await finalizeCupCompetition({
+            db,
+            roomId,
+            roomRef,
+            roomCompetitionState,
+            cupRef,
+            memberUids,
+            memberMetaByUid,
+            totalsByUid: creditedTotalsByUid,
+            nowMs,
+          });
+
+          roomCompetitionState = finalized?.competitionState || roomCompetitionState;
+        } else {
+          const nextCupPollAtMs = nowMs + 60 * 60 * 1000;
+
+          await cupRef.set(
+            {
+              status: "scheduled",
+              completed: false,
+              updatedAtMs: nowMs,
+            },
+            { merge: true }
+          );
+
+          roomCompetitionState = await setCompetitionState(
+            roomRef,
+            buildCupCompetitionStatePatch({
+              weekStatus: "scheduled",
+              nextCupPollAtMs,
+              nowMs,
+              isDone: false,
+            }),
+            {
+              roomData: { competitionState: roomCompetitionState },
+              nowMs,
+            }
+          );
+        }
+      } else {
+        roomCompetitionState = armed.competitionState || roomCompetitionState;
       }
       return;
     }
@@ -943,12 +1248,17 @@ async function runCupEngine({
     const roomWeekStatus = effectiveLive ? "live" : needsResolving ? "resolving" : "scheduled";
 
     await cupRef.set({ status: roomWeekStatus, updatedAtMs: nowMs }, { merge: true });
-    await roomRef.set(
+    roomCompetitionState = await setCompetitionState(
+      roomRef,
+      buildCupCompetitionStatePatch({
+        weekStatus: roomWeekStatus,
+        nextCupPollAtMs,
+        nowMs,
+      }),
       {
-        "competitionState.weekStatus": roomWeekStatus,
-        "competitionState.updatedAtMs": nowMs,
-      },
-      { merge: true }
+        roomData: { competitionState: roomCompetitionState },
+        nowMs,
+      }
     );
 
     if (!effectiveLive && !needsResolving) return;
@@ -1075,7 +1385,10 @@ async function runCupEngine({
               statsMap[pid].position = toPos(statsMap[pid].position || p.position);
 
               // Force the exact individual breakdown
-              const scoredOne = scorePlayer(p, statsMap[pid], toPos);
+              const scoredOne = scorePlayer(
+                statsMap[pid] || {},
+                toPos(statsMap[pid]?.position || p.position)
+              );
               const onePts = Number(scoredOne?.points ?? scoredOne?.total ?? 0);
 
               if (counted) sTotal += onePts;
@@ -1375,6 +1688,19 @@ async function runCupEngine({
 
     const creditedMap2 = await getCreditedMap(db, roomId, currentIds);
     const allCredited = currentIds.every((fid) => creditedMap2[fid]);
+    const nextCupPollAtMsAfter = computeNextCupPollAtMs({
+      cup: {
+        ...(cupAfter || {}),
+        currentWindowFixtures:
+          Array.isArray(cupAfter?.currentWindowFixtures) && cupAfter.currentWindowFixtures.length
+            ? cupAfter.currentWindowFixtures
+            : cup?.currentWindowFixtures || [],
+      },
+      currentIds,
+      shortById,
+      creditedMap: creditedMap2,
+      nowMs,
+    });
 
     if (allFin && allCredited) {
       await writeCupHistorySummary({
@@ -1389,16 +1715,37 @@ async function runCupEngine({
           currentWindowFixtureIds: currentIds,
           windowPointsByUid,
           cupTotalsByUid: creditedTotalsByUid,
-          breakdownByUserId: cupAfter.breakdownByUserId || {}
+          breakdownByUserId: cupAfter.breakdownByUserId || {},
         },
         memberUids,
         memberMetaByUid,
         nowMs,
       });
+
+      const afterCurrentWindowMs = Number(
+        cupAfter?.currentWindowEndAtMs ||
+        cup?.currentWindowEndAtMs ||
+        Math.max(
+          ...currentIds
+            .map((fid) => {
+              const fixture = (
+                cupAfter?.currentWindowFixtures ||
+                cup?.currentWindowFixtures ||
+                []
+              ).find((f) => String(f?.id || f?.fixtureId || "") === String(fid));
+
+              return Number(fixture?.kickoffMs || 0);
+            })
+            .filter((ms) => Number.isFinite(ms) && ms > 0)
+        ) ||
+        0
+      );
+
       const armed = await armNextCupWindow({
         db,
         roomId,
         roomRef,
+        roomCompetitionState,
         cupRef,
         apiFootballGet,
         apiKey,
@@ -1406,29 +1753,93 @@ async function runCupEngine({
         season,
         timezone,
         nowMs,
+        afterMs: afterCurrentWindowMs,
+        excludeFixtureIds: currentIds,
       });
 
       if (!armed) {
-        await finalizeCupCompetition({
-          db,
-          roomId,
-          roomRef,
-          cupRef,
-          memberUids,
-          memberMetaByUid,
-          totalsByUid: creditedTotalsByUid,
-          nowMs,
-        });
+        const finishedWindowLabel =
+          cupAfter?.currentWindowLabel ||
+          cup?.currentWindowLabel ||
+          roomCompetitionState?.currentLabel ||
+          "";
+
+        if (isTrueCupFinalLabel(finishedWindowLabel)) {
+          const finalized = await finalizeCupCompetition({
+            db,
+            roomId,
+            roomRef,
+            roomCompetitionState,
+            cupRef,
+            memberUids,
+            memberMetaByUid,
+            totalsByUid: creditedTotalsByUid,
+            nowMs,
+          });
+
+          roomCompetitionState = finalized?.competitionState || roomCompetitionState;
+        } else {
+          const nextCupPollAtMs = nowMs + 60 * 60 * 1000;
+
+          await cupRef.set(
+            {
+              status: "scheduled",
+              completed: false,
+              completedAtMs: FieldValue.delete(),
+
+              currentWindowId: null,
+              currentWindowLabel: null,
+              currentWindowFixtureIds: [],
+              currentWindowFixtures: [],
+              currentWindowStartAtMs: null,
+              currentWindowEndAtMs: null,
+
+              windowPointsByUid: {},
+              creditedFixtures: {},
+              breakdownByUserId: {},
+              livePointsByUid: {},
+              liveBreakdownByUserId: {},
+              projectedTotalsByUid: {},
+              projectedIncludesLivePoints: false,
+              updatedAtMs: nowMs,
+            },
+            { merge: true }
+          );
+
+          roomCompetitionState = await setCompetitionState(
+            roomRef,
+            buildCupCompetitionStatePatch({
+              weekStatus: "scheduled",
+              currentLabel: "Waiting for next round",
+              nextCupPollAtMs,
+              nowMs,
+              isDone: false,
+            }),
+            {
+              roomData: { competitionState: roomCompetitionState },
+              nowMs,
+            }
+          );
+        }
+      } else {
+        roomCompetitionState = armed.competitionState || roomCompetitionState;
       }
     } else {
       const statusToSave = effectiveLive ? "live" : needsResolving ? "resolving" : "scheduled";
+
       await cupRef.set({ status: statusToSave, updatedAtMs: nowMs }, { merge: true });
-      await roomRef.set(
+
+      roomCompetitionState = await setCompetitionState(
+        roomRef,
+        buildCupCompetitionStatePatch({
+          weekStatus: statusToSave,
+          nextCupPollAtMs: nextCupPollAtMsAfter,
+          nowMs,
+        }),
         {
-          "competitionState.weekStatus": statusToSave,
-          "competitionState.updatedAtMs": nowMs,
-        },
-        { merge: true }
+          roomData: { competitionState: roomCompetitionState },
+          nowMs,
+        }
       );
     }
   } catch (e) {
