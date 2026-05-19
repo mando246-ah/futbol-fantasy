@@ -3,7 +3,7 @@ import { useEffect, useState, useRef} from "react";
 import { useParams, Link } from "react-router-dom";
 import { doc, onSnapshot, collection, query, orderBy, limit } from "firebase/firestore";
 
-import { useTournament } from "../../tournament/hooks/useTournament";
+import { useLineupsForUsers, useTournament } from "../../tournament/hooks/useTournament";
 import { app, auth, db } from "../../firebase";
 
 import "./TournamentPage.css";
@@ -16,6 +16,7 @@ import FlagIcon from "../../components/FlagIcon";
 //Labels for stats
 const STAT_LABELS = {
   // Core
+  base: "Appearance",
   appearance: "Appearance",
   sixtyPlus: "Played 60+ mins",
   goals: "Goals",
@@ -90,6 +91,13 @@ function playerPosOf(p) {
 }
 function playerPtsOf(p) {
   return Number(p?.pts ?? p?.points ?? p?.total ?? 0);
+}
+
+function mainPointsClass(points) {
+  const n = Number(points);
+  if (Number.isFinite(n) && n > 0) return "tpPtsPositive";
+  if (Number.isFinite(n) && n < 0) return "tpPtsNegative";
+  return "tpPtsZero";
 }
 
 function fmtDT(v) {
@@ -189,6 +197,33 @@ function firstText(...values) {
   return "";
 }
 
+const LIVE_STATUS_CODES = new Set(["1H", "HT", "2H", "ET", "BT", "P"]);
+const FINAL_STATUS_CODES = new Set(["FT", "AET", "PEN"]);
+
+function isLiveStatusCode(value) {
+  return LIVE_STATUS_CODES.has(String(value || "").trim().toUpperCase());
+}
+
+function isFinalStatusCode(value) {
+  return FINAL_STATUS_CODES.has(String(value || "").trim().toUpperCase());
+}
+
+function isPlayerLiveFromStats(stats = {}) {
+  const status =
+    stats?.statusShort ||
+    stats?.fixtureStatus ||
+    stats?.matchStatus ||
+    "";
+
+  if (isFinalStatusCode(status)) return false;
+
+  return Boolean(stats?.isLive) || isLiveStatusCode(status);
+}
+
+function statsFromEntry(entry = {}) {
+  return entry?.stats || entry?.rawStats || {};
+}
+
 function getPlayerCountry(player = {}, entry = null, pick = null) {
   return firstText(
     player?.country,
@@ -208,7 +243,17 @@ function getPlayerCountry(player = {}, entry = null, pick = null) {
 }
 
 function getPlayerClub(player = {}, entry = null, pick = null) {
+  const stats = statsFromEntry(entry || {});
   return firstText(
+    stats?.teamName,
+    stats?.realTeamName,
+    stats?.clubName,
+
+    entry?.teamName,
+    entry?.realTeamName,
+    entry?.clubName,
+    entry?.club,
+
     player?.clubName,
     player?.club,
     player?.teamName,
@@ -222,10 +267,37 @@ function getPlayerClub(player = {}, entry = null, pick = null) {
     pick?.team?.name,
     pick?.lastRealTeamName,
 
-    entry?.clubName,
-    entry?.club,
+    "Unknown Team"
+  );
+}
+
+function getDisplayTeamName(player = {}, entry = null, pick = null, stats = null) {
+  const liveStats = stats || statsFromEntry(entry || {});
+  return firstText(
+    liveStats?.teamName,
+    liveStats?.realTeamName,
+    liveStats?.clubName,
+    entry?.teamName,
     entry?.realTeamName,
-    entry?.teamName
+    entry?.clubName,
+    player?.teamName,
+    player?.clubName,
+    player?.club,
+    pick?.teamName,
+    pick?.clubName,
+    pick?.club,
+    "Unknown Team"
+  );
+}
+
+function getDisplayOpponentName(player = {}, entry = null, stats = null) {
+  const liveStats = stats || statsFromEntry(entry || {});
+  return firstText(
+    liveStats?.opponentName,
+    liveStats?.opponentTeamName,
+    entry?.opponentName,
+    player?.opponentName,
+    "Opponent"
   );
 }
 
@@ -320,35 +392,10 @@ const SCORING_DISPLAY = [
 
 export default function TournamentPage() {
   const { roomId } = useParams();
-  const { loading, error, data } = useTournament(roomId);
+  const { loading, error, data } = useTournament(roomId, { loadScope: "core", enableLocalFallback: false });
   const [myUid, setMyUid] = useState(auth.currentUser?.uid || null);
   const [nowMs, setNowMs] = useState(() => Date.now());
-  const [picksMap, setPicksMap] = useState({});
   
-
-
-  useEffect(() => {
-    if (!roomId) {
-      setPicksMap({});
-      return;
-    }
-
-    const unsub = onSnapshot(
-      collection(db, "rooms", roomId, "picks"),
-      (snap) => {
-        const map = {};
-        snap.forEach((d) => {
-          const val = d.data() || {};
-          const pid = String(val.playerId || val.pid || val.apiPlayerId || "");
-          if (pid) map[pid] = val;
-        });
-        setPicksMap(map);
-      },
-      () => setPicksMap({})
-    );
-
-    return unsub;
-  }, [roomId]);
   //const myUid = auth.currentUser?.uid;
   useEffect(() => {
     const unsub = auth.onAuthStateChanged((u) => setMyUid(u?.uid || null));
@@ -378,7 +425,9 @@ export default function TournamentPage() {
   const [forcingUpdate, setForcingUpdate] = useState(false);
   const [creatingNextWeek, setCreatingNextWeek] = useState(false);
   const [shadowTestBusy, setShadowTestBusy] = useState(false);
+  const [globalApplyBusy, setGlobalApplyBusy] = useState(false);
   // Week history (previous weeks dropdown)
+  const [historyEnabled, setHistoryEnabled] = useState(false);
   const [weekHistory, setWeekHistory] = useState([]);
   const [historyWeekIndex, setHistoryWeekIndex] = useState(null);
   const [historyWeekDoc, setHistoryWeekDoc] = useState(null);
@@ -534,6 +583,41 @@ export default function TournamentPage() {
     }
   }
 
+  async function debugApplyRegularGlobalAggregatorOnce() {
+    if (!isHost) return;
+    if (!roomId) return;
+    if (currentWeekIndex == null) return alert("No current weekIndex yet.");
+
+    try {
+      setGlobalApplyBusy(true);
+
+      const fn = httpsCallable(functions, "debugApplyRegularGlobalAggregatorOnce");
+      const res = await fn({ roomId, weekIndex: currentWeekIndex });
+
+      console.log("====================================");
+      console.log("GLOBAL REGULAR AGGREGATOR APPLY RESULT");
+      console.log("Summary:", res.data);
+      console.table(
+        Object.entries(res.data?.diffsByUid || {}).map(([uid, diff]) => ({
+          uid,
+          diff,
+        }))
+      );
+      console.table(res.data?.matchups || []);
+      console.table(res.data?.weekLeaderboard || []);
+      console.log("====================================");
+
+      alert(
+        `Global aggregator applied: maxAbsDiff=${res.data?.maxAbsDiff ?? 0}, missingFixtures=${res.data?.missingFixtureCount ?? 0}`
+      );
+    } catch (e) {
+      console.error("GLOBAL REGULAR AGGREGATOR APPLY FAILED", e);
+      alert(e?.message || "Global regular aggregator apply failed. Check console.");
+    } finally {
+      setGlobalApplyBusy(false);
+    }
+  }
+
   async function forceUpdateThisWeek() {
     if (!isHost) return;
     if (currentWeekIndex == null) return alert("No current weekIndex yet.");
@@ -640,8 +724,9 @@ export default function TournamentPage() {
 
   //History Matches
   useEffect(() => {
-    if (!roomId) {
+    if (!roomId || !historyEnabled) {
       setWeekHistory([]);
+      setHistoryWeekIndex(null);
       return;
     }
 
@@ -668,10 +753,10 @@ export default function TournamentPage() {
     );
 
     return () => unsub();
-  }, [roomId]);
+  }, [roomId, historyEnabled]);
 
   useEffect(() => {
-    if (!roomId || historyWeekIndex == null) {
+    if (!roomId || !historyEnabled || historyWeekIndex == null) {
       setHistoryWeekDoc(null);
       setHistoryWeekResults(null);
       return;
@@ -693,7 +778,7 @@ export default function TournamentPage() {
       u1();
       u2();
     };
-  }, [roomId, historyWeekIndex]);
+  }, [roomId, historyEnabled, historyWeekIndex]);
 
 
 
@@ -861,6 +946,38 @@ export default function TournamentPage() {
   }, [roomId, loading, isHost, currentWeekIndex, bootAttempted]);
 
 
+  const coreUsers = data?.users || [];
+  const preActiveResults = stableWeekResults || weekResults || null;
+  const preMeUid = myUid || coreUsers[0]?.userId || null;
+  const preMatchupsAllRaw =
+    preActiveResults?.matchups?.length ? preActiveResults.matchups : weekDoc?.matchups || [];
+  const preMyMatchup =
+    (preMatchupsAllRaw || []).find(
+      (m) => m.homeUserId === preMeUid || m.awayUserId === preMeUid
+    ) || null;
+  const preOpponentUid = preMyMatchup
+    ? preMyMatchup.homeUserId === preMeUid
+      ? preMyMatchup.awayUserId
+      : preMyMatchup.homeUserId
+    : null;
+  const preExpandedOtherMatchup =
+    expandedOtherMatchupKey
+      ? (preMatchupsAllRaw || []).find(
+          (m) => `${m.homeUserId}-${m.awayUserId}` === expandedOtherMatchupKey
+        ) || null
+      : null;
+  const stagedLineupUserIds = Array.from(
+    new Set([
+      preMeUid,
+      preOpponentUid,
+      preExpandedOtherMatchup?.homeUserId,
+      preExpandedOtherMatchup?.awayUserId,
+    ].filter(Boolean).map(String))
+  );
+  const stagedLineups = useLineupsForUsers(roomId, stagedLineupUserIds, {
+    enabled: Boolean(roomId && !loading),
+  });
+
   // ---------- UI guards (after hooks) ----------
   if (!roomId) {
     return (
@@ -903,7 +1020,17 @@ export default function TournamentPage() {
     );
   }
 
-  const users = data?.users || [];
+  const stagedUsersById = stagedLineups.usersById || {};
+  const users = [
+    ...(data?.users || []).map((u) => ({
+      ...u,
+      ...(stagedUsersById[String(u.userId)] || {}),
+    })),
+    ...Object.values(stagedUsersById).filter(
+      (u) => !(data?.users || []).some((base) => String(base.userId) === String(u.userId))
+    ),
+  ];
+  const picksMap = stagedLineups.picksMap || {};
   const userById = Object.fromEntries(users.map((u) => [u.userId, u]));
 
   // Prefer week results if present; fallback to old results (Option A)
@@ -1083,6 +1210,7 @@ export default function TournamentPage() {
 
   const myBreakdown = activeResults?.breakdownByUserId?.[me?.userId] || null;
   const myBench = getBenchList(activeResults, me?.userId, me);
+  const myStarters = sortPlayersForDisplay(getStartersList(activeResults, me?.userId, me));
 
 
   const opponentUid = myMatchup
@@ -1096,6 +1224,8 @@ export default function TournamentPage() {
   const oppBreakdown = opponentUid ? (activeResults?.breakdownByUserId?.[opponentUid] || null) : null;
 
   const oppBench = getBenchList(activeResults, opponentUid, opponent);
+  const oppStarters = sortPlayersForDisplay(getStartersList(activeResults, opponentUid, opponent));
+  const isLineupLoading = (uid) => Boolean(stagedLineups.loadingByUid?.[String(uid || "")]);
 
   const myBenchTotal = sumPointsForList(myBreakdown, myBench);
   const oppBenchTotal = sumPointsForList(oppBreakdown, oppBench);
@@ -1291,6 +1421,7 @@ export default function TournamentPage() {
                     onClick={debugRunGlobalShadowRegularTest}
                     disabled={
                       shadowTestBusy ||
+                      globalApplyBusy ||
                       forcingUpdate ||
                       creatingNextWeek ||
                       repairing ||
@@ -1298,6 +1429,22 @@ export default function TournamentPage() {
                     }
                   >
                     {shadowTestBusy ? "Running Shadow Test..." : "DEV: Test Global Shadow"}
+                  </button>
+
+                  <button
+                    type="button"
+                    className="tpToolsItem"
+                    onClick={debugApplyRegularGlobalAggregatorOnce}
+                    disabled={
+                      globalApplyBusy ||
+                      shadowTestBusy ||
+                      forcingUpdate ||
+                      creatingNextWeek ||
+                      repairing ||
+                      recomputingStandings
+                    }
+                  >
+                    {globalApplyBusy ? "Applying Global..." : "DEV: Apply Global Aggregator Once"}
                   </button>
 
                   <button
@@ -1466,7 +1613,7 @@ export default function TournamentPage() {
           </div>
           <div className="tpSectionLabel">Starters</div>
           <ul className="tpList">
-            {sortPlayersForDisplay(getStartersList(activeResults, me?.userId, me)).map((p) => {
+            {myStarters.map((p) => {
               const pid = playerIdOf(p);
               const entry = myBreakdown?.perPlayer?.[pid];
               const entryObj = typeof entry === "object" ? entry : null;
@@ -1475,10 +1622,11 @@ export default function TournamentPage() {
               const pts = typeof entry === "number" ? entry : entry?.points ?? 0;
               const breakdown = entryObj?.breakdown || {};
               const stats = entryObj?.stats || {};
-              const realTeamName = entryObj?.realTeamName || "";
-              const opponentName = entryObj?.opponentName || "";
+              const realTeamName = getDisplayTeamName(p, entryObj, pickObj, stats);
+              const opponentName = getDisplayOpponentName(p, entryObj, stats);
               const country = getPlayerCountry(p, entryObj, pickObj);
-              const club = getPlayerClub(p, entryObj, pickObj);
+              const club = realTeamName || getPlayerClub(p, entryObj, pickObj);
+              const isPlayerLive = isPlayerLiveFromStats(stats);
 
               const isOpen = expandedPlayerId === pid;
 
@@ -1493,12 +1641,12 @@ export default function TournamentPage() {
 
                     <div className="tpMeta">
                       {normalizeDisplayPos(playerPosOf(p))}
-                      <span className={`tpLivePill ${stats?.isLive ? "live" : "idle"}`}>
-                        {stats?.isLive ? "LIVE" : "IDLE"}
+                      <span className={`tpLivePill ${isPlayerLive ? "live" : "idle"}`}>
+                        {isPlayerLive ? "LIVE" : "IDLE"}
                       </span>
                     </div>
 
-                    <div className="tpPts">{pts} pts</div>
+                    <div className={`tpPts ${mainPointsClass(pts)}`}>{pts} pts</div>
                   </div>
 
                   {isOpen && (
@@ -1512,6 +1660,9 @@ export default function TournamentPage() {
                 </li>
               );
             })}
+            {!myStarters.length && isLineupLoading(me?.userId) && (
+              <li className="tpLineupLoading">Loading your lineup...</li>
+            )}
           </ul>
           {(myBench?.length || 0) > 0 && (
             <details className="tpBenchDetails">
@@ -1536,10 +1687,11 @@ export default function TournamentPage() {
                   const pts = pointsFromEntry(entry);
                   const breakdown = entryObj?.breakdown || {};
                   const stats = entryObj?.stats || {};
-                  const realTeamName = entryObj?.realTeamName || "";
-                  const opponentName = entryObj?.opponentName || "";
+                  const realTeamName = getDisplayTeamName(p, entryObj, pickObj, stats);
+                  const opponentName = getDisplayOpponentName(p, entryObj, stats);
                   const country = getPlayerCountry(p, entryObj, pickObj);
-                  const club = getPlayerClub(p, entryObj, pickObj);
+                  const club = realTeamName || getPlayerClub(p, entryObj, pickObj);
+                  const isPlayerLive = isPlayerLiveFromStats(stats);
 
                   const isOpen = expandedPlayerId === pid;
 
@@ -1554,12 +1706,12 @@ export default function TournamentPage() {
 
                         <div className="tpMeta">
                           {normalizeDisplayPos(playerPosOf(p))}
-                          <span className={`tpLivePill ${stats?.isLive ? "live" : "idle"}`}>
-                            {stats?.isLive ? "LIVE" : "IDLE"}
+                          <span className={`tpLivePill ${isPlayerLive ? "live" : "idle"}`}>
+                            {isPlayerLive ? "LIVE" : "IDLE"}
                           </span>
                         </div>
 
-                        <div className="tpPts">{pts} pts</div>
+                        <div className={`tpPts ${mainPointsClass(pts)}`}>{pts} pts</div>
                       </div>
 
                       {isOpen && (
@@ -1587,7 +1739,7 @@ export default function TournamentPage() {
           </div>
           <div className="tpSectionLabel">Starters</div>
           <ul className="tpList">
-            {sortPlayersForDisplay(getStartersList(activeResults, opponentUid, opponent)).map((p) => {
+            {oppStarters.map((p) => {
               const pid = playerIdOf(p);
               const entry = oppBreakdown?.perPlayer?.[pid];
               const entryObj = typeof entry === "object" ? entry : null;
@@ -1596,10 +1748,11 @@ export default function TournamentPage() {
               const pts = typeof entry === "number" ? entry : entry?.points ?? 0;
               const breakdown = entryObj?.breakdown || {};
               const stats = entryObj?.stats || {};
-              const realTeamName = entryObj?.realTeamName || "";
-              const opponentName = entryObj?.opponentName || "";
+              const realTeamName = getDisplayTeamName(p, entryObj, pickObj, stats);
+              const opponentName = getDisplayOpponentName(p, entryObj, stats);
               const country = getPlayerCountry(p, entryObj, pickObj);
-              const club = getPlayerClub(p, entryObj, pickObj);
+              const club = realTeamName || getPlayerClub(p, entryObj, pickObj);
+              const isPlayerLive = isPlayerLiveFromStats(stats);
 
               const isOpen = expandedPlayerId === pid;
 
@@ -1614,12 +1767,12 @@ export default function TournamentPage() {
 
                     <div className="tpMeta">
                       {normalizeDisplayPos(playerPosOf(p))}
-                      <span className={`tpLivePill ${stats?.isLive ? "live" : "idle"}`}>
-                        {stats?.isLive ? "LIVE" : "IDLE"}
+                      <span className={`tpLivePill ${isPlayerLive ? "live" : "idle"}`}>
+                        {isPlayerLive ? "LIVE" : "IDLE"}
                       </span>
                     </div>
 
-                    <div className="tpPts">{pts} pts</div>
+                    <div className={`tpPts ${mainPointsClass(pts)}`}>{pts} pts</div>
                   </div>
 
                   {isOpen && (
@@ -1633,6 +1786,9 @@ export default function TournamentPage() {
                 </li>
               );
             })}
+            {!oppStarters.length && isLineupLoading(opponentUid) && (
+              <li className="tpLineupLoading">Loading opponent lineup...</li>
+            )}
           </ul>
           {(oppBench?.length || 0) > 0 && (
             <details className="tpBenchDetails">
@@ -1657,10 +1813,11 @@ export default function TournamentPage() {
                   const pts = pointsFromEntry(entry);
                   const breakdown = entryObj?.breakdown || {};
                   const stats = entryObj?.stats || {};
-                  const realTeamName = entryObj?.realTeamName || "";
-                  const opponentName = entryObj?.opponentName || "";
+                  const realTeamName = getDisplayTeamName(p, entryObj, pickObj, stats);
+                  const opponentName = getDisplayOpponentName(p, entryObj, stats);
                   const country = getPlayerCountry(p, entryObj, pickObj);
-                  const club = getPlayerClub(p, entryObj, pickObj);
+                  const club = realTeamName || getPlayerClub(p, entryObj, pickObj);
+                  const isPlayerLive = isPlayerLiveFromStats(stats);
 
                   const isOpen = expandedPlayerId === pid;
 
@@ -1675,12 +1832,12 @@ export default function TournamentPage() {
 
                         <div className="tpMeta">
                           {normalizeDisplayPos(playerPosOf(p))}
-                          <span className={`tpLivePill ${stats?.isLive ? "live" : "idle"}`}>
-                            {stats?.isLive ? "LIVE" : "IDLE"}
+                          <span className={`tpLivePill ${isPlayerLive ? "live" : "idle"}`}>
+                            {isPlayerLive ? "LIVE" : "IDLE"}
                           </span>
                         </div>
 
-                        <div className="tpPts">{pts} pts</div>
+                        <div className={`tpPts ${mainPointsClass(pts)}`}>{pts} pts</div>
                       </div>
 
                       {isOpen && (
@@ -1797,8 +1954,10 @@ export default function TournamentPage() {
                         const pts = typeof entry === "number" ? entry : entry?.points ?? 0;
                         const breakdown = typeof entry === "object" ? entry?.breakdown : {};
                         const stats = typeof entry === "object" ? entry?.stats : {};
-                        const realTeamName = typeof entry === "object" ? entry?.realTeamName : "";
-                        const opponentName = typeof entry === "object" ? entry?.opponentName : "";
+                        const entryObj = typeof entry === "object" ? entry : null;
+                        const realTeamName = getDisplayTeamName(p, entryObj, null, stats);
+                        const opponentName = getDisplayOpponentName(p, entryObj, stats);
+                        const isPlayerLive = isPlayerLiveFromStats(stats);
 
                         const isPlayerOpen =
                           expandedOtherPlayer.matchupKey === matchupKey &&
@@ -1813,12 +1972,12 @@ export default function TournamentPage() {
 
                               <div className="tpMeta">
                                 {normalizeDisplayPos(playerPosOf(p))}
-                                <span className={`tpLivePill ${stats?.isLive ? "live" : "idle"}`}>
-                                  {stats?.isLive ? "LIVE" : "IDLE"}
+                                <span className={`tpLivePill ${isPlayerLive ? "live" : "idle"}`}>
+                                  {isPlayerLive ? "LIVE" : "IDLE"}
                                 </span>
                               </div>
 
-                              <div className="tpPts">{pts} pts</div>
+                              <div className={`tpPts ${mainPointsClass(pts)}`}>{pts} pts</div>
                             </div>
 
                             {isPlayerOpen && (
@@ -1832,6 +1991,9 @@ export default function TournamentPage() {
                           </li>
                         );
                       })}
+                      {!homeStarters.length && isLineupLoading(homeUid) && (
+                        <li className="tpLineupLoading">Loading lineups...</li>
+                      )}
                     </ul>
                     {(homeBench?.length || 0) > 0 && (
                       <details className="tpBenchDetails">
@@ -1853,8 +2015,10 @@ export default function TournamentPage() {
                             const pts = pointsFromEntry(entry);
                             const breakdown = typeof entry === "object" ? entry?.breakdown : {};
                             const stats = typeof entry === "object" ? entry?.stats : {};
-                            const realTeamName = typeof entry === "object" ? entry?.realTeamName : "";
-                            const opponentName = typeof entry === "object" ? entry?.opponentName : "";
+                            const entryObj = typeof entry === "object" ? entry : null;
+                            const realTeamName = getDisplayTeamName(p, entryObj, null, stats);
+                            const opponentName = getDisplayOpponentName(p, entryObj, stats);
+                            const isPlayerLive = isPlayerLiveFromStats(stats);
 
                             const isOpen =
                               expandedOtherPlayer.matchupKey === matchupKey &&
@@ -1869,12 +2033,12 @@ export default function TournamentPage() {
 
                                   <div className="tpMeta">
                                     {normalizeDisplayPos(playerPosOf(p))}
-                                    <span className={`tpLivePill ${stats?.isLive ? "live" : "idle"}`}>
-                                      {stats?.isLive ? "LIVE" : "IDLE"}
+                                    <span className={`tpLivePill ${isPlayerLive ? "live" : "idle"}`}>
+                                      {isPlayerLive ? "LIVE" : "IDLE"}
                                     </span>
                                   </div>
 
-                                  <div className="tpPts">{pts} pts</div>
+                                  <div className={`tpPts ${mainPointsClass(pts)}`}>{pts} pts</div>
                                 </div>
 
                                 {isOpen && (
@@ -1909,8 +2073,10 @@ export default function TournamentPage() {
                         const pts = typeof entry === "number" ? entry : entry?.points ?? 0;
                         const breakdown = typeof entry === "object" ? entry?.breakdown : {};
                         const stats = typeof entry === "object" ? entry?.stats : {};
-                        const realTeamName = typeof entry === "object" ? entry?.realTeamName : "";
-                        const opponentName = typeof entry === "object" ? entry?.opponentName : "";
+                        const entryObj = typeof entry === "object" ? entry : null;
+                        const realTeamName = getDisplayTeamName(p, entryObj, null, stats);
+                        const opponentName = getDisplayOpponentName(p, entryObj, stats);
+                        const isPlayerLive = isPlayerLiveFromStats(stats);
 
                         const isPlayerOpen =
                           expandedOtherPlayer.matchupKey === matchupKey &&
@@ -1925,12 +2091,12 @@ export default function TournamentPage() {
 
                               <div className="tpMeta">
                                 {normalizeDisplayPos(playerPosOf(p))}
-                                <span className={`tpLivePill ${stats?.isLive ? "live" : "idle"}`}>
-                                  {stats?.isLive ? "LIVE" : "IDLE"}
+                                <span className={`tpLivePill ${isPlayerLive ? "live" : "idle"}`}>
+                                  {isPlayerLive ? "LIVE" : "IDLE"}
                                 </span>
                               </div>
 
-                              <div className="tpPts">{pts} pts</div>
+                              <div className={`tpPts ${mainPointsClass(pts)}`}>{pts} pts</div>
                             </div>
 
                             {isPlayerOpen && (
@@ -1944,6 +2110,9 @@ export default function TournamentPage() {
                           </li>
                         );
                       })}
+                      {!awayStarters.length && isLineupLoading(awayUid) && (
+                        <li className="tpLineupLoading">Loading lineups...</li>
+                      )}
                     </ul>
                     {(awayBench?.length || 0) > 0 && (
                       <details className="tpBenchDetails">
@@ -1965,8 +2134,10 @@ export default function TournamentPage() {
                             const pts = pointsFromEntry(entry);
                             const breakdown = typeof entry === "object" ? entry?.breakdown : {};
                             const stats = typeof entry === "object" ? entry?.stats : {};
-                            const realTeamName = typeof entry === "object" ? entry?.realTeamName : "";
-                            const opponentName = typeof entry === "object" ? entry?.opponentName : "";
+                            const entryObj = typeof entry === "object" ? entry : null;
+                            const realTeamName = getDisplayTeamName(p, entryObj, null, stats);
+                            const opponentName = getDisplayOpponentName(p, entryObj, stats);
+                            const isPlayerLive = isPlayerLiveFromStats(stats);
 
                             const isOpen =
                               expandedOtherPlayer.matchupKey === matchupKey &&
@@ -1981,12 +2152,12 @@ export default function TournamentPage() {
 
                                   <div className="tpMeta">
                                     {normalizeDisplayPos(playerPosOf(p))}
-                                    <span className={`tpLivePill ${stats?.isLive ? "live" : "idle"}`}>
-                                      {stats?.isLive ? "LIVE" : "IDLE"}
+                                    <span className={`tpLivePill ${isPlayerLive ? "live" : "idle"}`}>
+                                      {isPlayerLive ? "LIVE" : "IDLE"}
                                     </span>
                                   </div>
 
-                                  <div className="tpPts">{pts} pts</div>
+                                  <div className={`tpPts ${mainPointsClass(pts)}`}>{pts} pts</div>
                                 </div>
 
                                 {isOpen && (
@@ -2016,6 +2187,20 @@ export default function TournamentPage() {
   </div> )}
   {/*Week History*/}
   <div className="tpCard tpFull">
+    {!historyEnabled ? (
+      <div className="tpHistoryLoadCard">
+        <div>
+          <h3 className="tpHistoryLoadTitle">Week History</h3>
+          <p className="tpHistoryLoadText">
+          
+          </p>
+        </div>
+        <button type="button" className="tpPointsBtn" onClick={() => setHistoryEnabled(true)}>
+          Load Week History
+        </button>
+      </div>
+    ) : (
+      <>
     <div className="tpHistoryHeader">
       <h3 className="tpCardTitle tpHistoryTitle">Week History</h3>
 
@@ -2141,6 +2326,20 @@ export default function TournamentPage() {
                 return null;
               };
 
+              const pointsToneClass = (points) => {
+                const n = Number(points);
+                if (Number.isFinite(n) && n > 0) return "tpBreakdownPointsPillPositive";
+                if (Number.isFinite(n) && n < 0) return "tpBreakdownPointsPillNegative";
+                return "tpBreakdownPointsPillNeutral";
+              };
+
+              const valueToneClass = (value) => {
+                const n = typeof value === "number" ? value : Number(value);
+                if (Number.isFinite(n) && n > 0) return "tpBreakdownValuePositive";
+                if (Number.isFinite(n) && n < 0) return "tpBreakdownValueNegative";
+                return "tpBreakdownValueNeutral";
+              };
+
               const renderSide = (title, bd) => (
                 <div className="tpBreakdownCol">
                   <div className="tpBreakdownColTitle">{title}</div>
@@ -2158,7 +2357,10 @@ export default function TournamentPage() {
                           <summary className="tpBreakdownSummary">
                             <span className="tpBreakdownName">{nameOf(p)}</span>
                             <span className="tpBreakdownMeta">
-                              {posOf(p)} • {totalPts} pts
+                              <span className="tpBreakdownPosBadge">{posOf(p) || "—"}</span>
+                              <span className={`tpBreakdownPointsPill ${pointsToneClass(totalPts)}`}>
+                                {totalPts} pts
+                              </span>
                             </span>
                           </summary>
 
@@ -2169,7 +2371,7 @@ export default function TournamentPage() {
                                 .map(([k, v]) => (
                                   <div key={k} className="tpBreakdownPartRow">
                                     <span className="tpBreakdownPartKey">{prettyStatLabel(k)}</span>
-                                    <span className="tpBreakdownPartVal">{String(v)}</span>
+                                    <span className={`tpBreakdownPartVal ${valueToneClass(v)}`}>{String(v)}</span>
                                   </div>
                                 ))}
                             </div>
@@ -2183,7 +2385,7 @@ export default function TournamentPage() {
                     <div className="tpMuted">No starters saved for this week</div>
                   )}
 
-                  <div className="tpBreakdownSectionTitle">Bench (not counted)</div>
+                  <div className="tpBreakdownSectionTitle tpBreakdownBenchSection">Bench (not counted)</div>
                   {(bd.bench || []).length ? (
                     (bd.bench || []).map((p) => {
                       const pid = pidOf(p);
@@ -2195,7 +2397,10 @@ export default function TournamentPage() {
                           <summary className="tpBreakdownSummary">
                             <span className="tpBreakdownName">{nameOf(p)}</span>
                             <span className="tpBreakdownMeta">
-                              {posOf(p)} • {totalPts} pts
+                              <span className="tpBreakdownPosBadge">{posOf(p) || "—"}</span>
+                              <span className={`tpBreakdownPointsPill ${pointsToneClass(totalPts)}`}>
+                                {totalPts} pts
+                              </span>
                             </span>
                           </summary>
 
@@ -2206,7 +2411,7 @@ export default function TournamentPage() {
                                 .map(([k, v]) => (
                                   <div key={k} className="tpBreakdownPartRow">
                                     <span className="tpBreakdownPartKey">{prettyStatLabel(k)}</span>
-                                    <span className="tpBreakdownPartVal">{String(v)}</span>
+                                    <span className={`tpBreakdownPartVal ${valueToneClass(v)}`}>{String(v)}</span>
                                   </div>
                                 ))}
                             </div>
@@ -2268,6 +2473,8 @@ export default function TournamentPage() {
         )}
       </>
     )}
+      </>
+    )}
   </div>
 
   </div>
@@ -2278,6 +2485,7 @@ export default function TournamentPage() {
 const LIVE_TIMER_STATUSES = new Set(["1H", "2H", "ET"]);
 const HOLD_TIMER_STATUSES = new Set(["HT", "BT", "P"]);
 const FINISHED_TIMER_STATUSES = new Set(["FT", "AET", "PEN"]);
+const MAX_DISPLAY_EXTRA_MINUTES = 30;
 
 function timerStatusOf(stats = {}) {
   return String(
@@ -2292,7 +2500,6 @@ function formatClockSeconds(totalSeconds) {
   const safe = Math.max(0, Math.floor(Number(totalSeconds) || 0));
   const mins = Math.floor(safe / 60);
   const secs = safe % 60;
-
   return `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
 }
 
@@ -2322,20 +2529,17 @@ function getLiveTimerDisplay(stats, nowMs) {
     stats?.timerElapsed ??
     stats?.matchElapsed
   );
-
-  if (!Number.isFinite(apiElapsed)) return null;
-
+  const apiExtra = Number(stats?.extra ?? stats?.stoppageTime ?? 0);
   const updatedAtMs = Number(
     stats?.statusUpdatedAtMs ??
     stats?.timerUpdatedAtMs ??
     stats?.updatedAtMs
   );
 
-  const apiExtra = Number(stats?.extra ?? stats?.stoppageTime ?? 0);
+  if (!Number.isFinite(apiElapsed) || apiElapsed <= 0) return null;
 
-  let seconds = Math.max(0, Math.floor(apiElapsed * 60));
+  let seconds = Math.floor(apiElapsed * 60);
 
-  // Local display timer only. This does NOT call the API.
   if (
     LIVE_TIMER_STATUSES.has(status) &&
     Number.isFinite(updatedAtMs) &&
@@ -2352,18 +2556,20 @@ function getLiveTimerDisplay(stats, nowMs) {
 
   let extra = "";
 
-  if (capSeconds && (seconds > capSeconds || apiExtra > 0)) {
-    const computedExtra = seconds > capSeconds
-      ? Math.ceil((seconds - capSeconds) / 60)
-      : 0;
-
-    const bestExtra = Math.max(
-      Number.isFinite(apiExtra) ? apiExtra : 0,
-      computedExtra
+  if (capSeconds && seconds > capSeconds) {
+    const computedExtra = Math.min(
+      MAX_DISPLAY_EXTRA_MINUTES,
+      Math.ceil((seconds - capSeconds) / 60)
     );
+    const safeApiExtra =
+      Number.isFinite(apiExtra) && apiExtra > 0 && apiExtra <= MAX_DISPLAY_EXTRA_MINUTES
+        ? Math.floor(apiExtra)
+        : 0;
 
+    extra = `+${Math.max(computedExtra, safeApiExtra)}`;
     seconds = capSeconds;
-    extra = bestExtra > 0 ? `+${bestExtra}` : "";
+  } else if (Number.isFinite(apiExtra) && apiExtra > 0 && apiExtra <= MAX_DISPLAY_EXTRA_MINUTES) {
+    extra = `+${Math.floor(apiExtra)}`;
   }
 
   return {
@@ -2383,6 +2589,8 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName, labels }) {
   useEffect(() => {
     if (!LIVE_TIMER_STATUSES.has(timerStatus)) return;
 
+    setTimerNowMs(Date.now());
+
     const id = window.setInterval(() => {
       setTimerNowMs(Date.now());
     }, 1000);
@@ -2393,18 +2601,36 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName, labels }) {
     stats?.elapsed,
     stats?.extra,
     stats?.statusUpdatedAtMs,
+    stats?.timerUpdatedAtMs,
+    stats?.updatedAtMs,
   ]);
   
-  const showMatchHeader = Boolean(teamName || opponentName);
+  const homeTeamName = firstText(stats?.homeTeamName, stats?.homeName);
+  const awayTeamName = firstText(stats?.awayTeamName, stats?.awayName);
+  const showHomeAwayHeader = Boolean(homeTeamName && awayTeamName);
+  const headerTeamName = showHomeAwayHeader
+    ? homeTeamName
+    : firstText(stats?.teamName, stats?.realTeamName, stats?.clubName, teamName, "Unknown Team");
+  const headerOpponentName = showHomeAwayHeader
+    ? awayTeamName
+    : firstText(stats?.opponentName, stats?.opponentTeamName, opponentName, "Opponent");
+  const showMatchHeader = Boolean(headerTeamName || headerOpponentName);
 
   // Look for the game score in the raw stats
-  const tScore = stats?.teamScore ?? stats?.teamGoals ?? null;
-  const oScore = stats?.opponentScore ?? stats?.opponentGoals ?? null;
+  const tScore = showHomeAwayHeader
+    ? (stats?.goalsHome ?? stats?.homeGoals ?? stats?.homeScore ?? null)
+    : (stats?.teamScore ?? stats?.teamGoals ?? null);
+  const oScore = showHomeAwayHeader
+    ? (stats?.goalsAway ?? stats?.awayGoals ?? stats?.awayScore ?? null)
+    : (stats?.opponentScore ?? stats?.opponentGoals ?? null);
   const hasScore = tScore !== null && oScore !== null;
   const timerDisplay = getLiveTimerDisplay(stats, timerNowMs);
   const isLiveStatus =
+    Boolean(stats?.isLive) ||
     LIVE_TIMER_STATUSES.has(timerStatus) ||
     HOLD_TIMER_STATUSES.has(timerStatus);
+  const minutes = Number(stats?.minutes ?? stats?.minutesPlayed ?? 0);
+  const showLiveNoAppearanceNote = isLiveStatus && minutes === 0;
 
   const dividerLabel =
     timerDisplay?.main ||
@@ -2457,6 +2683,9 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName, labels }) {
     if (indexB !== -1) return 1;
     return a.localeCompare(b);
   });
+  const displayRawKeys = showLiveNoAppearanceNote && !sortedRawKeys.includes("minutes")
+    ? ["minutes", ...sortedRawKeys]
+    : sortedRawKeys;
 
   const sortedBreakdownKeys = Object.keys(breakdown || {}).sort((a, b) => {
     const indexA = STAT_ORDER.indexOf(a);
@@ -2503,11 +2732,11 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName, labels }) {
       {showMatchHeader && (
       <div className="tpCardHeader">
         <div className="tpMatchHeaderTeam tpMatchHeaderTeamTop">
-          <span className="tpMatchHeaderName">{teamName || "Unknown Team"}</span>
+          <span className="tpMatchHeaderName">{headerTeamName}</span>
           {hasScore && <span className="tpMatchHeaderScore">{tScore}</span>}
         </div>
 
-        {opponentName && (
+        {headerOpponentName && (
           <>
             <div className={`tpMatchHeaderDivider ${timerDisplay?.kind ? `tpMatchHeaderDivider-${timerDisplay.kind}` : ""}`}>
               <span>{dividerLabel}</span>
@@ -2517,7 +2746,7 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName, labels }) {
             </div>
 
             <div className="tpMatchHeaderTeam">
-              <span className="tpMatchHeaderName">{opponentName}</span>
+              <span className="tpMatchHeaderName">{headerOpponentName}</span>
               {hasScore && <span className="tpMatchHeaderScore">{oScore}</span>}
             </div>
           </>
@@ -2525,30 +2754,45 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName, labels }) {
       </div>
     )}
 
+      {showLiveNoAppearanceNote && (
+        <div className="tpStatsNote">
+          Team is live, but this player has not appeared yet.
+        </div>
+      )}
+
       <div className="tpStatsGrid">
         <div className="tpStatsCol">
           <span className="tpStatsHead">Raw Stats</span>
-          {sortedRawKeys.map((k) => {
-            const v = stats[k];
+          {displayRawKeys.map((k) => {
+            const v = k === "minutes" ? minutes : stats[k];
             
             // Hide the stat completely if the value is 0, false, null, or an internal API flag
-            if (v == null || v === false || v === 0 || v === "0") return null;
+            if (k !== "minutes" && (v == null || v === false || v === 0 || v === "0")) return null;
+            if (k === "minutes" && !showLiveNoAppearanceNote && (v == null || v === false || v === 0 || v === "0")) return null;
             if (
               k === "isLive" ||
               k === "teamId" ||
               k === "fixtureId" ||
+              k === "fixtureIds" ||
               k === "fixtureStatus" ||
               k === "matchStatus" ||
               k === "statusShort" ||
               k === "statusLong" ||
+              k === "statusUpdatedAtMs" ||
               k === "elapsed" ||
               k === "extra" ||
-              k === "statusUpdatedAtMs" ||
-              k === "timerUpdatedAtMs" ||
               k === "teamScore" ||
               k === "opponentScore" ||
               k === "teamGoals" ||
-              k === "opponentGoals"
+              k === "opponentGoals" ||
+              k === "goalsHome" ||
+              k === "goalsAway" ||
+              k === "homeTeamId" ||
+              k === "awayTeamId" ||
+              k === "homeTeamName" ||
+              k === "awayTeamName" ||
+              k === "homeTeamLogo" ||
+              k === "awayTeamLogo"
             ) return null;
 
             return (
@@ -2574,7 +2818,7 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName, labels }) {
             );
           })}
           {validBreakdownKeys.length === 0 && (
-            <div className="tpStatRow"><span>Base</span><span>0</span></div>
+            <div className="tpStatRow"><span>Appearance</span><span>0</span></div>
           )}
         </div>
       </div>

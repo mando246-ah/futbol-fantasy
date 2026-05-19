@@ -1,12 +1,13 @@
 // src/pages/TournamentPage/TournamentRouter.jsx
 import { useEffect, useState } from "react";
-import { useParams, Link } from "react-router-dom";
+import { useParams, Link, useLocation } from "react-router-dom";
 import { doc, onSnapshot } from "firebase/firestore";
 
 import { db } from "../../firebase";
 import { useTournament } from "../../tournament/hooks/useTournament";
 import TournamentPage from "./TournamentPage";
 import CupTournamentPage from "./CupTournamentPage";
+import WorldCupTournamentPage from "./WorldCupTournamentPage";
 import "./TournamentPage.css";
 
 function detectPhaseFromRoundLabelClient(roundLabel) {
@@ -49,6 +50,7 @@ function getClientCompetitionState(room = {}) {
 
 export default function TournamentRouter() {
   const { roomId } = useParams();
+  const location = useLocation();
   const { loading, error, data } = useTournament(roomId);
   const [cupDoc, setCupDoc] = useState(null);
   const [weekDoc, setWeekDoc] = useState(null);
@@ -133,6 +135,48 @@ export default function TournamentRouter() {
   // 4. Robust Cup vs RegularSeason routing
   const room = data?.room || {};
   const state = getClientCompetitionState(room);
+  const engineType = String(room?.engineType || room?.worldCup?.engineType || "").trim();
+  const worldCupPhase = String(room?.worldCupPhase || room?.worldCup?.phase || "").trim();
+  const competitionKey = String(room?.competitionKey || "").toLowerCase();
+  const competitionMetaType = String(room?.competitionMeta?.type || "").toLowerCase();
+  const competitionMetaName = String(room?.competitionMeta?.name || room?.competition?.name || "").toLowerCase();
+  const viewOverride = new URLSearchParams(location.search).get("view");
+
+  if (viewOverride === "worldcup") {
+    return <WorldCupTournamentPage />;
+  }
+
+  if (viewOverride === "cup") {
+    return <CupTournamentPage />;
+  }
+
+  const isWorldCupRoom = Boolean(
+    room?.worldCup ||
+    room?.worldCupPhase ||
+    competitionMetaType.includes("world cup") ||
+    competitionMetaName.includes("world cup") ||
+    competitionKey.includes("worldcup") ||
+    competitionKey.includes("world-cup")
+  );
+
+  const isWorldCupGroupRoom =
+    engineType === "worldCupDaily" ||
+    room?.worldCup?.engineType === "worldCupDaily" ||
+    worldCupPhase.toLowerCase() === "group" ||
+    state?.phaseLabel === "WorldCupGroup";
+
+  const isWorldCupKnockoutRoom =
+    isWorldCupRoom &&
+    (
+      worldCupPhase.toLowerCase() === "knockout" ||
+      String(room?.worldCup?.phase || "").toLowerCase() === "knockout" ||
+      engineType === "cupEngine" ||
+      state?.phaseLabel === "Cup"
+    );
+
+  if (isWorldCupGroupRoom || isWorldCupKnockoutRoom) {
+    return <WorldCupTournamentPage />;
+  }
 
   const storedPhase =
     state.phaseLabel ||
@@ -168,6 +212,8 @@ export default function TournamentRouter() {
     );
 
   const isCup =
+    worldCupPhase.toLowerCase() === "knockout" ||
+    engineType === "cupEngine" ||
     String(storedPhase).toLowerCase() === "cup" ||
     detectedPhase === "Cup" ||
     hasCupDoc;

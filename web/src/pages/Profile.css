@@ -209,6 +209,13 @@
   line-height: 1.2;
 }
 
+.roomCompetition {
+  margin-top: 4px;
+  color: rgba(255,255,255,0.72);
+  font-size: 0.88rem;
+  font-weight: 700;
+}
+
 .roomMeta {
   font-size: 0.85rem;
   color: var(--ff-muted);

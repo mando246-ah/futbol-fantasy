@@ -26,7 +26,7 @@ export default function Home() {
         {/* Foreground content */}
         <div className="homeHeroContent">
           <div className="homeHeroInner">
-            <img src={logo} alt="Fútball Fantasy Logo" className="homeHeroLogo" />
+            <img src={logo} alt="Fútbol Fantasy Logo" className="homeHeroLogo" />
             <p className="homeKicker"></p>
 
             <h1 className="homeTitle">
@@ -37,19 +37,28 @@ export default function Home() {
               Draft your squad. <span className="homeSubtitleAccent">Take the win</span>. Every week matters.
             </p>
 
-            <div className="homeButtons">
-              <button
-                className="homeBtn homeBtnPrimary"
-                onClick={() => navigate("/draft")}
-              >
-                Get Drafting
-              </button>
+            <div className="homeButtonStack">
+              <div className="homeButtons">
+                <button
+                  className="homeBtn homeBtnPrimary"
+                  onClick={() => navigate("/draft")}
+                >
+                  Get Drafting
+                </button>
+
+                <button
+                  className="homeBtn homeBtnGhost"
+                  onClick={handleLearnMore}
+                >
+                  How It Works
+                </button>
+              </div>
 
               <button
-                className="homeBtn homeBtnGhost"
-                onClick={handleLearnMore}
+                className="homeBtn homeBtnSupport homeBtnSupportLower"
+                onClick={() => navigate("/support")}
               >
-                How It Works
+                Support Us
               </button>
             </div>
 
@@ -62,7 +71,7 @@ export default function Home() {
       {/* LEARN MORE SECTION */}
       <section id="learn-more" className="homeSection">
         <div className="homeSectionInner">
-          <h2 className="homeSectionTitle">What is Fútball Fantasy?</h2>
+          <h2 className="homeSectionTitle">What is Fútbol Fantasy?</h2>
           <p className="homeSectionText">
             Create a room, invite your friends, draft your squads, and compete weekly.
             Only your Starting XI scores — every pick matters.
@@ -94,7 +103,7 @@ export default function Home() {
 
             <div className="homeModeWrap">
               <div className="homeModeGrid">
-                <div className="homeModeCard">
+                <div className="homeModeCard homeModeCardRegular">
                   <div className="homeModeTopRow">
                     <h4 className="homeModeTitle">Regular Season</h4>
                     <span className="homeModePill">Head-to-Head</span>
@@ -105,14 +114,14 @@ export default function Home() {
                   </p>
                   <ul className="homeModeList">
                     <li>1v1 round-robin style matchups</li>
-                    <li>Wins &amp; tie-breakers tracked on a leaderboard</li>
+                    
                     <li>Only the Starting XI scores</li>
                     <li>Host controls Transfer Market</li>
                     <li>Most win weeks wins</li>
                   </ul>
                 </div>
 
-                <div className="homeModeCard">
+                <div className="homeModeCard homeModeCardCup">
                   <div className="homeModeTopRow">
                     <h4 className="homeModeTitle">Cups</h4>
                     <span className="homeModePill">Everyone vs Everyone</span>
@@ -123,7 +132,7 @@ export default function Home() {
                   </p>
                   <ul className="homeModeList">
                     <li>Daily / short-window leaderboards</li>
-                    <li>Top 3 earn bonus points per window</li>
+                  
                     <li>More picks, more decisions</li>
                     <li>Host controls Transfer Market</li>
                     <li>Most Fantasy points wins</li>
@@ -137,7 +146,7 @@ export default function Home() {
 
           <div className="homeSectionCtaRow">
             <button
-              className="homeBtn homeBtnPrimary"
+              className="homeBtn homeBtnPrimary homeSectionCtaButton"
               onClick={() => navigate("/draft")}
             >
               Start Drafting

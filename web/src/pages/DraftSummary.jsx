@@ -32,6 +32,87 @@ function displayNameOf(m) {
   return m?.displayName || m?.uid || "User";
 }
 
+function normalizeRosterPosition(pos) {
+  const raw = String(pos || "").toUpperCase();
+  if (["FWD", "FW", "ST", "CF", "FORWARD", "ATTACKER"].includes(raw)) return "ATT";
+  if (["CM", "DM", "AM", "MIDFIELDER"].includes(raw)) return "MID";
+  if (["CB", "LB", "RB", "WB", "DEFENDER"].includes(raw)) return "DEF";
+  if (["GOALKEEPER", "KEEPER"].includes(raw)) return "GK";
+  if (["ATT", "MID", "DEF", "GK", "SUB"].includes(raw)) return raw;
+  return raw || "SUB";
+}
+
+function rosterPlayerName(player) {
+  return player?.playerName || player?.name || player?.fullName || "Unknown player";
+}
+
+function rosterPlayerTeam(player) {
+  return player?.teamName || player?.clubName || player?.team?.name || "No club";
+}
+
+function rosterPlayerCountry(player) {
+  const candidates = [
+    player?.nationality ||
+      player?.country ||
+      player?.countryName ||
+      player?.birth?.country,
+    player?.countryName,
+    player?.birth?.country,
+  ].filter(Boolean);
+
+  const readable = candidates.find((value) => !/^[A-Za-z]{2}$/.test(String(value).trim()));
+  return (
+    readable ||
+    candidates[0] ||
+    player?.countryName ||
+    player?.countryCode ||
+    ""
+  );
+}
+
+function rosterPlayerLogo(player) {
+  return player?.teamLogo || player?.team?.logo || player?.clubLogo || "";
+}
+
+function RosterPlayerRow({
+  player,
+  compact = false,
+  action = null,
+  live = false,
+  selected = false,
+  swapTarget = false,
+}) {
+  const position = normalizeRosterPosition(player?.position || player?.pos || player?.role);
+  const country = rosterPlayerCountry(player);
+  const logo = rosterPlayerLogo(player);
+  const name = rosterPlayerName(player);
+
+  return (
+    <div className={`rosterPlayerCard ${compact ? "rosterPlayerCard--compact" : ""} ${selected ? "rosterPlayerCard--selected" : ""} ${swapTarget ? "rosterPlayerCard--swapTarget" : ""}`}>
+      <div className="rosterPlayerMain">
+        {logo ? <img className="rosterTeamLogo" src={logo} alt="" loading="lazy" /> : null}
+        <div className="rosterPlayerText">
+          <div className="rosterPlayerName" title={name}>{name}</div>
+          <div className="rosterPlayerMeta">
+            <span className="rosterPlayerTeam">{rosterPlayerTeam(player)}</span>
+            <span className="rosterPlayerCountry">
+              {country ? <FlagIcon country={country} size={13} title={country} /> : null}
+              <span>{country || "Unknown"}</span>
+            </span>
+          </div>
+        </div>
+      </div>
+      <div className="rosterPlayerSide">
+        {live ? (
+          <span className="rosterLivePill">LIVE</span>
+        ) : null}
+        <span className={`rosterPositionPill rosterPositionPill--${position}`}>{position}</span>
+        {action}
+      </div>
+    </div>
+  );
+}
+
 
 //Subs locked
 function useSubsLock(roomId, enabled) {
@@ -388,7 +469,7 @@ export default function DraftSummary() {
       </div>
 
       {/* Rosters */}
-      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+      <div className="rosterManagersGrid">
         {managerRows.map(({ manager, picks }) => (
           <ManagerRosterCard
             key={manager.uid}
@@ -888,7 +969,7 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, teamName, ro
   }, [benchKeys, pickByKey]);
 
   return (
-    <div className="rounded-2xl border border-slate-200 bg-white shadow-sm p-4">
+    <div className="rosterManagerCard rounded-2xl border border-slate-200 bg-white shadow-sm p-4">
       <div className="flex items-center gap-3 mb-1">
         <Avatar className="h-10 w-10 border">
           <AvatarImage src={photoURL || ""} alt={displayNameOf(manager)} />
@@ -961,17 +1042,17 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, teamName, ro
       </div>
 
       {/* Same layout (ATT/MID/DEF/GK) */}
-      <div className="grid grid-cols-2 gap-2 text-sm">
+      <div className="rosterShell grid grid-cols-2 gap-2 text-sm">
         {isMe ? (
           <>
-            <StarterBlock title="ATT" list={startersByPos.ATT} pendingIn={!!pendingIn} locked={lockedNow} onPick={onStarterClick} keyOf={keyOf} isLivePick={isPickLive} pendingInPickLive={pendingIsLive} replaceable={replaceableStarters}/>
-            <StarterBlock title="MID" list={startersByPos.MID} pendingIn={!!pendingIn} locked={lockedNow} onPick={onStarterClick} keyOf={keyOf} isLivePick={isPickLive} pendingInPickLive={pendingIsLive} replaceable={replaceableStarters}/>
-            <StarterBlock title="DEF" list={startersByPos.DEF} pendingIn={!!pendingIn} locked={lockedNow} onPick={onStarterClick} keyOf={keyOf} isLivePick={isPickLive} pendingInPickLive={pendingIsLive} replaceable={replaceableStarters}/>
-            <StarterBlock title="GK"  list={startersByPos.GK}  pendingIn={!!pendingIn} locked={lockedNow} onPick={onStarterClick} keyOf={keyOf} isLivePick={isPickLive} pendingInPickLive={pendingIsLive} replaceable={replaceableStarters}/>
+            <RosterStarterBlock title="ATT" list={startersByPos.ATT} pendingIn={!!pendingIn} locked={lockedNow} onPick={onStarterClick} keyOf={keyOf} isLivePick={isPickLive} pendingInPickLive={pendingIsLive} replaceable={replaceableStarters}/>
+            <RosterStarterBlock title="MID" list={startersByPos.MID} pendingIn={!!pendingIn} locked={lockedNow} onPick={onStarterClick} keyOf={keyOf} isLivePick={isPickLive} pendingInPickLive={pendingIsLive} replaceable={replaceableStarters}/>
+            <RosterStarterBlock title="DEF" list={startersByPos.DEF} pendingIn={!!pendingIn} locked={lockedNow} onPick={onStarterClick} keyOf={keyOf} isLivePick={isPickLive} pendingInPickLive={pendingIsLive} replaceable={replaceableStarters}/>
+            <RosterStarterBlock title="GK"  list={startersByPos.GK}  pendingIn={!!pendingIn} locked={lockedNow} onPick={onStarterClick} keyOf={keyOf} isLivePick={isPickLive} pendingInPickLive={pendingIsLive} replaceable={replaceableStarters}/>
 
             {/* SUB section becomes Bench */}
             <div className="col-span-2">
-              <BenchBlock
+              <RosterBenchBlock
                 title="SUB"
                 list={benchPicks}
                 pendingKey={pendingIn}
@@ -984,41 +1065,26 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, teamName, ro
           </>
         ) : (
           <>
-            <PosBlock title="ATT" list={startersByPos.ATT} />
-            <PosBlock title="MID" list={startersByPos.MID} />
-            <PosBlock title="DEF" list={startersByPos.DEF} />
-            <PosBlock title="GK"  list={startersByPos.GK} />
+            <RosterPosBlock title="ATT" list={startersByPos.ATT} />
+            <RosterPosBlock title="MID" list={startersByPos.MID} />
+            <RosterPosBlock title="DEF" list={startersByPos.DEF} />
+            <RosterPosBlock title="GK"  list={startersByPos.GK} />
             <div className="col-span-2">
-              <BenchReadOnlyBlock title="SUB" list={benchPicks} />
+              <RosterBenchReadOnlyBlock title="SUB" list={benchPicks} />
             </div>
           </>
         )}
       </div>
 
-      {/* Flat list ordered by turn (unchanged) */}
-      <div className="mt-3">
-        <div className="text-xs text-gray-500 mb-1">All Picks (by draft order)</div>
-        <ol className="space-y-1 max-h-48 overflow-auto">
-          {orderedPicks.map((p) => (
-            <li key={p.id || `${p.uid}-${p.turn}`} className="border rounded px-2 py-1 flex items-center justify-between">
-              <span>
-                <b>#{p.turn}</b> — {p.playerName} <span className="opacity-70">({p.position || "SUB"})</span>
-              </span>
-              <span className="opacity-60 text-xs">R{p.round}</span>
-            </li>
-          ))}
-          {picks.length === 0 && <div className="opacity-60 text-sm">No picks yet.</div>}
-        </ol>
-      </div>
     </div>
   );
 }
 
 function StarterBlock({ title, list, pendingIn, locked, onPick, keyOf, isLivePick, pendingInPickLive, replaceable }) {
   return (
-    <div className="border rounded p-2">
+    <div className={`rosterPositionGroup rosterPositionGroup--${title} border rounded p-2`}>
       <div className="text-xs font-semibold mb-1">{title}</div>
-      <ul className="space-y-1">
+      <ul className="space-y-2">
         {list.map((p) => {
           const k = keyOf(p);
 
@@ -1033,7 +1099,7 @@ function StarterBlock({ title, list, pendingIn, locked, onPick, keyOf, isLivePic
           return (
             <li
               key={p.id || `${p.uid}-${p.turn}`}
-              className={`border rounded px-2 py-1 flex items-center justify-between
+              className={`rosterPlayerAction
                 ${locked ? "opacity-60" : ""}
                 ${
                   pendingIn
@@ -1060,7 +1126,11 @@ function StarterBlock({ title, list, pendingIn, locked, onPick, keyOf, isLivePic
                 onPick(k);
               }}
             >
-              <span>{p.playerName}</span>
+              <RosterPlayerRow
+                player={p}
+                live={!!isLivePick?.(p)}
+                swapTarget={!!pendingIn && !disabled}
+              />
             </li>
           );
         })}
@@ -1149,6 +1219,148 @@ function BenchReadOnlyBlock({ title, list }) {
           </li>
         ))}
         {list.length === 0 && <li className="text-xs text-gray-400">—</li>}
+      </ul>
+    </div>
+  );
+}
+
+function RosterStarterBlock({ title, list, pendingIn, locked, onPick, keyOf, isLivePick, pendingInPickLive, replaceable }) {
+  return (
+    <div className={`rosterPositionGroup rosterPositionGroup--${title} border rounded p-2`}>
+      <div className="text-xs font-semibold mb-2">{title}</div>
+      <ul className="space-y-2">
+        {list.map((p) => {
+          const k = keyOf(p);
+          const illegalByFormation = !!pendingIn && !!replaceable && !replaceable.has(k);
+          const disabled = locked || !pendingIn || pendingInPickLive || illegalByFormation;
+
+          return (
+            <li
+              key={p.id || `${p.uid}-${p.turn}`}
+              className={`rosterPlayerAction ${locked ? "opacity-60" : ""} ${
+                pendingIn
+                  ? disabled
+                    ? "opacity-50 cursor-not-allowed"
+                    : "cursor-pointer"
+                  : ""
+              }`}
+              title={
+                locked
+                  ? "Lineups locked"
+                  : pendingInPickLive
+                  ? "Selected bench player is LIVE (can't sub in)"
+                  : isLivePick?.(p)
+                  ? "This starter is LIVE (can't sub out)"
+                  : illegalByFormation
+                  ? "Can't sub out (formation rules)"
+                  : pendingIn
+                  ? "Tap to sub out"
+                  : undefined
+              }
+              onClick={() => {
+                if (disabled) return;
+                onPick(k);
+              }}
+            >
+              <RosterPlayerRow
+                player={p}
+                live={!!isLivePick?.(p)}
+                swapTarget={!!pendingIn && !disabled}
+              />
+            </li>
+          );
+        })}
+        {list.length === 0 && <li className="text-xs text-gray-400">-</li>}
+      </ul>
+    </div>
+  );
+}
+
+function RosterBenchBlock({ title, list, pendingKey, locked, onSubIn, keyOf, isLivePick }) {
+  const selectedPick = pendingKey
+    ? list.find((p) => keyOf(p) === pendingKey)
+    : null;
+
+  return (
+    <div className="rosterBenchList border rounded p-2">
+      <div className="text-xs font-semibold mb-2">{title} <span className="opacity-60">(Bench)</span></div>
+      {selectedPick ? (
+        <div className="rosterSubHint">
+          Selected: {rosterPlayerName(selectedPick)}. Now choose a starter to swap out.
+        </div>
+      ) : null}
+      <ul className="space-y-2">
+        {list.map((p) => {
+          const k = keyOf(p);
+          const selected = pendingKey === k;
+          const live = !!isLivePick?.(p);
+
+          return (
+            <li
+              key={p.id || `${p.uid}-${p.turn}`}
+              className={`rosterBenchRow ${selected ? "rosterBenchRow--selected" : ""} ${locked ? "opacity-60" : ""}`}
+            >
+              <RosterPlayerRow
+                player={p}
+                compact
+                live={live}
+                selected={selected}
+                action={
+                  <button
+                    type="button"
+                    className={`rosterSubButton subInButton border rounded px-2 py-1 text-xs ${locked ? "opacity-50 cursor-not-allowed" : ""}`}
+                    disabled={locked || live}
+                    title={
+                      locked
+                        ? "Lineups locked while games are live"
+                        : live
+                        ? "This player is LIVE (can't sub in)"
+                        : "Move to starting lineup"
+                    }
+                    onClick={() => onSubIn(k)}
+                  >
+                    {selected ? "SELECTED" : "SUB IN"}
+                  </button>
+                }
+              />
+            </li>
+          );
+        })}
+        {list.length === 0 && <li className="text-xs text-gray-400">-</li>}
+      </ul>
+    </div>
+  );
+}
+
+function RosterPosBlock({ title, list }) {
+  return (
+    <div className={`rosterPositionGroup rosterPositionGroup--${title} border rounded p-2`}>
+      <div className="text-xs font-semibold mb-2">{title}</div>
+      <ul className="space-y-2">
+        {list.map((p) => (
+          <li key={p.id || `${p.uid}-${p.turn}`}>
+            <RosterPlayerRow player={p} />
+          </li>
+        ))}
+        {list.length === 0 && <li className="text-xs text-gray-400">-</li>}
+      </ul>
+    </div>
+  );
+}
+
+function RosterBenchReadOnlyBlock({ title, list }) {
+  return (
+    <div className="rosterBenchList border rounded p-2">
+      <div className="text-xs font-semibold mb-2">
+        {title} <span className="opacity-60">(Bench)</span>
+      </div>
+      <ul className="space-y-2">
+        {list.map((p) => (
+          <li key={p.id || `${p.uid}-${p.turn}`} className="rosterBenchRow">
+            <RosterPlayerRow player={p} compact />
+          </li>
+        ))}
+        {list.length === 0 && <li className="text-xs text-gray-400">-</li>}
       </ul>
     </div>
   );

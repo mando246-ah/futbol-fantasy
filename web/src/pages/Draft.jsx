@@ -43,7 +43,9 @@ import FlagIcon from "@/components/FlagIcon";
 
 
 // ----- Config -----
-const TURN_SECONDS = 120;
+const TURN_SECONDS = 45;
+// TODO: enforce this in backend/Firebase rules too before public launch.
+const MAX_ROOM_MANAGERS = 10;
 
 const NEW_ROOM_GLOBAL_PIPELINE_MODE = "legacy";
 // For testing, I may temporarily change this to "shadow".
@@ -115,6 +117,42 @@ function roundOrder(order, roundIndex) {
 }
 function displayNameOf(m, fallback = "User") {
   return m?.displayName || m?.uid || fallback;
+}
+
+function memberUidOf(member) {
+  return String(
+    typeof member === "string"
+      ? member
+      : member?.uid ?? member?.userId ?? member?.id ?? ""
+  );
+}
+
+function formatDraftDuration(totalSeconds) {
+  const seconds = Math.max(0, Math.ceil(Number(totalSeconds || 0)));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.ceil((seconds % 3600) / 60);
+
+  if (hours && minutes) return `${hours}h ${minutes}m`;
+  if (hours) return `${hours}h`;
+  return `${Math.max(1, minutes)}m`;
+}
+
+function getRoomMemberCount(room, members) {
+  const fromMembersState = Array.isArray(members) ? members.length : 0;
+  const fromRoom = Array.isArray(room?.members) ? room.members.length : 0;
+  return fromMembersState || fromRoom || 0;
+}
+
+function getEstimatedDraftDurationSeconds(room, members) {
+  const managerCount = getRoomMemberCount(room, members);
+  const totalRounds = Number(room?.totalRounds ?? DRAFT_SIZE_LEAGUE);
+  return Math.max(0, managerCount * totalRounds * TURN_SECONDS);
+}
+
+function isUserRoomMember(room, uid) {
+  const userUid = String(uid || "");
+  if (!userUid || !Array.isArray(room?.members)) return false;
+  return room.members.some((member) => memberUidOf(member) === userUid);
 }
 
 
@@ -249,6 +287,11 @@ function draftSizeForCompetitionType(type) {
   return String(type || "").toLowerCase() === "cup" ? DRAFT_SIZE_CUP : DRAFT_SIZE_LEAGUE;
 }
 
+function isWorldCupSelection(selection) {
+  const name = String(selection?.name || "").toLowerCase();
+  return /\bworld cup\b/.test(name) && !/\bclub\b/.test(name);
+}
+
 
 export default function DraftWithPresence() {
   // Auth
@@ -309,6 +352,15 @@ export default function DraftWithPresence() {
   };
 
   const membersKey = useMemo(() => (members || []).join("|"), [members]);
+  const managerCount = useMemo(
+    () => getRoomMemberCount(room, members),
+    [room?.members, members]
+  );
+  const estimatedDraftDurationLabel = useMemo(
+    () => formatDraftDuration(getEstimatedDraftDurationSeconds(room, members)),
+    [room?.totalRounds, room?.members, members]
+  );
+  const roomIsFull = managerCount >= MAX_ROOM_MANAGERS;
 
   //Flags
   const competitionName = room?.competitionMeta?.name || "";
@@ -426,6 +478,24 @@ useEffect(() => {
       didJoin = true;
       setJoining(true);
       try {
+        const roomSnap = await getDoc(doc(db, "rooms", roomId));
+        const joinRoomData = roomSnap.exists() ? (roomSnap.data() || {}) : null;
+        const alreadyMember = isUserRoomMember(joinRoomData, auth.currentUser.uid);
+        const isRoomHost = String(joinRoomData?.hostUid || "") === String(auth.currentUser.uid);
+        const currentMembers = getRoomMemberCount(joinRoomData, null);
+
+        if (joinRoomData && !alreadyMember && !isRoomHost && currentMembers >= MAX_ROOM_MANAGERS) {
+          console.warn(`This room is full. Max managers: ${MAX_ROOM_MANAGERS}.`);
+          alert(`This room is full. Max managers: ${MAX_ROOM_MANAGERS}.`);
+          setRoomId("");
+          setRoomKeyInput("");
+          setRoom(null);
+          setMembers([]);
+          return;
+        }
+
+        if (alreadyMember || isRoomHost) return;
+
         const profile = await getUserProfile(auth.currentUser.uid).catch(() => null);
         const displayName = profile?.displayName || auth.currentUser.displayName || auth.currentUser.email;
         await joinRoom(roomId, { displayName });
@@ -570,6 +640,33 @@ useEffect(() => {
     if (!key) return alert("Enter a room key");
 
     try {
+      const roomSnap = await getDoc(doc(db, "rooms", key));
+      if (!roomSnap.exists()) return alert("Room not found.");
+
+      const joinRoomData = roomSnap.data() || {};
+      const alreadyMember = isUserRoomMember(joinRoomData, user.uid);
+      const isRoomHost = String(joinRoomData.hostUid || "") === String(user.uid);
+      const canReopen = alreadyMember || isRoomHost;
+      const currentMembers = getRoomMemberCount(joinRoomData, null);
+
+      if (!canReopen && currentMembers >= MAX_ROOM_MANAGERS) {
+        return alert(`This room is full. Max managers: ${MAX_ROOM_MANAGERS}.`);
+      }
+
+      if (!canReopen && joinRoomData.started) {
+        return alert("This draft has already started.");
+      }
+
+      if (canReopen) {
+        setRoomId(key);
+        logAnalyticsEvent("join_room", {
+          room_id: key,
+          join_method: "code",
+          reopened: true,
+        });
+        return;
+      }
+
       const profile = await getUserProfile(user.uid).catch(() => null);
       const displayName =
         profile?.displayName ||
@@ -1112,7 +1209,10 @@ useEffect(() => {
                   
                 </CardHeader>
                 <CardContent>
-                  <h3 className="font-semibold mb-2">⚽ Managers in Room</h3>
+                  <h3 className="font-semibold mb-2">
+                    ⚽ Managers in Room ({managerCount}/{MAX_ROOM_MANAGERS})
+                    {roomIsFull ? <span className="ml-2 text-xs opacity-80">Full</span> : null}
+                  </h3>
                   <div className="space-y-2">
                     {(room.members || []).map((m) => (
                       <div
@@ -1209,9 +1309,11 @@ useEffect(() => {
                     </div>
                   )}
                 </div>
-                  <p className="text-sm mb-3">
-                    {room.startAt ? "Scheduled" : "Not scheduled"} • Turn: {room.turnIndex ?? 0}
-                  </p>
+                  <div className="draftScheduleMeta">
+                    <span>{room.startAt ? "Scheduled" : "Not scheduled"}</span>
+                    <span>Draft may take up to: <b>{estimatedDraftDurationLabel}</b></span>
+                    <span>{managerCount}/{MAX_ROOM_MANAGERS} managers</span>
+                  </div>
                   {/* Everyone sees scheduled draft start */}
                   {room.startAt ? (
                     <div className="text-sm mb-3">
@@ -1553,8 +1655,6 @@ function PlayerPool({
         />
       </div>
 
-      <DraftFormationRules compact />
-
       <div className="grid gap-2">
         {loadingPlayers ? (
           <div className="opacity-70 p-2">Loading players from API…</div>
@@ -1705,8 +1805,11 @@ function LeagueSelector({ roomId, room, isHost, poolCount, setSeedingPlayers }) 
     const leagueIdNum = Number(selected.leagueId);
     const seasonNum = Number(season);
     const timezone = "America/Los_Angeles";
+    const isWorldCup = isWorldCupSelection(selected);
 
-    const totalRoundsForComp = draftSizeForCompetitionType(selected.type);
+    const totalRoundsForComp = isWorldCup
+      ? DRAFT_SIZE_CUP
+      : draftSizeForCompetitionType(selected.type);
     try {
       setSeedingPlayers(true);
       setError("");
@@ -1724,19 +1827,40 @@ function LeagueSelector({ roomId, room, isHost, poolCount, setSeedingPlayers }) 
         status: "seeding_players",
         totalRounds: totalRoundsForComp,
         playerCount: 0,
+        ...(isWorldCup
+          ? {
+              seasonKey: `worldcup-${seasonNum}`,
+              competitionKey: "worldcup",
+              competitionType: "worldCup",
+            }
+          : {}),
         updatedAt: serverTimestamp(),
       });
 
       // Seed players (league paging mode)
-      const seedFn = httpsCallable(functions, "seedPlayersFromCompetition");
-      const res = await seedFn({
+      const seedFn = httpsCallable(
+        functions,
+        isWorldCup ? "seedWorldCupRoom" : "seedPlayersFromCompetition"
+      );
+      const seedPayload = {
         roomId,
         league: leagueIdNum,
         season: seasonNum,
         timezone,
+        competitionName: selected.name,
+        competitionCountry: selected.country,
+        competitionLogo: selected.logo,
+        competitionType: isWorldCup ? "worldCup" : selected.type,
         maxPages: 250, // adjust higher if you want a bigger pool
         maxPlayers: 1500,
-      });
+      };
+
+      if (isWorldCup) {
+        seedPayload.competitionKey = "worldcup";
+        seedPayload.seasonKey = `worldcup-${seasonNum}`;
+      }
+
+      const res = await seedFn(seedPayload);
       alert(`Successfully loaded ${res.data?.written ?? 0} players.`);
 
       const written = res.data?.written ?? 0;

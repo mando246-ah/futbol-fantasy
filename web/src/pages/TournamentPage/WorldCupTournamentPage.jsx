@@ -1,7 +1,7 @@
-// src/pages/TournamentPage/CupTournamentPage.jsx
+// src/pages/TournamentPage/WorldCupTournamentPage.jsx
 import { useEffect, useMemo, useState, useRef } from "react";
 import { useParams, Link, useLocation, useNavigate } from "react-router-dom";
-import { doc, onSnapshot, collection, query, orderBy, getDocs } from "firebase/firestore";
+import { doc, onSnapshot, collection, query, orderBy, limit, getDocs } from "firebase/firestore";
 
 import { useLineupsForUsers, useTournament } from "../../tournament/hooks/useTournament";
 import { scorePlayerFromCore, toCorePos } from "../../tournament/logic/scoringCoreClient";
@@ -9,6 +9,7 @@ import { auth, db } from "../../firebase";
 import { buildTournamentPlayerResolver } from "./tournamentPlayerResolver";
 
 import "./TournamentPage.css";
+import "./WorldCupTournamentPage.css";
 import { Avatar, AvatarImage, AvatarFallback } from "../../components/ui/avatar";
 import FlagIcon from "../../components/FlagIcon";
 import FinalResultsCard from "../../components/ui/FinalResultsCard";
@@ -45,6 +46,41 @@ const SCORING_DISPLAY = [
   { label: "Offsides", detail: "-1 per 3" },
 
   { label: "Shots on Target", detail: "+1 each" },
+];
+
+const WORLD_CUP_FLAG_MARQUEE = [
+  "United States",
+  "Mexico",
+  "Canada",
+  "Brazil",
+  "Argentina",
+  "Uruguay",
+  "Colombia",
+  "Ecuador",
+  "France",
+  "Spain",
+  "Portugal",
+  "Germany",
+  "Italy",
+  "Netherlands",
+  "Belgium",
+  "Croatia",
+  "England",
+  "Japan",
+  "South Korea",
+  "Australia",
+  "Morocco",
+  "Nigeria",
+  "Senegal",
+  "Ghana",
+  "Tunisia",
+  "Saudi Arabia",
+  "Qatar",
+  "Iran",
+  "Costa Rica",
+  "Panama",
+  "Paraguay",
+  "Chile",
 ];
 
 const STAT_LABELS = {
@@ -886,7 +922,7 @@ function inferOwnerUidFromPick(d) {
   return null;
 }
 
-export default function CupTournamentPage() {
+export default function WorldCupTournamentPage() {
   const { roomId } = useParams();
   const location = useLocation();
   const navigate = useNavigate();
@@ -895,12 +931,42 @@ export default function CupTournamentPage() {
   const engineType = String(room?.engineType || room?.worldCup?.engineType || "").trim();
   const competitionType = String(room?.competitionType || "").trim();
   const worldCupPhase = String(room?.worldCupPhase || room?.worldCup?.phase || "").trim();
-  const viewOverride = new URLSearchParams(location.search).get("view");
-  const detectedWorldCupGroupRoom =
+  const competitionKey = String(room?.competitionKey || "").toLowerCase();
+  const competitionMetaType = String(room?.competitionMeta?.type || "").toLowerCase();
+  const competitionMetaName = String(room?.competitionMeta?.name || room?.competition?.name || "").toLowerCase();
+  const isWorldCupRoom = Boolean(
+    room?.worldCup ||
+    room?.worldCupPhase ||
+    competitionMetaType.includes("world cup") ||
+    competitionMetaName.includes("world cup") ||
+    competitionKey.includes("worldcup") ||
+    competitionKey.includes("world-cup")
+  );
+  const isWorldCupGroupRoom =
     engineType === "worldCupDaily" ||
     (competitionType === "worldCup" && worldCupPhase === "group") ||
     room?.competitionState?.phaseLabel === "WorldCupGroup";
-  const isWorldCupGroupRoom = viewOverride === "cup" ? false : detectedWorldCupGroupRoom;
+  const isWorldCupKnockoutRoom =
+    isWorldCupRoom &&
+    !isWorldCupGroupRoom &&
+    (
+      worldCupPhase.toLowerCase() === "knockout" ||
+      String(room?.worldCup?.phase || "").toLowerCase() === "knockout" ||
+      engineType === "cupEngine" ||
+      room?.competitionState?.phaseLabel === "Cup"
+    );
+  const worldCupPageTitle = isWorldCupGroupRoom
+    ? "World Cup Group Stage"
+    : isWorldCupKnockoutRoom
+      ? "World Cup Knockouts"
+      : "World Cup Tournament";
+  const worldCupWindowLabel = isWorldCupGroupRoom ? "Group Stage Games" : "Next Games";
+  const worldCupCurrentLabel = isWorldCupGroupRoom ? "Current Day" : "Current Round";
+  const worldCupHistoryTitle = isWorldCupGroupRoom ? "Daily Results" : "Knockout Results";
+  const worldCupLeaderboardTitle = isWorldCupGroupRoom
+    ? "Group Stage Leaderboard"
+    : "Knockout Leaderboard";
+  const marqueeFlags = [...WORLD_CUP_FLAG_MARQUEE, ...WORLD_CUP_FLAG_MARQUEE];
   const [myUid, setMyUid] = useState(auth.currentUser?.uid || null);
   const [nowMs, setNowMs] = useState(() => Date.now());
   
@@ -916,6 +982,8 @@ export default function CupTournamentPage() {
   const [dayResults, setDayResults] = useState([]);
   const [roomPlayerDocs, setRoomPlayerDocs] = useState([]);
   const [roomPickDocs, setRoomPickDocs] = useState([]);
+  const [currentDayDoc, setCurrentDayDoc] = useState(null);
+  const [currentDayResultDoc, setCurrentDayResultDoc] = useState(null);
   const [selectedHistoryId, setSelectedHistoryId] = useState("");
   const [openHistoryBreakdownKey, setOpenHistoryBreakdownKey] = useState(null);
   const [devPreviewComplete, setDevPreviewComplete] = useState(false);
@@ -930,6 +998,9 @@ export default function CupTournamentPage() {
   const [devBusy, setDevBusy] = useState(false);
   const [shadowTestBusy, setShadowTestBusy] = useState(false);
   const [shadowTestResult, setShadowTestResult] = useState(null);
+  const [wcDebugRunning, setWcDebugRunning] = useState(false);
+  const [wcDebugResult, setWcDebugResult] = useState(null);
+  const [wcDebugError, setWcDebugError] = useState("");
   
 
   useEffect(() => {
@@ -1094,6 +1165,48 @@ export default function CupTournamentPage() {
   }, [roomId, isWorldCupGroupRoom, historyEnabled]);
 
   useEffect(() => {
+    if (!roomId || !isWorldCupGroupRoom) {
+      setCurrentDayDoc(null);
+      setCurrentDayResultDoc(null);
+      return undefined;
+    }
+
+    const currentDayIndex = Number(room?.worldCup?.currentDayIndex);
+    let unsubDay = () => {};
+    let unsubDayResult = () => {};
+
+    if (Number.isFinite(currentDayIndex) && currentDayIndex > 0) {
+      const dayId = String(currentDayIndex);
+      unsubDay = onSnapshot(
+        doc(db, "rooms", roomId, "days", dayId),
+        (snap) => setCurrentDayDoc(snap.exists() ? { id: snap.id, ...(snap.data() || {}) } : null),
+        () => setCurrentDayDoc(null)
+      );
+      unsubDayResult = onSnapshot(
+        doc(db, "rooms", roomId, "dayResults", dayId),
+        (snap) => setCurrentDayResultDoc(snap.exists() ? { id: snap.id, ...(snap.data() || {}) } : null),
+        () => setCurrentDayResultDoc(null)
+      );
+    } else {
+      const latestDayResultQ = query(
+        collection(db, "rooms", roomId, "dayResults"),
+        orderBy("dayIndex", "desc"),
+        limit(1)
+      );
+      unsubDayResult = onSnapshot(
+        latestDayResultQ,
+        (snap) => setCurrentDayResultDoc(snap.docs[0] ? { id: snap.docs[0].id, ...(snap.docs[0].data() || {}) } : null),
+        () => setCurrentDayResultDoc(null)
+      );
+    }
+
+    return () => {
+      unsubDay();
+      unsubDayResult();
+    };
+  }, [roomId, isWorldCupGroupRoom, room?.worldCup?.currentDayIndex]);
+
+  useEffect(() => {
     setOpenHistoryBreakdownKey(null);
   }, [historyEnabled, selectedHistoryId]);
 
@@ -1160,6 +1273,10 @@ export default function CupTournamentPage() {
   }
 
   const isHost = room?.hostUid === myUid;
+  const normalizedCurrentDayResult =
+    isWorldCupGroupRoom && currentDayResultDoc
+      ? normalizeWorldCupDayResults([currentDayResultDoc], userById)[0] || null
+      : null;
   const displayHistoryRounds = historyEnabled
     ? (isWorldCupGroupRoom
         ? normalizeWorldCupDayResults(dayResults, userById)
@@ -1180,12 +1297,13 @@ export default function CupTournamentPage() {
 
     //Status 
     const latestDayResult = isWorldCupGroupRoom
-      ? displayHistoryRounds[0] || null
+      ? normalizedCurrentDayResult || displayHistoryRounds[0] || null
       : null;
     const currentWorldCupDayIndex = Number(room?.worldCup?.currentDayIndex);
     const currentDayResult =
       isWorldCupGroupRoom && Number.isFinite(currentWorldCupDayIndex)
-        ? displayHistoryRounds.find(
+        ? normalizedCurrentDayResult ||
+          displayHistoryRounds.find(
             (day) => Number(day?.dayIndex) === currentWorldCupDayIndex
           ) || null
         : null;
@@ -1240,7 +1358,7 @@ export default function CupTournamentPage() {
     const lastUpdateLabel = lastUpdateMs ? fmtDT(lastUpdateMs) : "—";
     const status = String(statusRaw).toUpperCase();
     const currentWindowLabel = isWorldCupGroupRoom
-      ? room?.competitionState?.currentLabel || room?.worldCup?.currentDayLabel || latestDayResult?.label || "Waiting for next day"
+      ? room?.competitionState?.currentLabel || room?.worldCup?.currentDayLabel || currentDayDoc?.label || latestDayResult?.label || "Waiting for next day"
       : cupDoc?.currentWindowLabel || "Waiting for next round";
     const isFinal = status === "FINAL" || cupDoc?.completed || (isWorldCupGroupRoom && room?.competitionState?.isDone);
     
@@ -1730,7 +1848,9 @@ export default function CupTournamentPage() {
   const winStartMs =
     (isWorldCupGroupRoom
       ? room?.worldCup?.currentDayStartAtMs ||
+        currentDayDoc?.startAtMs ||
         currentDayResult?.startAtMs ||
+        latestDayResult?.startAtMs ||
         room?.worldCup?.firstWindowStartAtMs
       : cupDoc?.currentWindowStartAtMs ??
         cupDoc?.startAtMs ??
@@ -1740,7 +1860,9 @@ export default function CupTournamentPage() {
   const winEndMs =
     (isWorldCupGroupRoom
       ? room?.worldCup?.currentDayEndAtMs ||
+        currentDayDoc?.endAtMs ||
         currentDayResult?.endAtMs ||
+        latestDayResult?.endAtMs ||
         room?.worldCup?.lastWindowEndAtMs
       : cupDoc?.currentWindowEndAtMs ??
         cupDoc?.endAtMs ??
@@ -2129,6 +2251,48 @@ export default function CupTournamentPage() {
     }
   }
 
+  async function runWorldCupDebug(nowMs = null, label = "now") {
+    if (!roomId) return;
+
+    setWcDebugRunning(true);
+    setWcDebugError("");
+    setWcDebugResult(null);
+
+    try {
+      const functions = getFunctions(getApp(), "us-west2");
+      const fn = httpsCallable(functions, "debugRunWorldCupGroupEngine");
+      const payload = { roomId };
+      const parsedNowMs = Number(nowMs);
+
+      if (nowMs !== null && nowMs !== undefined && Number.isFinite(parsedNowMs)) {
+        payload.nowMs = parsedNowMs;
+      }
+
+      const res = await fn(payload);
+      const debugData = res?.data || {};
+
+      console.log("[WorldCupTournamentPage] debugRunWorldCupGroupEngine result", {
+        label,
+        payload,
+        data: debugData,
+      });
+
+      if (debugData?.fixtureCoverage) {
+        console.table(debugData.fixtureCoverage);
+      }
+
+      setWcDebugResult({
+        label,
+        ...debugData,
+      });
+    } catch (err) {
+      console.error("[WorldCupTournamentPage] debugRunWorldCupGroupEngine failed", err);
+      setWcDebugError(err?.message || String(err));
+    } finally {
+      setWcDebugRunning(false);
+    }
+  }
+
     const roomNextLabel =
         room?.competitionState?.currentLabel ||
         room?.["competitionState.currentLabel"] ||
@@ -2137,10 +2301,35 @@ export default function CupTournamentPage() {
     const nextGameLabel = roomNextLabel || currentWindowLabel || "—";
 
   const nextLabel =
-    (isWorldCupGroupRoom ? roomNextLabel || latestDayResult?.label : cupDoc?.currentWindowLabel) ||
+    (isWorldCupGroupRoom ? roomNextLabel || currentDayDoc?.label || latestDayResult?.label : cupDoc?.currentWindowLabel) ||
     room?.competitionState?.currentLabel ||
     room?.["competitionState.currentLabel"] ||
     "—";
+
+  const debugCurrentDay = currentDayDoc || currentDayResult || latestDayResult || null;
+  const debugCurrentDayFixtures = Array.isArray(debugCurrentDay?.fixtures)
+    ? debugCurrentDay.fixtures
+    : [];
+  const debugLastFixture =
+    debugCurrentDayFixtures.length > 0
+      ? debugCurrentDayFixtures[debugCurrentDayFixtures.length - 1]
+      : null;
+  const currentDayFirstKickoffMs =
+    Number(debugCurrentDay?.firstKickoffMs || debugCurrentDayFixtures[0]?.kickoffMs || 0) || null;
+  const currentDayLastKickoffMs =
+    Number(debugCurrentDay?.lastKickoffMs || debugLastFixture?.kickoffMs || 0) || null;
+  const debugBeforeKickoffMs = currentDayFirstKickoffMs
+    ? currentDayFirstKickoffMs - 30 * 60 * 1000
+    : null;
+  const debugPreLiveMs = currentDayFirstKickoffMs
+    ? currentDayFirstKickoffMs - 10 * 60 * 1000
+    : null;
+  const debugLiveMs = currentDayFirstKickoffMs
+    ? currentDayFirstKickoffMs + 10 * 60 * 1000
+    : null;
+  const debugPostDayMs = currentDayLastKickoffMs
+    ? currentDayLastKickoffMs + 2 * 60 * 60 * 1000 + 5 * 60 * 1000
+    : null;
 
   const winText =
     winStartMs && winEndMs ? `${fmtDT(winStartMs)} → ${fmtDT(winEndMs)}` : "—";
@@ -2149,12 +2338,21 @@ export default function CupTournamentPage() {
 
 
   return (
-    <div className="tpPage">
+    <div className={`tpPage worldcup-page ${isWorldCupGroupRoom ? "worldcup-group-page" : "worldcup-knockout-page"}`}>
       <div className="tpWrap">
         {/* --- HEADER --- */}
         <div className="tpHeaderRow">
           <div className="tpHeaderLeft">
-            <h2 className="tpTitle">{isWorldCupGroupRoom ? "World Cup" : "Cup Tournament"}</h2>
+            <div className="worldcup-flag-marquee" aria-label="World Cup flags">
+              <div className="worldcup-flag-track">
+                {marqueeFlags.map((country, index) => (
+                  <span className="worldcup-flag" key={`${country}-${index}`} title={country}>
+                    <FlagIcon country={country} size={26} title={country} />
+                  </span>
+                ))}
+              </div>
+            </div>
+            <h2 className="tpTitle worldcup-title">{worldCupPageTitle}</h2>
             <div className="tpHeaderMetaBlock">
               {competitionLabel && (
                 <div className="tpRoomMeta">
@@ -2162,7 +2360,7 @@ export default function CupTournamentPage() {
                 </div>
               )}
                 <div className="tpRoomMeta">
-                    {isWorldCupGroupRoom ? "Current Day" : "Next Games"}: <b>{winText}</b> • {isWorldCupGroupRoom ? "Day" : "Round"}: <b style={{ color: "var(--color-primary)" }}>{nextLabel}</b>
+                    {worldCupWindowLabel}: <b>{winText}</b> • {worldCupCurrentLabel}: <b style={{ color: "var(--color-primary)" }}>{nextLabel}</b>
                 </div>
               <div className="tpRoomMeta">Room: <b>{room?.name} - {roomId}</b></div>
               <div className="tpLiveHeaderLine">
@@ -2203,14 +2401,62 @@ export default function CupTournamentPage() {
                     <button
                       type="button"
                       className="tpToolsItem"
-                      onClick={() => switchTournamentView("worldcup")}
+                      onClick={() => switchTournamentView("cup")}
                     >
-                      View World Cup UI
+                      View Cup UI
                     </button>
 
                     <button className="tpToolsItem" onClick={() => setDevPreviewComplete(!devPreviewComplete)}>
                         {devPreviewComplete ? "Hide Podium" : "DEV: Preview Final Podium"}
                     </button>
+
+                    {isWorldCupGroupRoom && (
+                      <div className="wcDebugTools">
+                        <div className="wcDebugWarning">
+                          Debug engine writes day results, standings, and room state.
+                        </div>
+                        <button
+                          type="button"
+                          className="tpToolsItem"
+                          onClick={() => runWorldCupDebug(null, "now")}
+                          disabled={wcDebugRunning}
+                        >
+                          {wcDebugRunning ? "Running WC Engine..." : "Debug WC Engine: Now"}
+                        </button>
+                        <button
+                          type="button"
+                          className="tpToolsItem"
+                          onClick={() => runWorldCupDebug(debugBeforeKickoffMs, "30m-before-kickoff")}
+                          disabled={wcDebugRunning || !debugBeforeKickoffMs}
+                        >
+                          Debug: 30m Before Kickoff
+                        </button>
+                        <button
+                          type="button"
+                          className="tpToolsItem"
+                          onClick={() => runWorldCupDebug(debugPreLiveMs, "10m-before-kickoff")}
+                          disabled={wcDebugRunning || !debugPreLiveMs}
+                        >
+                          Debug: 10m Before Kickoff
+                        </button>
+                        <button
+                          type="button"
+                          className="tpToolsItem"
+                          onClick={() => runWorldCupDebug(debugLiveMs, "10m-after-kickoff")}
+                          disabled={wcDebugRunning || !debugLiveMs}
+                        >
+                          Debug: 10m After Kickoff
+                        </button>
+                        <button
+                          type="button"
+                          className="tpToolsItem"
+                          onClick={() => runWorldCupDebug(debugPostDayMs, "after-day-window")}
+                          disabled={wcDebugRunning || !debugPostDayMs}
+                        >
+                          Debug: After Day Window
+                        </button>
+                      </div>
+                    )}
 
                     {!isWorldCupGroupRoom && (
                       <>
@@ -2255,6 +2501,24 @@ export default function CupTournamentPage() {
                 </ul>
                 </div>
             )}
+
+            {wcDebugResult && (
+              <div className="wcDebugResult">
+                <strong>Debug result:</strong>
+                <span>Label: {wcDebugResult.label || "now"}</span>
+                <span>Status: {wcDebugResult.status || "—"}</span>
+                <span>Week Status: {wcDebugResult.weekStatus || "—"}</span>
+                <span>Day: {wcDebugResult.currentDayIndex || wcDebugResult.dayIndex || "—"}</span>
+                <span>Source: {wcDebugResult.result?.source || wcDebugResult.source || "—"}</span>
+                <span>Next poll: {wcDebugResult.nextPollAtMs || "—"}</span>
+              </div>
+            )}
+
+            {wcDebugError && (
+              <div className="wcDebugError">
+                Debug failed: {wcDebugError}
+              </div>
+            )}
             </div>
         </div>
 
@@ -2264,8 +2528,8 @@ export default function CupTournamentPage() {
             <div className="tpCard tpFull">
               <FinalResultsCard
                 finalResults={devPreviewComplete ? fakePodiumData : finalResultsDoc}
-                title={isWorldCupGroupRoom ? "World Cup Complete" : "Cup Complete"}
-                subtitle={isWorldCupGroupRoom ? "Top 3 Managers" : "Final Podium"}
+                title={isWorldCupGroupRoom ? "World Cup Group Stage Top 3" : "World Cup Knockout Champion"}
+                subtitle="Top 3 Managers"
                 badge="🏆"
                 showWdl={false}
                 matchLabel="Competition"
@@ -2279,7 +2543,7 @@ export default function CupTournamentPage() {
 
           {/* LEADERBOARD */}
           <div className="tpCard tpFull">
-            <h3 className="tpCardTitle">Global Leaderboard</h3>
+            <h3 className="tpCardTitle">{worldCupLeaderboardTitle}</h3>
             <div className="tpBoard">
               <div className="tpBoardHead">
                 <span>#</span>
@@ -2543,27 +2807,27 @@ export default function CupTournamentPage() {
             </div>
           )}
           
-          {/* ROUND / DAILY HISTORY */}
+          {/* DAILY RESULTS */}
           <div className="tpCard tpFull">
             {!historyEnabled ? (
               <div className="tpHistoryLoadCard">
                 <div>
                   <h3 className="tpHistoryLoadTitle">
-                    {isWorldCupGroupRoom ? "Daily History" : "Round History"}
+                    {worldCupHistoryTitle}
                   </h3>
                   <p className="tpHistoryLoadText">
                     
                   </p>
                 </div>
                 <button type="button" className="tpPointsBtn" onClick={() => setHistoryEnabled(true)}>
-                  {isWorldCupGroupRoom ? "Load Daily History" : "Load Round History"}
+                  {isWorldCupGroupRoom ? "Load Daily Results" : "Load Knockout Results"}
                 </button>
               </div>
             ) : (
               <>
             <div className="tpHistoryHeader">
               <h3 className="tpCardTitle tpHistoryTitle">
-                {isWorldCupGroupRoom ? "Daily History" : "Round History"}
+                {worldCupHistoryTitle}
               </h3>
 
               <div className="tpHistoryControls">
@@ -2575,8 +2839,8 @@ export default function CupTournamentPage() {
                 >
                   <option value="">
                     {displayHistoryRounds.length === 0
-                      ? (isWorldCupGroupRoom ? "No daily results yet" : "No completed rounds yet")
-                      : (isWorldCupGroupRoom ? "Select daily results..." : "Select a previous round...")}
+                      ? (isWorldCupGroupRoom ? "No daily results yet" : "No knockout results yet")
+                      : (isWorldCupGroupRoom ? "Select daily results..." : "Select knockout results...")}
                   </option>
 
                   {displayHistoryRounds.map((h) => (
@@ -2606,7 +2870,7 @@ export default function CupTournamentPage() {
               <p className="tpText">
                 {isWorldCupGroupRoom
                   ? "Pick daily results to view scores."
-                  : "Pick a previous round to view final scores."}
+                  : "Pick knockout results to view final scores."}
               </p>
             ) : (
               <>
@@ -2620,7 +2884,7 @@ export default function CupTournamentPage() {
 
                   <div className="tpHistoryMetaCard">
                     <span className="tpHistoryMetaLabel">
-                      {isWorldCupGroupRoom ? "Daily Results" : "Round"}
+                      {worldCupHistoryTitle}
                     </span>
                     <span className="tpHistoryMetaValue">
                       {isWorldCupGroupRoom && selectedHistory?.dateLabel
@@ -2657,7 +2921,7 @@ export default function CupTournamentPage() {
                         historyBreakdown.bench.length > 0;
                       const emptyHistoryBreakdownText = isWorldCupGroupRoom
                         ? "No player breakdown saved for this day."
-                        : "No player breakdown saved for this round.";
+                        : "No player breakdown saved for this knockout round.";
 
                       const pointsToneClass = (points) => {
                         const n = Number(points);
@@ -2778,7 +3042,7 @@ export default function CupTournamentPage() {
                   <p className="tpText">
                     {isWorldCupGroupRoom
                       ? "No scores saved for this day yet."
-                      : "No scores saved for this round yet."}
+                      : "No scores saved for this knockout round yet."}
                   </p>
                 )}
               </>
@@ -2792,3 +3056,4 @@ export default function CupTournamentPage() {
     </div>
   );
 }
+

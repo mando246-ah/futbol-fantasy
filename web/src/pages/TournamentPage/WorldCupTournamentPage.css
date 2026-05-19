@@ -1,0 +1,180 @@
+.worldcup-page {
+  background:
+    radial-gradient(circle at 10% 8%, rgba(59, 130, 246, 0.28), transparent 28%),
+    radial-gradient(circle at 85% 10%, rgba(239, 68, 68, 0.22), transparent 26%),
+    radial-gradient(circle at 24% 88%, rgba(34, 197, 94, 0.2), transparent 28%),
+    radial-gradient(circle at 78% 82%, rgba(250, 204, 21, 0.18), transparent 28%),
+    linear-gradient(180deg, #050816 0%, #07111f 48%, #04070d 100%);
+}
+
+.worldcup-page .tpWrap {
+  position: relative;
+}
+
+.worldcup-page .tpWrap::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 50% 0%, rgba(250, 204, 21, 0.12), transparent 34%),
+    linear-gradient(rgba(255, 255, 255, 0.025) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
+  background-size: 54px 54px;
+  mask-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.75), transparent 72%);
+}
+
+.worldcup-flag-marquee {
+  width: 100%;
+  overflow: hidden;
+  border: 1px solid rgba(255, 215, 80, 0.35);
+  border-radius: 999px;
+  background:
+    linear-gradient(90deg, rgba(0, 180, 255, 0.12), rgba(255, 60, 120, 0.12), rgba(255, 215, 80, 0.12)),
+    rgba(3, 7, 18, 0.5);
+  box-shadow: 0 0 24px rgba(255, 215, 80, 0.12);
+  margin-bottom: 14px;
+}
+
+.worldcup-flag-track {
+  display: flex;
+  width: max-content;
+  gap: 18px;
+  padding: 8px 16px;
+  animation: worldcupFlagScroll 28s linear infinite;
+  will-change: transform;
+}
+
+.worldcup-flag {
+  display: inline-flex;
+  flex: 0 0 auto;
+  font-size: 1.45rem;
+  line-height: 1;
+  filter: drop-shadow(0 0 6px rgba(255, 255, 255, 0.25));
+}
+
+.worldcup-page .tpTitle,
+.worldcup-title {
+  color: #fef3c7;
+  text-shadow:
+    0 0 18px rgba(250, 204, 21, 0.28),
+    0 0 34px rgba(59, 130, 246, 0.18);
+}
+
+.worldcup-page .tpCard {
+  border-color: rgba(250, 204, 21, 0.2);
+  background:
+    radial-gradient(circle at top left, rgba(59, 130, 246, 0.12), transparent 32%),
+    radial-gradient(circle at top right, rgba(239, 68, 68, 0.1), transparent 28%),
+    linear-gradient(145deg, rgba(15, 23, 42, 0.9), rgba(3, 12, 20, 0.92));
+  box-shadow: 0 22px 60px rgba(0, 0, 0, 0.28);
+}
+
+.worldcup-page .tpCardTitle,
+.worldcup-page .tpHistoryLoadTitle {
+  color: #fef9c3;
+}
+
+.worldcup-page .tpPointsBtn,
+.worldcup-page .tpScoringBtn,
+.worldcup-page .tpToolsBtn {
+  border-color: rgba(250, 204, 21, 0.35);
+  background: linear-gradient(135deg, rgba(250, 204, 21, 0.18), rgba(59, 130, 246, 0.14), rgba(34, 197, 94, 0.12));
+}
+
+.worldcup-page .tpBoardRow:hover,
+.worldcup-page .tpHistoryRow:hover,
+.worldcup-page .tpRow:hover {
+  border-color: rgba(250, 204, 21, 0.38);
+  box-shadow: 0 0 24px rgba(250, 204, 21, 0.1);
+}
+
+.worldcup-page .tpHistoryRankBadge {
+  background: rgba(250, 204, 21, 0.16);
+  border-color: rgba(250, 204, 21, 0.32);
+  color: #fef3c7;
+}
+
+.wcDebugTools {
+  display: grid;
+  gap: 7px;
+  padding-top: 8px;
+  margin-top: 8px;
+  border-top: 1px solid rgba(250, 204, 21, 0.18);
+}
+
+.wcDebugWarning {
+  padding: 8px 10px;
+  border: 1px solid rgba(250, 204, 21, 0.25);
+  border-radius: 12px;
+  background: rgba(250, 204, 21, 0.08);
+  color: #fde68a;
+  font-size: 0.78rem;
+  font-weight: 800;
+  line-height: 1.25;
+}
+
+.wcDebugResult {
+  margin-top: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(250, 204, 21, 0.25);
+  background: rgba(250, 204, 21, 0.08);
+  color: rgba(255, 255, 255, 0.88);
+  font-size: 0.82rem;
+}
+
+.wcDebugResult span,
+.wcDebugResult strong {
+  display: inline-flex;
+  align-items: center;
+}
+
+.wcDebugError {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(248, 113, 113, 0.35);
+  background: rgba(248, 113, 113, 0.10);
+  color: #fecaca;
+  font-weight: 800;
+  font-size: 0.82rem;
+}
+
+@keyframes worldcupFlagScroll {
+  from {
+    transform: translateX(0);
+  }
+
+  to {
+    transform: translateX(-50%);
+  }
+}
+
+@media (max-width: 640px) {
+  .worldcup-flag-marquee {
+    width: 100%;
+    border-radius: 18px;
+    margin-inline: 0;
+  }
+
+  .worldcup-flag-track {
+    gap: 12px;
+    padding: 7px 12px;
+    animation-duration: 22s;
+  }
+
+  .worldcup-flag {
+    width: 30px;
+    height: 30px;
+  }
+
+  .worldcup-flag img,
+  .worldcup-flag svg {
+    width: 21px;
+    height: 21px;
+  }
+}

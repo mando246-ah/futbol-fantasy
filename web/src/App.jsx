@@ -13,6 +13,7 @@ import Draft from "./pages/Draft";
 import Profile from "./pages/Profile";
 import DraftSummary from "./pages/DraftSummary";
 import Home from "./pages/Home";
+import SupportPage from "./pages/SupportPage";
 //import TournamentPage from "./pages/TournamentPage/TournamentPage";
 import TournamentRouter from "./pages/TournamentPage/TournamentRouter";
 import {
@@ -30,6 +31,7 @@ import {
   logPageView,
   logAnalyticsEvent,
 } from "./firebase";
+
 
 import { Avatar, AvatarImage, AvatarFallback } from "./components/ui/avatar";
 import logo from "./assets/logo.png";
@@ -81,6 +83,7 @@ function Nav({ user, displayName, photoURL }) {
     },
     { to: "/profile", label: "Profile", hideWhenNoUser: true },
     { to: "/signin", label: "Sign In", hideWhenAuthed: true },
+    { to: "/support", label: "Support Us" },
   ];
 
   const visibleTabs = tabs.filter(
@@ -277,7 +280,24 @@ function SignIn() {
     <div className="min-h-[60vh] grid place-items-center p-6">
       <div className="rounded-2xl border border-white/10 bg-white/5 backdrop-blur-md shadow-lg p-6 w-full max-w-md text-white">
         <h1 className="text-xl font-bold mb-2">Sign in</h1>
-        <p className="text-sm opacity-70 mb-4">Please sign in with Google</p>
+        <p className="text-sm opacity-80 mb-4 leading-relaxed">
+          Sign in to create or join rooms, draft with friends, manage your lineups, and track your tournament live.
+        </p>
+
+        <div className="mb-4 grid gap-2 text-sm">
+          <div className="flex items-center gap-2 rounded-xl border border-white/10 bg-white/5 px-3 py-2">
+            <span className="text-emerald-300">✓</span>
+            <span>Create or join private rooms</span>
+          </div>
+          <div className="flex items-center gap-2 rounded-xl border border-white/10 bg-white/5 px-3 py-2">
+            <span className="text-emerald-300">✓</span>
+            <span>Manage your starting XI and bench</span>
+          </div>
+          <div className="flex items-center gap-2 rounded-xl border border-white/10 bg-white/5 px-3 py-2">
+            <span className="text-emerald-300">✓</span>
+            <span>Follow scores, standings, and matchups</span>
+          </div>
+        </div>
 
         <label className="flex items-center gap-2 text-sm opacity-90 mb-4 select-none">
           <input
@@ -297,37 +317,7 @@ function SignIn() {
           Continue with Google
         </button>
 
-        {/*<div className="flex items-center gap-3 mb-4">
-          <div className="h-px flex-1 bg-white/10" />
-          <div className="text-xs opacity-50">OR</div>
-          <div className="h-px flex-1 bg-white/10" />
-        </div>
-
-        {!sent ? (
-          <form onSubmit={onSend} className="space-y-3">
-            <input
-              type="email"
-              required
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              placeholder="you@example.com"
-              className="w-full rounded-xl border border-white/15 bg-black/30 px-3 py-2 text-white placeholder:text-white/40 outline-none focus:ring-2 focus:ring-cyan-400/40"
-            />
-            <button
-              type="submit"
-              disabled={busy}
-              className="w-full px-3 py-2 rounded-xl border border-white/10 bg-gradient-to-r from-fuchsia-500/80 to-cyan-400/80 text-white hover:from-fuchsia-500 hover:to-cyan-400 disabled:opacity-50"
-            >
-              {busy ? "Working..." : "Send magic link"}
-            </button>
-          </form>
-        ) : (
-          <div className="text-sm">
-            We sent a link to <b>{email}</b>. Open it here to finish sign-in.
-          </div>
-        )}
-
-        {err && <div className="text-red-600 text-sm mt-3">{String(err)}</div>} */}
+       
       </div>
     </div>
   );
@@ -468,18 +458,13 @@ export default function App() {
             </RequireAuth>
           } />
 
-          {/*<Route path="/tournament" element={
-            <RequireAuth user={user}><TournamentPage /></RequireAuth>
-          } />
-          <Route path="/tournament/:roomId" element={
-            <RequireAuth user={user}><TournamentPage /></RequireAuth>
-          } /> */}
           <Route path="/tournament" element={
             <RequireAuth user={user}><TournamentRouter /></RequireAuth>
           } />
           <Route path="/tournament/:roomId" element={
             <RequireAuth user={user}><TournamentRouter /></RequireAuth>
           } />
+          <Route path="/support" element={<SupportPage />} />
         </Route>
       </Routes>
     </Router>

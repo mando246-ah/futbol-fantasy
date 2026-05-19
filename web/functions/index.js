@@ -20,6 +20,7 @@ const {
   getGlobalPipelineMode,
   isGlobalPlayerPoolEnabled,
   isGlobalLiveFixtureCacheEnabled,
+  isGlobalRoomAggregatorEnabled,
   normalizeGlobalPipelineMode,
 } = require("./shared/globalPipeline");
 const {
@@ -35,6 +36,36 @@ const {
   getCompetitionState,
   setCompetitionState,
 } = require("./shared/competitionState");
+const {
+  WORLD_CUP_GROUP_PHASE,
+  WORLD_CUP_KNOCKOUT_PHASE,
+  buildWorldCupRoomMode,
+  getWorldCupQualifiedTeamsDocPath,
+  isWorldCupCompetition,
+} = require("./worldCup/worldCupMode");
+const {
+  loadWorldCupGroupDailyWindows,
+  writeWorldCupDailyWindowsForRoom,
+} = require("./worldCup/worldCupDailyWindows");
+const { runWorldCupGroupEngine } = require("./worldCup/worldCupGroupEngine");
+const {
+  buildWorldCupGroupSeasonTargetForRoom,
+} = require("./worldCup/worldCupGlobalTargets");
+const {
+  WORLD_CUP_GLOBAL_PLAYER_POOL_MIN,
+  collectWorldCupTeamsFromDailyWindows,
+  fetchWorldCupTeamPlayerPool,
+} = require("./worldCup/worldCupPlayerPool");
+
+const { defineSecret } = require("firebase-functions/params");
+
+const APIFOOTBALL_KEY = defineSecret("APIFOOTBALL_KEY");
+const SUPPORT_EMAIL_USER = defineSecret("SUPPORT_EMAIL_USER");
+const SUPPORT_EMAIL_PASS = defineSecret("SUPPORT_EMAIL_PASS");
+const SUPPORT_TO_EMAIL = defineSecret("SUPPORT_TO_EMAIL");
+
+const nodemailer = require("nodemailer");
+const REGULAR_FINAL_HOLD_MS = 24 * 60 * 60 * 1000;
 
 //Serve Resolve Market Helpers
 async function loadStandingsByUid(roomRef) {
@@ -259,8 +290,7 @@ async function getRoomMemberUids(roomRef, room) {
 
 
 //API
-const { defineSecret } = require("firebase-functions/params");
-const APIFOOTBALL_KEY = defineSecret("APIFOOTBALL_KEY");
+
 
 async function apiFootballGet(path, params, apiKey) {
   const url = new URL(`https://v3.football.api-sports.io/${path}`);
@@ -474,6 +504,226 @@ async function fetchCompetitionPlayerPoolFromApi({
   };
 }
 
+function collectFixtureTeams(fixtures = []) {
+  const teamsById = new Map();
+
+  for (const fixture of Array.isArray(fixtures) ? fixtures : []) {
+    for (const side of [fixture?.teams?.home, fixture?.teams?.away]) {
+      const id = side?.id;
+      if (!id) continue;
+
+      const key = String(id);
+      if (teamsById.has(key)) continue;
+
+      teamsById.set(key, {
+        id: key,
+        name: side?.name || "",
+        logo: side?.logo || "",
+      });
+    }
+  }
+
+  return Array.from(teamsById.values());
+}
+
+function collectWeekWindowTeams({ window = null, teamMeta = null } = {}) {
+  const teamsById = new Map();
+
+  const addTeam = (id, name = "", logo = "") => {
+    if (id == null || id === "") return;
+    const key = String(id);
+    if (!key || teamsById.has(key)) return;
+    teamsById.set(key, { id: key, name: name || "", logo: logo || "" });
+  };
+
+  if (teamMeta instanceof Map) {
+    for (const [id, meta] of teamMeta.entries()) {
+      addTeam(id, meta?.name || "", meta?.logo || "");
+    }
+  }
+
+  for (const fixture of Array.isArray(window?.fixtures) ? window.fixtures : []) {
+    addTeam(fixture?.homeTeamId, fixture?.homeTeamName, fixture?.homeTeamLogo);
+    addTeam(fixture?.awayTeamId, fixture?.awayTeamName, fixture?.awayTeamLogo);
+    addTeam(fixture?.teams?.home?.id, fixture?.teams?.home?.name, fixture?.teams?.home?.logo);
+    addTeam(fixture?.teams?.away?.id, fixture?.teams?.away?.name, fixture?.teams?.away?.logo);
+  }
+
+  return Array.from(teamsById.values());
+}
+
+function getGlobalPlayerPoolCoverage({ seasonPlayers = [], requiredTeams = [] } = {}) {
+  const poolTeamIds = new Set(
+    (Array.isArray(seasonPlayers) ? seasonPlayers : [])
+      .map((player) => player?.teamId ?? player?.apiTeamId ?? player?.team?.id ?? null)
+      .filter((id) => id != null && id !== "")
+      .map(String)
+  );
+
+  const missingTeams = (Array.isArray(requiredTeams) ? requiredTeams : []).filter((team) => {
+    const id = String(team?.id || "").trim();
+    return id && !poolTeamIds.has(id);
+  });
+
+  return {
+    ok: missingTeams.length === 0,
+    missingTeams,
+    missingTeamIds: missingTeams.map((team) => String(team.id)),
+    missingTeamNames: missingTeams.map((team) => team.name || String(team.id)),
+  };
+}
+
+async function fetchWorldCupQualifiedTeamsFromApi({
+  apiKey,
+  competition,
+  roundLabel,
+  timezone,
+}) {
+  const league = Number(competition?.league);
+  const season = Number(competition?.season);
+  const tz = String(timezone || competition?.timezone || "America/Los_Angeles");
+  let knockoutFixtures = [];
+  let source = "upcoming-knockout-fixtures";
+
+  if (roundLabel) {
+    const roundRes = await apiFootballGet(
+      "fixtures",
+      { league, season, round: roundLabel, timezone: tz },
+      apiKey
+    );
+    knockoutFixtures = (Array.isArray(roundRes?.response) ? roundRes.response : []).filter(
+      (fixture) =>
+        buildWorldCupRoomMode({
+          roundLabel: fixture?.league?.round || roundLabel,
+          season,
+        }).worldCupPhase === WORLD_CUP_KNOCKOUT_PHASE
+    );
+    if (knockoutFixtures.length) source = "current-knockout-round";
+  }
+
+  if (!knockoutFixtures.length) {
+    const from = isoDateInTZ(tz);
+    const to = addDaysISO(from, 120);
+    const fixturesRes = await apiFootballGet(
+      "fixtures",
+      { league, season, from, to, timezone: tz },
+      apiKey
+    );
+    knockoutFixtures = (Array.isArray(fixturesRes?.response) ? fixturesRes.response : []).filter(
+      (fixture) =>
+        buildWorldCupRoomMode({
+          roundLabel: fixture?.league?.round || "",
+          season,
+        }).worldCupPhase === WORLD_CUP_KNOCKOUT_PHASE
+    );
+  }
+
+  const teams = collectFixtureTeams(knockoutFixtures);
+
+  return {
+    teamIds: teams.map((team) => String(team.id)).filter(Boolean),
+    teams,
+    fixtureCount: knockoutFixtures.length,
+    source,
+  };
+}
+
+async function ensureWorldCupQualifiedTeams({
+  db,
+  seasonKey,
+  competition,
+  apiKey,
+  roundLabel,
+  timezone,
+  nowMs,
+}) {
+  const docPath = getWorldCupQualifiedTeamsDocPath(seasonKey);
+  const ref = db.doc(docPath);
+  const snap = await ref.get();
+  const existing = snap.exists ? (snap.data() || {}) : {};
+  const existingTeamIds = Array.isArray(existing.teamIds)
+    ? existing.teamIds.map(String).filter(Boolean)
+    : [];
+
+  if (existing.status === "ready" && existingTeamIds.length > 0) {
+    return {
+      docPath,
+      status: "ready",
+      reused: true,
+      teamIds: existingTeamIds,
+      teams: Array.isArray(existing.teams) ? existing.teams : [],
+      source: existing.source || "global-qualified-teams",
+    };
+  }
+
+  const buildingAtMs = Number(existing.buildingAtMs || 0);
+  const lockFresh = existing.status === "building" && nowMs - buildingAtMs < 5 * 60 * 1000;
+  if (lockFresh) {
+    throw new HttpsError(
+      "aborted",
+      "World Cup qualified teams are currently being built. Try again shortly."
+    );
+  }
+
+  await ref.set(
+    {
+      status: "building",
+      buildingAtMs: nowMs,
+      updatedAtMs: nowMs,
+      updatedAt: FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+
+  try {
+    const built = await fetchWorldCupQualifiedTeamsFromApi({
+      apiKey,
+      competition,
+      roundLabel,
+      timezone,
+    });
+
+    if (!built.teamIds.length) {
+      throw new HttpsError(
+        "failed-precondition",
+        "Could not determine World Cup knockout qualified teams from upcoming fixtures."
+      );
+    }
+
+    await ref.set(
+      {
+        status: "ready",
+        teamIds: built.teamIds,
+        teams: built.teams,
+        fixtureCount: built.fixtureCount,
+        source: built.source,
+        builtAtMs: nowMs,
+        updatedAtMs: nowMs,
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    return {
+      docPath,
+      status: "ready",
+      reused: false,
+      ...built,
+    };
+  } catch (e) {
+    await ref.set(
+      {
+        status: "error",
+        error: String(e?.message || e),
+        updatedAtMs: nowMs,
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+    throw e;
+  }
+}
+
 exports.seedPlayersFromCompetition = onCall(
   { region: "us-west2", secrets: [APIFOOTBALL_KEY], timeoutSeconds: 540, memory: "1GiB" },
   async (request) => {
@@ -593,6 +843,9 @@ exports.seedPlayersFromCompetition = onCall(
     let hitCap = false;
     let globalBootstrapWritten = 0;
     let globalBootstrapError = null;
+    let globalPlayerPoolCoverageOk = true;
+    let missingGlobalPoolTeamIds = [];
+    let missingGlobalPoolTeamNames = [];
     const fetchedPlayerDocs = [];
 
     function filterPlayersForFixtureDate(players = []) {
@@ -607,10 +860,77 @@ exports.seedPlayersFromCompetition = onCall(
     const globalPlayerPoolEnabled = isGlobalPlayerPoolEnabled(room);
 
     if (globalPlayerPoolEnabled && seasonKey) {
-      const seasonPlayers = await loadSeasonPlayerPool({ db, seasonKey });
-      const roomSourcePlayers = filterPlayersForFixtureDate(seasonPlayers);
+      let seasonPlayers = await loadSeasonPlayerPool({ db, seasonKey });
+      const requiredTeams = collectWeekWindowTeams({ window, teamMeta });
+      let coverage = getGlobalPlayerPoolCoverage({ seasonPlayers, requiredTeams });
+      globalPlayerPoolCoverageOk = coverage.ok;
+      missingGlobalPoolTeamIds = coverage.missingTeamIds;
+      missingGlobalPoolTeamNames = coverage.missingTeamNames;
 
-      if (seasonPlayers.length > 0 && (!fixtureDate || roomSourcePlayers.length > 0)) {
+      if (seasonPlayers.length > 0 && !coverage.ok && coverage.missingTeamIds.length > 0) {
+        try {
+          console.warn("[seedPlayersFromCompetition] Global player pool missing current-window teams; repairing", {
+            roomId,
+            seasonKey,
+            missingGlobalPoolTeamIds,
+            missingGlobalPoolTeamNames,
+          });
+
+          const missingTeamMeta = new Map(
+            coverage.missingTeams.map((team) => [
+              String(team.id),
+              { id: String(team.id), name: team.name || "", logo: team.logo || "" },
+            ])
+          );
+          const repairFetch = await fetchCompetitionPlayerPoolFromApi({
+            apiKey,
+            league,
+            season,
+            maxPlayers,
+            maxPages,
+            maxPagesPerTeam,
+            teamIds: coverage.missingTeamIds,
+            teamMeta: missingTeamMeta,
+          });
+
+          pagesFetched += repairFetch.pagesFetched;
+          hitCap = hitCap || repairFetch.hitCap;
+
+          if (repairFetch.players.length > 0) {
+            globalBootstrapWritten += await bootstrapSeasonPlayerPool({
+              db,
+              seasonKey,
+              players: repairFetch.players,
+            });
+
+            const byId = new Map();
+            for (const player of [...seasonPlayers, ...repairFetch.players]) {
+              const id = String(player?.id ?? player?.playerId ?? "").trim();
+              if (id) byId.set(id, player);
+            }
+            seasonPlayers = Array.from(byId.values());
+          }
+
+          coverage = getGlobalPlayerPoolCoverage({ seasonPlayers, requiredTeams });
+          globalPlayerPoolCoverageOk = coverage.ok;
+          missingGlobalPoolTeamIds = coverage.missingTeamIds;
+          missingGlobalPoolTeamNames = coverage.missingTeamNames;
+        } catch (e) {
+          globalBootstrapError = String(e?.message || e);
+          globalPlayerPoolCoverageOk = false;
+          console.warn("[seedPlayersFromCompetition] Global player pool repair failed; falling back to API seed", {
+            roomId,
+            seasonKey,
+            error: globalBootstrapError,
+          });
+        }
+      }
+
+      const roomSourcePlayers = globalPlayerPoolCoverageOk
+        ? filterPlayersForFixtureDate(seasonPlayers)
+        : [];
+
+      if (globalPlayerPoolCoverageOk && seasonPlayers.length > 0 && (!fixtureDate || roomSourcePlayers.length > 0)) {
         written = await replacePlayersInRoom({
           db,
           roomId,
@@ -671,6 +991,9 @@ exports.seedPlayersFromCompetition = onCall(
       await ensureRoomTotalRounds({ roomId, room, competition, apiKey });
     }
 
+    const playersFrom = usedGlobalSeasonPlayers ? "global-season-player-pool" : "api-football";
+    const seededAtMs = Date.now();
+
     await roomRef.set(
       {
         competition,
@@ -680,6 +1003,19 @@ exports.seedPlayersFromCompetition = onCall(
         competitionLocked: true,
         status: "ready_to_draft",
         playerCount: written,
+        playersFrom,
+        playersFromLabel: usedGlobalSeasonPlayers ? "Global Season Player Pool" : "API-Football",
+        usedGlobalSeasonPlayers,
+        globalPlayerPoolEnabledAtSeed: globalPlayerPoolEnabled,
+        seedSeasonKey: seasonKey || "",
+        seededAtMs,
+        seededAt: admin.firestore.FieldValue.serverTimestamp(),
+        seedPagesFetched: pagesFetched,
+        seedGlobalBootstrapWritten: globalBootstrapWritten,
+        seedGlobalBootstrapError: globalBootstrapError || null,
+        globalPlayerPoolCoverageOk,
+        missingGlobalPoolTeamIds,
+        missingGlobalPoolTeamNames,
       },
       { merge: true }
     );
@@ -711,13 +1047,552 @@ exports.seedPlayersFromCompetition = onCall(
       teamCount: fixtureDate ? teamMeta.size : null,
       globalPlayerPoolEnabled,
       usedGlobalSeasonPlayers,
-      source: usedGlobalSeasonPlayers ? "global-season-player-pool" : "api-football",
+      source: playersFrom,
+      playersFrom,
       globalBootstrapWritten,
       globalBootstrapError,
+      globalPlayerPoolCoverageOk,
+      missingGlobalPoolTeamIds,
+      missingGlobalPoolTeamNames,
 
       // helpful for debugging in the client
       phaseLabel,
       roundLabel,
+    };
+  }
+);
+
+exports.seedWorldCupRoom = onCall(
+  { region: "us-west2", secrets: [APIFOOTBALL_KEY], timeoutSeconds: 540, memory: "1GiB" },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) throw new HttpsError("unauthenticated", "Sign in required.");
+
+    const roomId = String(request.data?.roomId || "").trim();
+    const league = Number(request.data?.league);
+    const season = Number(request.data?.season);
+    const timezone = String(request.data?.timezone ?? "America/Los_Angeles");
+    const competitionName = String(request.data?.competitionName || "World Cup");
+    const worldCupMaxPlayers = Math.max(
+      WORLD_CUP_GLOBAL_PLAYER_POOL_MIN,
+      Math.min(
+        8000,
+        Number(request.data?.worldCupMaxPlayers ?? 5000)
+      )
+    );
+    const maxPages = Math.max(1, Math.min(250, Number(request.data?.maxPages ?? 200)));
+    const maxPagesPerTeam = Math.max(1, Math.min(20, Number(request.data?.maxPagesPerTeam ?? 10)));
+
+    if (!roomId) throw new HttpsError("invalid-argument", "roomId is required.");
+    if (!Number.isFinite(league) || !Number.isFinite(season)) {
+      throw new HttpsError("invalid-argument", "league and season are required.");
+    }
+    if (!isWorldCupCompetition({ competitionName, competitionKey: request.data?.competitionKey })) {
+      throw new HttpsError("failed-precondition", "Selected competition is not World Cup.");
+    }
+
+    const roomRef = db.doc(`rooms/${roomId}`);
+    const roomSnap = await roomRef.get();
+    if (!roomSnap.exists) throw new HttpsError("not-found", "Room not found.");
+
+    const room = roomSnap.data() || {};
+    if (!isHost(room, uid)) throw new HttpsError("permission-denied", "Host only.");
+
+    const apiKey = APIFOOTBALL_KEY.value();
+    const competition = {
+      provider: "api-football",
+      league,
+      season,
+      timezone,
+    };
+    const nowMs = Date.now();
+    const window = await fetchNextRoundWindow(competition);
+    if (!window || !Array.isArray(window.fixtures) || !window.fixtures.length) {
+      throw new HttpsError(
+        "failed-precondition",
+        "No real upcoming World Cup fixtures found for this competition."
+      );
+    }
+
+    const roundLabel = window?.roundLabel || null;
+    if (!roundLabel) {
+      throw new HttpsError(
+        "failed-precondition",
+        "Upcoming World Cup fixture is missing a round label, so the room phase cannot be detected."
+      );
+    }
+
+    const mode = buildWorldCupRoomMode({ roundLabel, season });
+    if (!mode.seasonKey) {
+      throw new HttpsError("failed-precondition", "Could not build World Cup season key.");
+    }
+
+    let qualifiedTeams = null;
+    let qualifiedTeamsError = null;
+    if (mode.worldCupPhase === WORLD_CUP_KNOCKOUT_PHASE) {
+      try {
+        qualifiedTeams = await ensureWorldCupQualifiedTeams({
+          db,
+          seasonKey: mode.seasonKey,
+          competition,
+          apiKey,
+          roundLabel,
+          timezone,
+          nowMs,
+        });
+      } catch (e) {
+        qualifiedTeamsError = String(e?.message || e);
+        console.warn("[seedWorldCupRoom] qualified teams unavailable; using player-pool fallback", {
+          roomId,
+          seasonKey: mode.seasonKey,
+          error: qualifiedTeamsError,
+        });
+      }
+    }
+
+    const dailyWindows =
+      mode.worldCupPhase === WORLD_CUP_GROUP_PHASE
+        ? await loadWorldCupGroupDailyWindows({
+            apiFootballGet,
+            apiKey,
+            league,
+            season,
+            timezone,
+          })
+        : [];
+
+    if (mode.worldCupPhase === WORLD_CUP_GROUP_PHASE && !dailyWindows.length) {
+      throw new HttpsError(
+        "failed-precondition",
+        "No World Cup group-stage daily windows could be created."
+      );
+    }
+
+    let fetchResult = {
+      players: [],
+      pagesFetched: 0,
+      hitCap: false,
+      teamFetchSummary: [],
+      teamIds: [],
+      teamCount: 0,
+      processedTeamCount: 0,
+      expectedTeamCount: 0,
+      allTeamsProcessed: true,
+      missingFetchTeamIds: [],
+      missingFetchTeamNames: [],
+      skippedTeamIdsDueToGlobalCap: [],
+      usedSquadFallbackTeamIds: [],
+      emptyTeamIds: [],
+      maxPlayers: worldCupMaxPlayers,
+    };
+    let roomPlayers = [];
+    let usedGlobalSeasonPlayers = false;
+    let globalBootstrapWritten = 0;
+    let globalBootstrapError = null;
+    let worldCupPlayerPoolIncomplete = false;
+    let worldCupPlayerPoolWarning = "";
+    let worldCupTeamIds = [];
+    let worldCupTeams = [];
+    let worldCupTeamFetchSummary = [];
+    let ignoredIncompleteGlobalWorldCupPoolCount = null;
+    let playersFrom = "api-football-world-cup-team-fallback";
+    let playersFromLabel = "API-Football World Cup Team Fallback";
+
+    const existingGlobalPool = await loadSeasonPlayerPool({
+      db,
+      seasonKey: mode.seasonKey,
+    }).catch((e) => {
+      console.warn("[seedWorldCupRoom] failed to load global World Cup player pool", {
+        roomId,
+        seasonKey: mode.seasonKey,
+        error: String(e?.message || e),
+      });
+      return [];
+    });
+
+    if (existingGlobalPool.length >= WORLD_CUP_GLOBAL_PLAYER_POOL_MIN) {
+      roomPlayers = existingGlobalPool;
+      usedGlobalSeasonPlayers = true;
+      playersFrom = "global-season-player-pool";
+      playersFromLabel = "Global Season Player Pool";
+    } else if (existingGlobalPool.length > 0) {
+      ignoredIncompleteGlobalWorldCupPoolCount = existingGlobalPool.length;
+    }
+
+    if (!usedGlobalSeasonPlayers) {
+      let collected = null;
+
+      if (mode.worldCupPhase === WORLD_CUP_GROUP_PHASE) {
+        collected = collectWorldCupTeamsFromDailyWindows(dailyWindows);
+      } else if (Array.isArray(qualifiedTeams?.teamIds) && qualifiedTeams.teamIds.length) {
+        const teamMeta = new Map();
+        for (const team of Array.isArray(qualifiedTeams?.teams) ? qualifiedTeams.teams : []) {
+          const id = String(team?.id || "").trim();
+          if (!id) continue;
+          teamMeta.set(id, {
+            id,
+            name: team.name || "",
+            logo: team.logo || "",
+          });
+        }
+        const teams = Array.from(teamMeta.values());
+        collected = {
+          teamIds: qualifiedTeams.teamIds.map(String).filter(Boolean),
+          teams,
+          teamMeta,
+        };
+      }
+
+      worldCupTeamIds = Array.isArray(collected?.teamIds) ? collected.teamIds : [];
+      worldCupTeams = Array.isArray(collected?.teams) ? collected.teams : [];
+
+      if (worldCupTeamIds.length) {
+        fetchResult = await fetchWorldCupTeamPlayerPool({
+          apiFootballGet,
+          apiKey,
+          season,
+          teamIds: worldCupTeamIds,
+          teamMeta: collected.teamMeta,
+          maxPlayers: worldCupMaxPlayers,
+          maxPagesPerTeam,
+        });
+        roomPlayers = fetchResult.players;
+        worldCupTeamFetchSummary = fetchResult.teamFetchSummary || [];
+        playersFrom = "world-cup-team-player-pool";
+        playersFromLabel = "API-Football World Cup Team Player Pool";
+      } else {
+        fetchResult = await fetchCompetitionPlayerPoolFromApi({
+          apiKey,
+          league,
+          season,
+          maxPlayers: worldCupMaxPlayers,
+          maxPages,
+          maxPagesPerTeam,
+          teamIds: null,
+        });
+        fetchResult = {
+          ...fetchResult,
+          processedTeamCount: 0,
+          expectedTeamCount: worldCupTeamIds.length,
+          allTeamsProcessed: false,
+          missingFetchTeamIds: worldCupTeamIds,
+          missingFetchTeamNames: worldCupTeams.map((team) => team?.name || String(team?.id || "")),
+          skippedTeamIdsDueToGlobalCap: [],
+          maxPlayers: worldCupMaxPlayers,
+        };
+        roomPlayers = fetchResult.players;
+        playersFrom = "api-football-world-cup-safe-fallback";
+        playersFromLabel = "API-Football World Cup Safe Fallback";
+      }
+
+      const skippedTeamIdsDueToGlobalCap = Array.isArray(fetchResult.skippedTeamIdsDueToGlobalCap)
+        ? fetchResult.skippedTeamIdsDueToGlobalCap
+        : [];
+      const canBootstrapWorldCupPlayerPool =
+        roomPlayers.length >= WORLD_CUP_GLOBAL_PLAYER_POOL_MIN &&
+        fetchResult.allTeamsProcessed !== false &&
+        fetchResult.hitCap !== true &&
+        skippedTeamIdsDueToGlobalCap.length === 0;
+
+      if (canBootstrapWorldCupPlayerPool) {
+        try {
+          globalBootstrapWritten = await bootstrapSeasonPlayerPool({
+            db,
+            seasonKey: mode.seasonKey,
+            players: roomPlayers,
+          });
+        } catch (e) {
+          globalBootstrapError = String(e?.message || e);
+        }
+      } else {
+        worldCupPlayerPoolIncomplete = true;
+        worldCupPlayerPoolWarning =
+          fetchResult.allTeamsProcessed === false ||
+          fetchResult.hitCap === true ||
+          skippedTeamIdsDueToGlobalCap.length > 0
+            ? "World Cup player pool did not process every team; not written to globalData"
+            : "World Cup player pool below global bootstrap threshold; not written to globalData";
+        playersFrom = "api-football-world-cup-team-fallback";
+        playersFromLabel = "API-Football World Cup Team Fallback";
+        globalBootstrapWritten = 0;
+      }
+    }
+
+    if (!roomPlayers.length) {
+      throw new HttpsError(
+        "failed-precondition",
+        "Could not load World Cup player pool from team fixtures."
+      );
+    }
+
+    const written = await replacePlayersInRoom({
+      db,
+      roomId,
+      players: roomPlayers,
+    });
+
+    const worldCupProcessedTeamCount = Number(fetchResult.processedTeamCount || 0);
+    const worldCupExpectedTeamCount = Number(fetchResult.expectedTeamCount || 0);
+    const worldCupMissingFetchTeamIds = Array.isArray(fetchResult.missingFetchTeamIds)
+      ? fetchResult.missingFetchTeamIds
+      : [];
+    const worldCupMissingFetchTeamNames = Array.isArray(fetchResult.missingFetchTeamNames)
+      ? fetchResult.missingFetchTeamNames
+      : [];
+    const worldCupAllTeamsProcessed = usedGlobalSeasonPlayers
+      ? true
+      : fetchResult.allTeamsProcessed === true;
+    const worldCupHitGlobalCap = Boolean(fetchResult.hitCap);
+    const worldCupSkippedTeamIdsDueToGlobalCap = Array.isArray(fetchResult.skippedTeamIdsDueToGlobalCap)
+      ? fetchResult.skippedTeamIdsDueToGlobalCap
+      : [];
+
+    const groupPollInfo =
+      mode.worldCupPhase === WORLD_CUP_GROUP_PHASE
+        ? getNextPollAtMsFromFixtures(dailyWindows[0]?.fixtures || [], nowMs)
+        : null;
+
+    const competitionStatePatch =
+      mode.worldCupPhase === WORLD_CUP_KNOCKOUT_PHASE
+        ? {
+            phaseLabel: "Cup",
+            currentLabel: roundLabel,
+            isDone: false,
+            weekStatus: "scheduled",
+          }
+        : {
+            phaseLabel: "WorldCupGroup",
+            currentLabel: dailyWindows[0]?.label || roundLabel,
+            isDone: false,
+            weekStatus: "scheduled",
+            nextPollAtMs: groupPollInfo?.nextPollAtMs || nowMs + 60 * 60 * 1000,
+            nextKickoffMs: groupPollInfo?.nextKickoffMs || null,
+          };
+
+    const worldCupGlobalPipeline = buildDefaultGlobalPipeline("global");
+    const seededAtMs = Date.now();
+
+    await roomRef.set(
+      {
+        competition,
+        competitionMeta: {
+          ...(room?.competitionMeta || {}),
+          name: competitionName,
+          country: request.data?.competitionCountry || room?.competitionMeta?.country || "",
+          type: "World Cup",
+          logo: request.data?.competitionLogo || room?.competitionMeta?.logo || "",
+        },
+        seedFilter: admin.firestore.FieldValue.delete(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+
+        seasonKey: mode.seasonKey,
+        competitionKey: mode.competitionKey,
+        competitionType: mode.competitionType,
+        worldCupPhase: mode.worldCupPhase,
+        engineType: mode.engineType,
+        globalPipeline: worldCupGlobalPipeline,
+        worldCup: {
+          phase: mode.worldCupPhase,
+          engineType: mode.engineType,
+          seasonKey: mode.seasonKey,
+          nextRoundLabel: roundLabel,
+          dayCount: dailyWindows.length || 0,
+          currentDayIndex: dailyWindows[0]?.dayIndex || null,
+          currentDayLabel: dailyWindows[0]?.label || null,
+          currentDayStartAtMs: dailyWindows[0]?.startAtMs || null,
+          currentDayEndAtMs: dailyWindows[0]?.endAtMs || null,
+          firstKickoffMs: dailyWindows[0]?.firstKickoffMs || null,
+          lastKickoffMs: dailyWindows[dailyWindows.length - 1]?.lastKickoffMs || null,
+          firstWindowStartAtMs: dailyWindows[0]?.startAtMs || null,
+          lastWindowEndAtMs: dailyWindows[dailyWindows.length - 1]?.endAtMs || null,
+          nextFixtureIds: (window.fixtures || []).map((fixture) => String(fixture.id)).filter(Boolean),
+          qualifiedTeamsDocPath:
+            mode.worldCupPhase === WORLD_CUP_KNOCKOUT_PHASE
+              ? getWorldCupQualifiedTeamsDocPath(mode.seasonKey)
+              : null,
+        },
+
+        competitionLocked: true,
+        status: "ready_to_draft",
+        playerCount: written,
+        playersFrom,
+        playersFromLabel,
+        usedGlobalSeasonPlayers,
+        globalPlayerPoolEnabledAtSeed: true,
+        seedSeasonKey: mode.seasonKey || "",
+        seededAtMs,
+        seededAt: admin.firestore.FieldValue.serverTimestamp(),
+        seedPagesFetched: fetchResult.pagesFetched,
+        seedGlobalBootstrapWritten: globalBootstrapWritten,
+        seedGlobalBootstrapError: globalBootstrapError || null,
+        worldCupPlayerPoolIncomplete,
+        worldCupPlayerPoolWarning,
+        worldCupPlayerPoolCount: written,
+        worldCupPlayerPoolTeamCount: worldCupTeamIds.length,
+        worldCupPlayerPoolTeamIds: worldCupTeamIds,
+        worldCupPlayerPoolTeams: worldCupTeams,
+        worldCupTeamFetchSummary,
+        worldCupGlobalPlayerPoolMin: WORLD_CUP_GLOBAL_PLAYER_POOL_MIN,
+        worldCupMaxPlayers,
+        worldCupProcessedTeamCount,
+        worldCupExpectedTeamCount,
+        worldCupMissingFetchTeamIds,
+        worldCupMissingFetchTeamNames,
+        worldCupAllTeamsProcessed,
+        worldCupHitGlobalCap,
+        worldCupSkippedTeamIdsDueToGlobalCap,
+        ignoredIncompleteGlobalWorldCupPoolCount,
+        qualifiedTeamsError: qualifiedTeamsError || null,
+      },
+      { merge: true }
+    );
+
+    const dailyWindowWriteCount =
+      mode.worldCupPhase === WORLD_CUP_GROUP_PHASE
+        ? await writeWorldCupDailyWindowsForRoom({
+            db,
+            roomId,
+            windows: dailyWindows,
+            nowMs,
+          })
+        : 0;
+
+    await setCompetitionState(roomRef, competitionStatePatch, {
+      roomData: room,
+      nowMs,
+    });
+
+    if (mode.worldCupPhase === WORLD_CUP_GROUP_PHASE) {
+      await upsertTournamentPollTask({
+        roomId,
+        phase: "WorldCupGroup",
+        nextPollAtMs: competitionStatePatch.nextPollAtMs,
+        reason: groupPollInfo?.reason || "world-cup-group-seeded",
+        nowMs,
+      });
+    }
+
+    return {
+      ok: true,
+      league,
+      season,
+      seasonKey: mode.seasonKey,
+      competitionKey: mode.competitionKey,
+      competitionType: mode.competitionType,
+      worldCupPhase: mode.worldCupPhase,
+      engineType: mode.engineType,
+      roundLabel,
+      fixtureCount: Array.isArray(window.fixtures) ? window.fixtures.length : 0,
+      dailyWindowCount: dailyWindows.length || 0,
+      dailyWindowWriteCount,
+      nextPollAtMs: competitionStatePatch.nextPollAtMs || null,
+      nextKickoffMs: competitionStatePatch.nextKickoffMs || null,
+      qualifiedTeamsDocPath:
+        mode.worldCupPhase === WORLD_CUP_KNOCKOUT_PHASE
+          ? getWorldCupQualifiedTeamsDocPath(mode.seasonKey)
+          : null,
+      qualifiedTeamCount: qualifiedTeams?.teamIds?.length || null,
+      pagesFetched: fetchResult.pagesFetched,
+      written,
+      maxPlayers: worldCupMaxPlayers,
+      worldCupMaxPlayers,
+      hitCap: fetchResult.hitCap || written >= worldCupMaxPlayers,
+      globalPipeline: worldCupGlobalPipeline,
+      playersFrom,
+      usedGlobalSeasonPlayers,
+      source: playersFrom,
+      globalBootstrapWritten,
+      globalBootstrapError,
+      worldCupPlayerPoolIncomplete,
+      worldCupPlayerPoolWarning,
+      worldCupPlayerPoolCount: written,
+      worldCupPlayerPoolTeamCount: worldCupTeamIds.length,
+      worldCupPlayerPoolTeamIds: worldCupTeamIds,
+      worldCupPlayerPoolTeams: worldCupTeams,
+      worldCupTeamFetchSummary,
+      worldCupGlobalPlayerPoolMin: WORLD_CUP_GLOBAL_PLAYER_POOL_MIN,
+      worldCupProcessedTeamCount,
+      worldCupExpectedTeamCount,
+      worldCupMissingFetchTeamIds,
+      worldCupMissingFetchTeamNames,
+      worldCupAllTeamsProcessed,
+      worldCupHitGlobalCap,
+      worldCupSkippedTeamIdsDueToGlobalCap,
+      ignoredIncompleteGlobalWorldCupPoolCount,
+      qualifiedTeamsError: qualifiedTeamsError || null,
+    };
+  }
+);
+
+exports.debugRunWorldCupGroupEngine = onCall(
+  { region: "us-west2", secrets: [APIFOOTBALL_KEY], timeoutSeconds: 540, memory: "1GiB" },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) throw new HttpsError("unauthenticated", "Sign in required.");
+
+    const roomId = String(request.data?.roomId || "").trim();
+    if (!roomId) throw new HttpsError("invalid-argument", "roomId is required.");
+
+    const roomRef = db.doc(`rooms/${roomId}`);
+    const roomSnap = await roomRef.get();
+    if (!roomSnap.exists) throw new HttpsError("not-found", "Room not found.");
+
+    const room = roomSnap.data() || {};
+    if (!isHost(room, uid)) throw new HttpsError("permission-denied", "Host only.");
+
+    const competitionState = getCompetitionState(room);
+    const isWorldCupGroupRoom =
+      room?.engineType === "worldCupDaily" ||
+      room?.worldCup?.engineType === "worldCupDaily" ||
+      room?.competitionState?.phaseLabel === "WorldCupGroup" ||
+      competitionState?.phaseLabel === "WorldCupGroup";
+
+    if (!isWorldCupGroupRoom) {
+      throw new HttpsError("failed-precondition", "Room is not a World Cup group room.");
+    }
+
+    const requestedNowMs = Number(request.data?.nowMs || Date.now());
+    const debugNowMs = Number.isFinite(requestedNowMs) ? requestedNowMs : Date.now();
+    const engineType = room.engineType || room.worldCup?.engineType || "";
+    const worldCupPhase = room.worldCupPhase || room.worldCup?.phase || "";
+
+    console.log("[debugRunWorldCupGroupEngine] manual run", {
+      roomId,
+      uid,
+      debugNowMs,
+      engineType,
+      worldCupPhase,
+    });
+
+    const result = await runWorldCupGroupEngine({
+      db,
+      roomId,
+      room,
+      apiKey: APIFOOTBALL_KEY.value(),
+      nowMs: debugNowMs,
+      getFixtureStatusMap,
+      getFixturePlayersStatsMapCached,
+      setCompetitionState,
+      ensureDefaultLineupsForRoom,
+    });
+
+    return {
+      ok: true,
+      roomId,
+      nowMs: debugNowMs,
+      engineType,
+      worldCupPhase,
+      result,
+      currentDayIndex: result?.dayIndex ?? result?.currentDayIndex ?? null,
+      status: result?.status ?? null,
+      weekStatus: result?.weekStatus ?? null,
+      isDone: Boolean(result?.isDone),
+      nextPollAtMs: result?.nextPollAtMs ?? null,
+      nextKickoffMs: result?.nextKickoffMs ?? null,
+      fixtureCoverage: result?.fixtureCoverage || [],
+      teamScoresByUserId: result?.teamScoresByUserId || {},
+      dailyLeaderboard: result?.dailyLeaderboard || [],
+      standingsPreview: result?.standingsPreview || result?.leaderboard || [],
     };
   }
 );
@@ -971,6 +1846,94 @@ function buildLeaderboard(users, matchups, totalsByUid) {
 
   rows.sort((a, b) => (b.matchPoints - a.matchPoints) || (b.fantasyPoints - a.fantasyPoints));
   return rows;
+}
+
+async function writeInitialWeekResultsPlaceholder({
+  roomId,
+  weekIndex,
+  weekDoc,
+  memberUids,
+  nowMs = Date.now(),
+}) {
+  const users = await loadRoomUsersLineupsForGlobalAggregation({ db, roomId });
+  const usersByUid = new Map(
+    users.map((user) => [String(user.uid), user])
+  );
+  const orderedUids = (Array.isArray(memberUids) && memberUids.length
+    ? memberUids
+    : users.map((user) => String(user.uid))
+  ).map(String).filter(Boolean).sort();
+
+  const teamScoresByUserId = {};
+  const breakdownByUserId = {};
+  const startersByUserId = {};
+  const benchByUserId = {};
+  const weekLeaderboard = [];
+
+  for (const uid of orderedUids) {
+    const user = usersByUid.get(uid) || { uid, displayName: uid, starters: [], bench: [] };
+    const starters = Array.isArray(user.starters) ? user.starters : [];
+    const bench = Array.isArray(user.bench) ? user.bench : [];
+    const displayName = user.displayName || user.name || uid;
+
+    teamScoresByUserId[uid] = 0;
+    startersByUserId[uid] = starters;
+    benchByUserId[uid] = bench;
+    breakdownByUserId[uid] = {
+      total: 0,
+      benchTotal: 0,
+      perPlayer: {},
+      starters,
+      bench,
+    };
+    weekLeaderboard.push({
+      rank: weekLeaderboard.length + 1,
+      userId: uid,
+      uid,
+      name: displayName,
+      displayName,
+      teamName: user.teamName || "",
+      result: "-",
+      matchPoints: 0,
+      fantasyPoints: 0,
+      totalFantasyPoints: 0,
+      points: 0,
+    });
+  }
+
+  const matchupPairs = Array.isArray(weekDoc?.matchups) ? weekDoc.matchups : [];
+  const matchups = matchupPairs.map((pair) => ({
+    weekIndex,
+    homeUserId: pair.homeUserId,
+    awayUserId: pair.awayUserId,
+    homeTotal: 0,
+    awayTotal: 0,
+    homeResult: "D",
+    awayResult: "D",
+    winnerUserId: null,
+    status: "SCHEDULED",
+  }));
+
+  await db.doc(`rooms/${roomId}/weekResults/${String(weekIndex)}`).set(
+    {
+      roomId,
+      weekIndex,
+      startAtMs: Number(weekDoc?.startAtMs || 0) || null,
+      endAtMs: Number(weekDoc?.endAtMs || 0) || null,
+      roundLabel: weekDoc?.roundLabel || null,
+      status: "scheduled",
+      source: "week-created-placeholder",
+      teamScoresByUserId,
+      breakdownByUserId,
+      startersByUserId,
+      benchByUserId,
+      matchups,
+      weekLeaderboard,
+      updatedAtMs: nowMs,
+      computedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
 }
 
 exports.searchLeagues = onCall(
@@ -1435,6 +2398,108 @@ function buildWeekWindowFromFixtures(fixtures, gapHours = 36) {
   };
 }
 
+function normalizeApiFixtureForWeek(m) {
+  const id = String(m?.fixture?.id || "").trim();
+  const kickoffMs = m?.fixture?.timestamp
+    ? Number(m.fixture.timestamp) * 1000
+    : Date.parse(m?.fixture?.date);
+  const round = m?.league?.round || null;
+  const homeTeam = m?.teams?.home || {};
+  const awayTeam = m?.teams?.away || {};
+
+  if (!id || !Number.isFinite(kickoffMs)) return null;
+
+  return {
+    id,
+    fixtureId: id,
+    kickoffMs,
+    round,
+    roundLabel: round,
+    homeTeamId: homeTeam?.id != null ? String(homeTeam.id) : "",
+    homeTeamName: homeTeam?.name || "",
+    homeTeamLogo: homeTeam?.logo || "",
+    awayTeamId: awayTeam?.id != null ? String(awayTeam.id) : "",
+    awayTeamName: awayTeam?.name || "",
+    awayTeamLogo: awayTeam?.logo || "",
+    teams: {
+      home: {
+        id: homeTeam?.id ?? null,
+        name: homeTeam?.name || "",
+        logo: homeTeam?.logo || "",
+      },
+      away: {
+        id: awayTeam?.id ?? null,
+        name: awayTeam?.name || "",
+        logo: awayTeam?.logo || "",
+      },
+    },
+  };
+}
+
+function buildWindowFromApiFixtures(fixtures, { gapHours = 36 } = {}) {
+  const normalized = (Array.isArray(fixtures) ? fixtures : [])
+    .map(normalizeApiFixtureForWeek)
+    .filter(Boolean)
+    .sort((a, b) => a.kickoffMs - b.kickoffMs);
+
+  if (!normalized.length) return null;
+
+  const first = normalized[0];
+
+  if (first.roundLabel) {
+    const sameRound = normalized.filter((f) => f.roundLabel === first.roundLabel);
+    return {
+      roundLabel: first.roundLabel,
+      windowMode: "round",
+      startAtMs: sameRound[0].kickoffMs,
+      endAtMs: sameRound[sameRound.length - 1].kickoffMs,
+      fixtures: sameRound.map((f) => ({
+        id: f.id,
+        fixtureId: f.fixtureId,
+        kickoffMs: f.kickoffMs,
+        round: f.roundLabel || null,
+        homeTeamId: f.homeTeamId || "",
+        homeTeamName: f.homeTeamName || "",
+        homeTeamLogo: f.homeTeamLogo || "",
+        awayTeamId: f.awayTeamId || "",
+        awayTeamName: f.awayTeamName || "",
+        awayTeamLogo: f.awayTeamLogo || "",
+        teams: f.teams || null,
+      })),
+    };
+  }
+
+  const gapMs = gapHours * 60 * 60 * 1000;
+  const cluster = [first];
+
+  for (let i = 1; i < normalized.length; i++) {
+    const prev = normalized[i - 1];
+    const cur = normalized[i];
+    if (cur.kickoffMs - prev.kickoffMs > gapMs) break;
+    cluster.push(cur);
+  }
+
+  return {
+    roundLabel: null,
+    windowMode: "fixture-cluster",
+    startAtMs: cluster[0].kickoffMs,
+    endAtMs: cluster[cluster.length - 1].kickoffMs,
+    fixtures: cluster.map((f) => ({
+      id: f.id,
+      fixtureId: f.fixtureId,
+      kickoffMs: f.kickoffMs,
+      round: null,
+      homeTeamId: f.homeTeamId || "",
+      homeTeamName: f.homeTeamName || "",
+      homeTeamLogo: f.homeTeamLogo || "",
+      awayTeamId: f.awayTeamId || "",
+      awayTeamName: f.awayTeamName || "",
+      awayTeamLogo: f.awayTeamLogo || "",
+      teams: f.teams || null,
+    })),
+  };
+}
+
 // round-robin pairing (circle method)
 // weekIndex starts at 1
 function roundRobinPairings(teamIds, weekIndex) {
@@ -1533,19 +2598,29 @@ async function fetchNextRoundWindow({ league, season, timezone }, opts={}) {
   }
 
 
+  function mergeFixtureLists(...lists) {
+    const byId = new Map();
+    for (const item of lists.flat()) {
+      const id = String(item?.fixture?.id || "").trim();
+      if (!id || byId.has(id)) continue;
+      byId.set(id, item);
+    }
+    return Array.from(byId.values());
+  }
+
   // 1) Try normal upcoming fixtures
   let fx = await apiFootballGet("fixtures", { league, season, next: 100, timezone }, apiKey);
   let list = Array.isArray(fx?.response) ? fx.response : [];
-  list = applyMinKickoff(list);
 
   // ✅ If we’re advancing after a finished week, ignore fixtures at/before that week’s end
   if (Number.isFinite(minKickoffMs)) {
-    list = list.filter((m) => {
-      const ko = m?.fixture?.timestamp
-        ? Number(m.fixture.timestamp) * 1000
-        : Date.parse(m?.fixture?.date);
-      return Number.isFinite(ko) && ko > minKickoffMs;
-    });
+    const from = isoDateInTZ(timezone, new Date(minKickoffMs));
+    const to = addDaysISO(from, 90);
+    const windowFx = await apiFootballGet("fixtures", { league, season, from, to, timezone }, apiKey);
+    const windowList = Array.isArray(windowFx?.response) ? windowFx.response : [];
+    list = applyMinKickoff(mergeFixtureLists(list, windowList));
+  } else {
+    list = applyMinKickoff(list);
   }
 
 
@@ -1567,8 +2642,27 @@ async function fetchNextRoundWindow({ league, season, timezone }, opts={}) {
 
   if (!list.length) return null;
 
-  const roundLabel = list[0]?.league?.round || null;
-      if (roundLabel) {
+  const firstWindow = buildWindowFromApiFixtures(list, { gapHours: 36 });
+  const firstRoundLabel = firstWindow?.roundLabel || null;
+
+  if (firstRoundLabel) {
+    const fxAll = await apiFootballGet("fixtures", {
+      league,
+      season,
+      round: firstRoundLabel,
+      timezone,
+    }, apiKey);
+    const allList = applyMinKickoff(Array.isArray(fxAll?.response) ? fxAll.response : []);
+    return buildWindowFromApiFixtures(allList.length ? allList : list, { gapHours: 36 });
+  }
+
+  console.log("[fetchNextRoundWindow] no round label; using fixture-cluster window", {
+    league,
+    season,
+    fixtureCount: Array.isArray(list) ? list.length : 0,
+  });
+  return firstWindow;
+/*
         const fxAll = await apiFootballGet("fixtures", { league, season, round: roundLabel, timezone }, apiKey);
         let allList = Array.isArray(fxAll?.response) ? fxAll.response : [];
         allList = applyMinKickoff(allList);
@@ -1605,6 +2699,7 @@ async function fetchNextRoundWindow({ league, season, timezone }, opts={}) {
     endAtMs: fixtures[fixtures.length - 1].kickoffMs,
     fixtures,
   };
+*/
 }
 
 async function ensureDefaultLineupsForRoom(roomId, memberUids) {
@@ -1916,6 +3011,7 @@ exports.createNextWeek = onCall(
       startAtMs: window.startAtMs,
       endAtMs: window.endAtMs,
       roundLabel: window.roundLabel || null,
+      windowMode: window.windowMode || (window.roundLabel ? "round" : "fixture-cluster"),
 
       // store fixtures so compute can seed stats per fixture
       fixtures: window.fixtures,
@@ -1930,6 +3026,14 @@ exports.createNextWeek = onCall(
     const nowMs = Date.now();
 
     await db.doc(`rooms/${roomId}/weeks/${String(weekIndex)}`).set(weekDoc, { merge: true });
+    await writeInitialWeekResultsPlaceholder({
+      roomId,
+      weekIndex,
+      weekDoc,
+      memberUids,
+      nowMs,
+    });
+
     const pollInfo = getNextPollAtMsFromFixtures(window.fixtures, nowMs);
 
     await roomRef.set(
@@ -2176,6 +3280,14 @@ function toNum(v) {
 function buildPlayerStatsMapFromFixturePlayersResponse(responseArr, fixtureMeta) {
   const out = {};
   const teams = Array.isArray(responseArr) ? responseArr : [];
+  const statusShort = String(fixtureMeta?.statusShort || fixtureMeta?.fixtureStatus || "").trim().toUpperCase() || null;
+  const homeTeamId = fixtureMeta?.homeTeamId ?? null;
+  const awayTeamId = fixtureMeta?.awayTeamId ?? null;
+  const homeTeamName = fixtureMeta?.homeTeamName || "";
+  const awayTeamName = fixtureMeta?.awayTeamName || "";
+  const homeTeamLogo = fixtureMeta?.homeTeamLogo || "";
+  const awayTeamLogo = fixtureMeta?.awayTeamLogo || "";
+  const isLive = statusShort ? isInPlay(statusShort) && !isFinalStatusCode(statusShort) : false;
 
   for (const t of teams) {
     const teamId = t.team?.id;
@@ -2183,7 +3295,7 @@ function buildPlayerStatsMapFromFixturePlayersResponse(responseArr, fixtureMeta)
     
     // Find Opponent
     const opponent = teams.find(x => x.team?.id !== teamId);
-    const opponentName = opponent?.team?.name || "";
+    let opponentName = opponent?.team?.name || "";
     
     const players = Array.isArray(t?.players) ? t.players : [];
     
@@ -2225,8 +3337,6 @@ function buildPlayerStatsMapFromFixturePlayersResponse(responseArr, fixtureMeta)
       let teamScore = null;
       let opponentScore = null;
 
-      const homeTeamId = fixtureMeta?.homeTeamId ?? null;
-      const awayTeamId = fixtureMeta?.awayTeamId ?? null;
       const goalsHome = toNum(fixtureMeta?.goalsHome);
       const goalsAway = toNum(fixtureMeta?.goalsAway);
 
@@ -2239,10 +3349,12 @@ function buildPlayerStatsMapFromFixturePlayersResponse(responseArr, fixtureMeta)
           teamConceded = goalsAway;
           teamScore = goalsHome;
           opponentScore = goalsAway;
+          if (!opponentName && awayTeamName) opponentName = awayTeamName;
         } else if (teamIdStr === awayTeamIdStr) {
           teamConceded = goalsHome;
           teamScore = goalsAway;
           opponentScore = goalsHome;
+          if (!opponentName && homeTeamName) opponentName = homeTeamName;
         }
       }
 
@@ -2253,22 +3365,32 @@ function buildPlayerStatsMapFromFixturePlayersResponse(responseArr, fixtureMeta)
       const ownGoals = 0; 
 
       out[String(pid)] = { 
+        fixtureId: fixtureMeta?.fixtureId ? String(fixtureMeta.fixtureId) : "",
         teamId: teamId ? String(teamId) : "",
         teamName,
         opponentName,
+        homeTeamId: homeTeamId != null ? String(homeTeamId) : "",
+        awayTeamId: awayTeamId != null ? String(awayTeamId) : "",
+        homeTeamName,
+        awayTeamName,
+        homeTeamLogo,
+        awayTeamLogo,
 
         teamScore,
         opponentScore,
         teamGoals: teamScore,
         opponentGoals: opponentScore,
-        fixtureStatus: fixtureMeta?.fixtureStatus || fixtureMeta?.statusShort || null,
-        matchStatus: fixtureMeta?.statusShort || fixtureMeta?.fixtureStatus || null,
-        statusShort: fixtureMeta?.statusShort || fixtureMeta?.fixtureStatus || null,
+        goalsHome,
+        goalsAway,
+        fixtureStatus: fixtureMeta?.fixtureStatus || statusShort,
+        matchStatus: statusShort || fixtureMeta?.fixtureStatus || null,
+        statusShort,
         statusLong: fixtureMeta?.statusLong || null,
         elapsed: fixtureMeta?.elapsed ?? null,
         extra: fixtureMeta?.extra ?? null,
         statusUpdatedAtMs: fixtureMeta?.statusUpdatedAtMs ?? null,
         kickoffMs: fixtureMeta?.kickoffMs ?? null,
+        isLive,
         minutes, 
         goals, 
         assists, 
@@ -2297,6 +3419,44 @@ function buildPlayerStatsMapFromFixturePlayersResponse(responseArr, fixtureMeta)
   return out;
 }
 
+function patchPlayerStatsWithFixtureMeta(playerStats = {}, fixtureMeta = {}) {
+  const statusShort = String(
+    fixtureMeta?.statusShort ||
+    fixtureMeta?.fixtureStatus ||
+    fixtureMeta?.matchStatus ||
+    ""
+  ).trim().toUpperCase();
+  const hasCurrentStatus = Boolean(statusShort);
+  const isLiveNow = hasCurrentStatus ? isInPlay(statusShort) && !isFinalStatusCode(statusShort) : null;
+  const patched = {};
+
+  for (const [pid, stats] of Object.entries(playerStats || {})) {
+    patched[pid] = {
+      ...(stats || {}),
+      fixtureId: fixtureMeta?.fixtureId ? String(fixtureMeta.fixtureId) : stats?.fixtureId || "",
+      statusShort: statusShort || stats?.statusShort || null,
+      fixtureStatus: statusShort || stats?.fixtureStatus || null,
+      matchStatus: statusShort || stats?.matchStatus || null,
+      statusLong: fixtureMeta?.statusLong || stats?.statusLong || null,
+      elapsed: fixtureMeta?.elapsed ?? stats?.elapsed ?? null,
+      extra: fixtureMeta?.extra ?? stats?.extra ?? null,
+      statusUpdatedAtMs: fixtureMeta?.statusUpdatedAtMs ?? stats?.statusUpdatedAtMs ?? null,
+      kickoffMs: fixtureMeta?.kickoffMs ?? stats?.kickoffMs ?? null,
+      isLive: isLiveNow == null ? Boolean(stats?.isLive) : isLiveNow,
+      homeTeamId: fixtureMeta?.homeTeamId != null ? String(fixtureMeta.homeTeamId) : stats?.homeTeamId || "",
+      awayTeamId: fixtureMeta?.awayTeamId != null ? String(fixtureMeta.awayTeamId) : stats?.awayTeamId || "",
+      homeTeamName: fixtureMeta?.homeTeamName || stats?.homeTeamName || "",
+      awayTeamName: fixtureMeta?.awayTeamName || stats?.awayTeamName || "",
+      homeTeamLogo: fixtureMeta?.homeTeamLogo || stats?.homeTeamLogo || "",
+      awayTeamLogo: fixtureMeta?.awayTeamLogo || stats?.awayTeamLogo || "",
+      goalsHome: fixtureMeta?.goalsHome ?? stats?.goalsHome ?? null,
+      goalsAway: fixtureMeta?.goalsAway ?? stats?.goalsAway ?? null,
+    };
+  }
+
+  return patched;
+}
+
 async function getFixturePlayersStatsMapCached({ fixtureId, apiKey, ttlMs, timeZone }) {
   //const ref = db.collection("apiCache").doc(`fixturePlayers_${String(fixtureId)}`);
   const ref = db.doc(`apiCache/fixturePlayers_${String(fixtureId)}`);
@@ -2305,27 +3465,50 @@ async function getFixturePlayersStatsMapCached({ fixtureId, apiKey, ttlMs, timeZ
   const metaDoc = metaSnap.exists ? (metaSnap.data() || {}) : {};
 
   const fixtureMeta = {
+    fixtureId: String(fixtureId),
     homeTeamId: metaDoc.homeTeamId ?? null,
     awayTeamId: metaDoc.awayTeamId ?? null,
+    homeTeamName: metaDoc.homeTeamName || "",
+    awayTeamName: metaDoc.awayTeamName || "",
+    homeTeamLogo: metaDoc.homeTeamLogo || "",
+    awayTeamLogo: metaDoc.awayTeamLogo || "",
     goalsHome: toNum(metaDoc.goalsHome),
     goalsAway: toNum(metaDoc.goalsAway),
 
     // Timer/status info for Cup + Regular player stat cards
     statusShort: metaDoc.short || metaDoc.statusShort || null,
     fixtureStatus: metaDoc.short || metaDoc.statusShort || null,
+    matchStatus: metaDoc.short || metaDoc.statusShort || null,
     statusLong: metaDoc.statusLong || null,
     elapsed: Number.isFinite(Number(metaDoc.elapsed)) ? Number(metaDoc.elapsed) : null,
     extra: Number.isFinite(Number(metaDoc.extra)) ? Number(metaDoc.extra) : null,
     statusUpdatedAtMs: Number.isFinite(Number(metaDoc.updatedAtMs)) ? Number(metaDoc.updatedAtMs) : null,
     kickoffMs: Number.isFinite(Number(metaDoc.kickoffMs)) ? Number(metaDoc.kickoffMs) : null,
   };
+  fixtureMeta.isLive = isInPlay(fixtureMeta.statusShort || fixtureMeta.fixtureStatus);
 
   try {
     const snap = await ref.get();
     if (snap.exists) {
       const d = snap.data() || {};
       const updatedAtMs = Number(d.updatedAtMs || 0);
-      if (updatedAtMs && now - updatedAtMs < ttlMs && d.playerStats) return d.playerStats;
+      const cachedStats = d.playerStats || {};
+      const sample = Object.values(cachedStats)[0] || {};
+      const cachedShort = String(sample?.statusShort || sample?.fixtureStatus || sample?.matchStatus || "").trim().toUpperCase();
+      const currentShort = String(fixtureMeta?.statusShort || fixtureMeta?.fixtureStatus || fixtureMeta?.matchStatus || "").trim().toUpperCase();
+      const statusChanged = Boolean(currentShort && cachedShort && currentShort !== cachedShort);
+      const becameFinal = isFinalStatusCode(currentShort) && cachedShort !== currentShort;
+
+      if (
+        updatedAtMs &&
+        now - updatedAtMs < ttlMs &&
+        cachedStats &&
+        Object.keys(cachedStats).length > 0 &&
+        !statusChanged &&
+        !becameFinal
+      ) {
+        return patchPlayerStatsWithFixtureMeta(cachedStats, fixtureMeta);
+      }
     }
   } catch (_) {}
 
@@ -2342,22 +3525,30 @@ async function getFixturePlayersStatsMapCached({ fixtureId, apiKey, ttlMs, timeZ
         const d2 = snap2.data() || {};
         const prev = d2.playerStats;
         if (prev && Object.keys(prev).length > 0) {
-          await ref.set({ updatedAtMs: now }, { merge: true });
-          return prev;
+          const patchedPrev = patchPlayerStatsWithFixtureMeta(prev, fixtureMeta);
+          await ref.set(
+            {
+              updatedAtMs: now,
+              playerStats: patchedPrev,
+            },
+            { merge: true }
+          );
+          return patchedPrev;
         }
       }
     } catch (_) {}
   }
 
+  const patchedFresh = patchPlayerStatsWithFixtureMeta(fresh, fixtureMeta);
   await ref.set(
     {
       updatedAtMs: now,
-      playerStats: fresh,
+      playerStats: patchedFresh,
     },
     { merge: true }
   );
 
-  return fresh;
+  return patchedFresh;
 }
 
 async function getFixtureStatusMap({ fixtureIds, timezone, apiKey }) {
@@ -2396,11 +3587,16 @@ async function getFixtureStatusMap({ fixtureIds, timezone, apiKey }) {
         }
 
         const d = snap.data() || {};
-        const short = d.short || null;
+        const short = d.short || d.statusShort || null;
         const updatedAtMs = Number(d.updatedAtMs || 0);
         const ttlMs = ttlForShort(short);
+        const hasFixtureDetails =
+          d.fixtureId &&
+          d.homeTeamName &&
+          d.awayTeamName &&
+          d.kickoffMs !== undefined;
 
-        if (short && updatedAtMs && now - updatedAtMs < ttlMs) {
+        if (short && updatedAtMs && now - updatedAtMs < ttlMs && hasFixtureDetails) {
           out[id] = short;
         } else {
           // expired or incomplete, refetch
@@ -2476,6 +3672,7 @@ async function getFixtureStatusMap({ fixtureIds, timezone, apiKey }) {
           {
             fixtureId,
             short,
+            statusShort: short,
             statusLong,
             elapsed,
             extra,
@@ -2508,10 +3705,13 @@ async function getFixtureStatusMap({ fixtureIds, timezone, apiKey }) {
 }
 
 function isInPlay(short) {
-  return ["1H", "HT", "2H", "ET", "BT", "P"].includes(short);
+  return ["1H", "HT", "2H", "ET", "BT", "P"].includes(String(short || "").trim().toUpperCase());
+}
+function isFinalStatusCode(short) {
+  return ["FT", "AET", "PEN"].includes(String(short || "").trim().toUpperCase());
 }
 function isFinished(short) {
-  return ["FT", "AET", "PEN"].includes(short);
+  return isFinalStatusCode(short);
 }
 
 function hasFixtureStarted(short) {
@@ -2627,6 +3827,92 @@ async function loadGlobalFixtureSummariesForSeason({ db, seasonKey, fixtureIds }
   return summariesById;
 }
 
+function buildFixtureMetaFromSummaryOrLive({ fixtureId, summary = {}, live = {} }) {
+  const statusShort = String(
+    summary?.statusShort ||
+    summary?.short ||
+    live?.statusShort ||
+    live?.short ||
+    ""
+  ).trim().toUpperCase();
+
+  const summaryElapsed = Number(summary?.elapsed);
+  const summaryExtra = Number(summary?.extra);
+  const summaryKickoffMs = Number(summary?.kickoffMs);
+
+  return {
+    fixtureId: String(fixtureId),
+    statusShort,
+    fixtureStatus: statusShort,
+    matchStatus: statusShort,
+    statusLong: summary?.statusLong || live?.statusLong || null,
+    elapsed: Number.isFinite(summaryElapsed) ? summaryElapsed : live?.elapsed ?? null,
+    extra: Number.isFinite(summaryExtra) ? summaryExtra : live?.extra ?? null,
+    statusUpdatedAtMs: summary?.updatedAtMs ?? live?.updatedAtMs ?? null,
+    kickoffMs: Number.isFinite(summaryKickoffMs) ? summaryKickoffMs : live?.kickoffMs ?? null,
+    homeTeamId: summary?.homeTeamId ?? live?.homeTeamId ?? null,
+    awayTeamId: summary?.awayTeamId ?? live?.awayTeamId ?? null,
+    homeTeamName: summary?.homeTeamName || live?.homeTeamName || "",
+    awayTeamName: summary?.awayTeamName || live?.awayTeamName || "",
+    homeTeamLogo: summary?.homeTeamLogo || live?.homeTeamLogo || "",
+    awayTeamLogo: summary?.awayTeamLogo || live?.awayTeamLogo || "",
+    goalsHome: summary?.goalsHome ?? live?.goalsHome ?? null,
+    goalsAway: summary?.goalsAway ?? live?.goalsAway ?? null,
+  };
+}
+
+function patchGlobalLiveFixturesWithSummaries(liveFixturesById = {}, fixtureSummariesById = {}) {
+  const patched = {};
+
+  for (const [fixtureId, live] of Object.entries(liveFixturesById || {})) {
+    const summary = fixtureSummariesById[String(fixtureId)] || {};
+    const fixtureMeta = buildFixtureMetaFromSummaryOrLive({
+      fixtureId,
+      summary,
+      live,
+    });
+
+    const rawStatsByPlayerId =
+      live?.rawStatsByPlayerId && typeof live.rawStatsByPlayerId === "object"
+        ? live.rawStatsByPlayerId
+        : {};
+    const patchedRawStats = patchPlayerStatsWithFixtureMeta(rawStatsByPlayerId, fixtureMeta);
+
+    const fantasyByPlayerId =
+      live?.fantasyByPlayerId && typeof live.fantasyByPlayerId === "object"
+        ? live.fantasyByPlayerId
+        : {};
+    const patchedFantasy = {};
+
+    for (const [pid, fantasy] of Object.entries(fantasyByPlayerId)) {
+      patchedFantasy[pid] = {
+        ...(fantasy || {}),
+        stats: patchedRawStats[pid] || fantasy?.stats || {},
+      };
+    }
+
+    const isLiveNow = fixtureMeta.statusShort
+      ? isInPlay(fixtureMeta.statusShort) && !isFinalStatusCode(fixtureMeta.statusShort)
+      : Boolean(live?.isLive);
+
+    patched[fixtureId] = {
+      ...(live || {}),
+      statusShort: fixtureMeta.statusShort || live?.statusShort || null,
+      fixtureStatus: fixtureMeta.fixtureStatus || live?.fixtureStatus || null,
+      matchStatus: fixtureMeta.matchStatus || live?.matchStatus || null,
+      statusLong: fixtureMeta.statusLong || live?.statusLong || null,
+      elapsed: fixtureMeta.elapsed ?? live?.elapsed ?? null,
+      extra: fixtureMeta.extra ?? live?.extra ?? null,
+      kickoffMs: fixtureMeta.kickoffMs ?? live?.kickoffMs ?? null,
+      isLive: isLiveNow,
+      rawStatsByPlayerId: patchedRawStats,
+      fantasyByPlayerId: patchedFantasy,
+    };
+  }
+
+  return patched;
+}
+
 async function loadRoomUsersLineupsForGlobalAggregation({ db, roomId }) {
   function inferOwnerUid(d) {
     const v =
@@ -2655,6 +3941,7 @@ async function loadRoomUsersLineupsForGlobalAggregation({ db, roomId }) {
     membersByUid.set(uid, {
       uid,
       displayName: String(data.displayName || data.name || uid),
+      teamName: String(data.teamName || data.team || ""),
     });
   });
 
@@ -2754,6 +4041,7 @@ async function loadRoomUsersLineupsForGlobalAggregation({ db, roomId }) {
     users.push({
       uid,
       displayName: membersByUid.get(uid)?.displayName || uid,
+      teamName: membersByUid.get(uid)?.teamName || "",
       starters,
       bench,
     });
@@ -2869,16 +4157,33 @@ function mergeGlobalRawPlayerStats(prev = {}, next = {}, fixtureId = "") {
   }
 
   out.cleanSheet = Boolean(out.cleanSheet) || Boolean(next?.cleanSheet);
+  const nextStatus = String(next?.statusShort || next?.fixtureStatus || next?.matchStatus || "").trim().toUpperCase();
+  if (isFinalStatusCode(nextStatus)) {
+    out.isLive = false;
+  } else if (nextStatus) {
+    out.isLive = isInPlay(nextStatus);
+  } else {
+    out.isLive = Boolean(out.isLive) || Boolean(next?.isLive);
+  }
   out.rating = Math.max(toNum(out.rating), toNum(next?.rating));
 
   const preferNextKeys = [
+    "fixtureId",
     "teamId",
     "teamName",
     "opponentName",
+    "homeTeamId",
+    "awayTeamId",
+    "homeTeamName",
+    "awayTeamName",
+    "homeTeamLogo",
+    "awayTeamLogo",
     "teamScore",
     "opponentScore",
     "teamGoals",
     "opponentGoals",
+    "goalsHome",
+    "goalsAway",
     "fixtureStatus",
     "matchStatus",
     "statusShort",
@@ -2979,9 +4284,66 @@ async function computeGlobalCupShadowResults({ db, roomId, nowMs }) {
     seasonKey: seasonContext.seasonKey,
     fixtureIds,
   });
+  const fixtureSummariesById = await loadGlobalFixtureSummariesForSeason({
+    db,
+    seasonKey: seasonContext.seasonKey,
+    fixtureIds,
+  });
+  const patchedLiveFixturesById = patchGlobalLiveFixturesWithSummaries(
+    liveFixturesById,
+    fixtureSummariesById
+  );
+
+  const fixtureCoverage = fixtureIds.map((fixtureId) => {
+    const live = patchedLiveFixturesById[String(fixtureId)] || null;
+    const summary = fixtureSummariesById[String(fixtureId)] || null;
+    const fantasyByPlayerId =
+      live?.fantasyByPlayerId && typeof live.fantasyByPlayerId === "object"
+        ? live.fantasyByPlayerId
+        : {};
+    const rawStatsByPlayerId =
+      live?.rawStatsByPlayerId && typeof live.rawStatsByPlayerId === "object"
+        ? live.rawStatsByPlayerId
+        : {};
+    const rawSample =
+      Object.values(rawStatsByPlayerId).find((value) => value && typeof value === "object") || {};
+
+    return {
+      fixtureId: String(fixtureId),
+      hasLivePayload: Boolean(live),
+      hasSummary: Boolean(summary),
+      statusShort:
+        live?.statusShort ||
+        summary?.short ||
+        summary?.statusShort ||
+        rawSample?.statusShort ||
+        rawSample?.fixtureStatus ||
+        rawSample?.matchStatus ||
+        null,
+      statusLong: live?.statusLong || summary?.statusLong || rawSample?.statusLong || null,
+      kickoffMs: Number(live?.kickoffMs ?? summary?.kickoffMs ?? rawSample?.kickoffMs ?? 0) || null,
+      fantasyPlayerCount: Object.keys(fantasyByPlayerId).length,
+      rawStatsPlayerCount: Object.keys(rawStatsByPlayerId).length,
+    };
+  });
 
   const users = await loadRoomUsersLineupsForGlobalAggregation({ db, roomId });
-  const globalRawStatsByPlayerId = buildAggregatedGlobalRawStatsByPlayerId(liveFixturesById);
+  const globalRawStatsByPlayerId = buildAggregatedGlobalRawStatsByPlayerId(patchedLiveFixturesById);
+  const playersById = new Map();
+
+  for (const user of users) {
+    for (const player of [...(user.starters || []), ...(user.bench || [])]) {
+      const pid = String(player?.id ?? player?.playerId ?? player?.apiPlayerId ?? "").trim();
+      if (!pid || playersById.has(pid)) continue;
+      playersById.set(pid, {
+        id: pid,
+        name: player?.name || player?.playerName || player?.fullName || "Unknown",
+        position: toPos(player?.position || player?.pos || player?.role || "MID"),
+        teamName: player?.teamName || "",
+        nationality: player?.nationality || "",
+      });
+    }
+  }
 
   const globalTotalsByUid = {};
   const globalBreakdownByUserId = {};
@@ -3009,6 +4371,7 @@ async function computeGlobalCupShadowResults({ db, roomId, nowMs }) {
       // not API-Football's fixture position.
       const scorePosition = toPos(
         player?.position ||
+        playersById.get(pid)?.position ||
         aggregated?.position ||
         rawStats?.position ||
         "MID"
@@ -3086,6 +4449,97 @@ async function computeGlobalCupShadowResults({ db, roomId, nowMs }) {
       ? cup.livePointsByUid
       : {};
 
+  function mergeCupShadowPerPlayerEntry(prev = {}, next = {}) {
+    return {
+      id: next.id || prev.id || "",
+      name: next.name || prev.name || "Unknown",
+      position: next.position || prev.position || "MID",
+      points: Number(prev.points || 0) + Number(next.points || 0),
+      breakdown: { ...(prev.breakdown || {}), ...(next.breakdown || {}) },
+      stats: { ...(prev.stats || {}), ...(next.stats || {}) },
+      counted: next.counted ?? prev.counted ?? true,
+    };
+  }
+
+  function mergeCupShadowBreakdownMaps(...maps) {
+    const out = {};
+
+    for (const map of maps) {
+      if (!map || typeof map !== "object") continue;
+
+      for (const [uid, incoming] of Object.entries(map)) {
+        const prev = out[uid] || { total: 0, benchTotal: 0, perPlayer: {} };
+        const mergedPerPlayer = { ...(prev.perPlayer || {}) };
+
+        for (const [pid, entry] of Object.entries(incoming?.perPlayer || {})) {
+          mergedPerPlayer[String(pid)] = mergeCupShadowPerPlayerEntry(
+            mergedPerPlayer[String(pid)] || {},
+            entry || {}
+          );
+        }
+
+        out[uid] = {
+          total: Number(prev.total || 0) + Number(incoming?.total || 0),
+          benchTotal: Number(prev.benchTotal || 0) + Number(incoming?.benchTotal || 0),
+          perPlayer: mergedPerPlayer,
+        };
+      }
+    }
+
+    return out;
+  }
+
+  function flattenCupShadowPerPlayer(legacyUserBreakdown = {}) {
+    const out = {};
+    const directCandidates = [
+      legacyUserBreakdown?.perPlayer,
+      legacyUserBreakdown?.partsByPlayerId,
+      legacyUserBreakdown?.playersById,
+    ];
+
+    for (const candidate of directCandidates) {
+      if (!candidate || typeof candidate !== "object") continue;
+      for (const [playerId, value] of Object.entries(candidate)) {
+        out[String(playerId)] = value || {};
+      }
+    }
+
+    const addList = (list) => {
+      for (const entry of Array.isArray(list) ? list : []) {
+        const pid = String(entry?.id ?? entry?.playerId ?? entry?.apiPlayerId ?? "").trim();
+        if (!pid || out[pid]) continue;
+        out[pid] = entry || {};
+      }
+    };
+
+    addList(legacyUserBreakdown?.starters);
+    addList(legacyUserBreakdown?.bench);
+
+    return out;
+  }
+
+  function hasCupShadowMeaningfulStats(value) {
+    if (!value || typeof value !== "object") return false;
+    return Object.entries(value).some(([key, val]) => {
+      if (["teamName", "opponentName", "fixtureId", "fixtureIds"].includes(key)) return false;
+      return val !== undefined && val !== null && val !== "" && val !== 0 && val !== false;
+    });
+  }
+
+  const creditedBreakdownCandidates = [
+    cup?.windowBreakdownByUserId,
+    cup?.currentWindowBreakdownByUserId,
+    cup?.breakdownByUserId,
+  ];
+  const creditedCurrentWindowBreakdownByUserId =
+    creditedBreakdownCandidates.find(
+      (candidate) => candidate && typeof candidate === "object" && Object.keys(candidate).length
+    ) || {};
+  const legacyCurrentWindowBreakdownByUserId = mergeCupShadowBreakdownMaps(
+    creditedCurrentWindowBreakdownByUserId,
+    cup?.liveBreakdownByUserId || {}
+  );
+
   // Shadow comparison should be current window vs current window.
   // Global reads cup.currentWindowFixtureIds, so compare it against
   // legacy windowPointsByUid + livePointsByUid, not full Cup totals.
@@ -3098,6 +4552,7 @@ async function computeGlobalCupShadowResults({ db, roomId, nowMs }) {
     ...Object.keys(globalTotalsByUid || {}),
     ...Object.keys(legacyWindowPointsByUid || {}),
     ...Object.keys(legacyLivePointsByUid || {}),
+    ...Object.keys(legacyCurrentWindowBreakdownByUserId || {}),
   ]);
 
   for (const uid of allUids) {
@@ -3112,6 +4567,64 @@ async function computeGlobalCupShadowResults({ db, roomId, nowMs }) {
     diffsByUid[uid] = Number(globalTotalsByUid[uid] || 0) - legacyTotal;
   }
 
+  const playerMismatches = [];
+  const statMismatches = [];
+
+  for (const uid of allUids) {
+    const legacyPerPlayer = flattenCupShadowPerPlayer(
+      legacyCurrentWindowBreakdownByUserId?.[uid] || {}
+    );
+    const globalPerPlayer =
+      globalBreakdownByUserId?.[uid]?.perPlayer &&
+      typeof globalBreakdownByUserId[uid].perPlayer === "object"
+        ? globalBreakdownByUserId[uid].perPlayer
+        : {};
+    const playerIds = new Set([
+      ...Object.keys(legacyPerPlayer),
+      ...Object.keys(globalPerPlayer),
+    ]);
+
+    for (const playerId of playerIds) {
+      const legacyEntry = legacyPerPlayer[playerId] || {};
+      const globalEntry = globalPerPlayer[playerId] || {};
+      const legacyPoints = Number(legacyEntry.points ?? legacyEntry.total ?? legacyEntry.fantasyPoints ?? 0);
+      const globalPoints = Number(globalEntry.points ?? 0);
+      const diff = globalPoints - legacyPoints;
+      const legacyStats = legacyEntry.stats || {};
+      const globalStats = globalEntry.stats || {};
+      const legacyHasStats = hasCupShadowMeaningfulStats(legacyStats);
+      const globalHasStats = hasCupShadowMeaningfulStats(globalStats);
+
+      if (diff !== 0 || legacyHasStats !== globalHasStats) {
+        playerMismatches.push({
+          uid,
+          playerId,
+          name: globalEntry.name || legacyEntry.name || "Unknown",
+          legacyPoints,
+          globalPoints,
+          diff,
+          legacyBreakdown: legacyEntry.breakdown || {},
+          globalBreakdown: globalEntry.breakdown || {},
+          legacyStats,
+          globalStats,
+        });
+      }
+
+      if (legacyHasStats !== globalHasStats) {
+        statMismatches.push({
+          uid,
+          playerId,
+          name: globalEntry.name || legacyEntry.name || "Unknown",
+          legacyHasStats,
+          globalHasStats,
+        });
+      }
+    }
+  }
+
+  const diffValues = Object.values(diffsByUid || {}).map((value) => Math.abs(Number(value || 0)));
+  const maxAbsDiff = diffValues.length ? Math.max(...diffValues) : 0;
+
   const payload = {
     mode: "cup-shadow-aggregator",
     source: "global-live-fixtures",
@@ -3120,6 +4633,9 @@ async function computeGlobalCupShadowResults({ db, roomId, nowMs }) {
     roomId,
     seasonKey: seasonContext.seasonKey,
     fixtureIds,
+    fixtureCount: fixtureIds.length,
+    missingFixtureCount: missingFixtureIds.length,
+    userCount: users.length,
 
     globalTotalsByUid,
     globalBreakdownByUserId,
@@ -3133,36 +4649,77 @@ async function computeGlobalCupShadowResults({ db, roomId, nowMs }) {
     legacyWindowPointsByUid,
     legacyLivePointsByUid,
     legacyCurrentWindowTotalsByUid,
+    legacyCurrentWindowBreakdownByUserId,
 
     diffsByUid,
+    maxAbsDiff,
+    fixtureCoverage,
+    playerMismatches,
+    statMismatches,
     missingFixtureIds,
     missingPlayerIdsByUid,
 
     updatedAtMs: nowMs,
-    updatedAt: FieldValue.serverTimestamp(),
 
     legacyTotalUsedByUid,
     legacyCompareSourceByUid,
   };
 
-  await roomRef.collection("globalShadowResults").doc("cup-current").set(payload, { merge: false });
+  await roomRef.collection("globalShadowResults").doc("cup-current").set(
+    {
+      ...payload,
+      updatedAt: FieldValue.serverTimestamp(),
+    },
+    { merge: false }
+  );
 
-  return {
-    ...payload,
-    userCount: users.length,
-  };
+  return payload;
 }
 
-async function computeGlobalRegularShadowResults({ db, roomId, weekIndex, nowMs }) {
+async function computeRegularWeekFromGlobalCache({
+  db,
+  roomId,
+  weekIndex,
+  nowMs = Date.now(),
+  writeMode = "shadow",
+  dryRun = true,
+}) {
   const roomRef = db.doc(`rooms/${roomId}`);
   const roomSnap = await roomRef.get();
   if (!roomSnap.exists) throw new HttpsError("not-found", "Room not found.");
 
   const room = roomSnap.data() || {};
   const phase = getRoomPhaseLabel(room);
-
   if (phase === "Cup") {
     throw new HttpsError("failed-precondition", "Room is Cup phase. Use Cup shadow test instead.");
+  }
+
+  const pipelineMode = getGlobalPipelineMode(room);
+  const liveFixtureCacheEnabled =
+    isGlobalLiveFixtureCacheEnabled(room) ||
+    pipelineMode === "shadow" ||
+    pipelineMode === "global";
+
+  if (!liveFixtureCacheEnabled) {
+    throw new HttpsError(
+      "failed-precondition",
+      "Room does not have global live fixture cache enabled."
+    );
+  }
+
+  const normalizedWriteMode =
+    String(writeMode || "").trim().toLowerCase() === "global" ? "global" : "shadow";
+  const realWriteRequested = normalizedWriteMode === "global" && !dryRun;
+  const realWriteAllowed =
+    realWriteRequested &&
+    pipelineMode === "global" &&
+    isGlobalRoomAggregatorEnabled(room);
+
+  if (realWriteRequested && !realWriteAllowed) {
+    throw new HttpsError(
+      "failed-precondition",
+      "Room global roomAggregator is not enabled."
+    );
   }
 
   const resolvedWeekIndex = Number(
@@ -3182,6 +4739,11 @@ async function computeGlobalRegularShadowResults({ db, roomId, weekIndex, nowMs 
   }
 
   const week = weekSnap.data() || {};
+  const endAtMs = Number(week.endAtMs || 0);
+  const pastPostWindow =
+    Number.isFinite(endAtMs) &&
+    endAtMs > 0 &&
+    nowMs >= endAtMs + TOURNAMENT_POST_MS;
   const fixtureIds = extractFixtureIdsFromWeekDoc(week);
 
   const seasonContext = deriveRoomSeasonContext(room);
@@ -3194,14 +4756,26 @@ async function computeGlobalRegularShadowResults({ db, roomId, weekIndex, nowMs 
     seasonKey: seasonContext.seasonKey,
     fixtureIds,
   });
+  if (missingFixtureIds.length) {
+    console.warn("[computeRegularWeekFromGlobalCache] missing global live fixture docs", {
+      roomId,
+      weekIndex: resolvedWeekIndex,
+      missingFixtureCount: missingFixtureIds.length,
+      missingFixtureIds: missingFixtureIds.slice(0, 5),
+    });
+  }
   const fixtureSummariesById = await loadGlobalFixtureSummariesForSeason({
     db,
     seasonKey: seasonContext.seasonKey,
     fixtureIds,
   });
+  const patchedLiveFixturesById = patchGlobalLiveFixturesWithSummaries(
+    liveFixturesById,
+    fixtureSummariesById
+  );
 
   const fixtureCoverage = fixtureIds.map((fixtureId) => {
-    const live = liveFixturesById[String(fixtureId)] || null;
+    const live = patchedLiveFixturesById[String(fixtureId)] || null;
     const summary = fixtureSummariesById[String(fixtureId)] || null;
     const fantasyByPlayerId =
       live?.fantasyByPlayerId && typeof live.fantasyByPlayerId === "object"
@@ -3211,128 +4785,284 @@ async function computeGlobalRegularShadowResults({ db, roomId, weekIndex, nowMs 
       live?.rawStatsByPlayerId && typeof live.rawStatsByPlayerId === "object"
         ? live.rawStatsByPlayerId
         : {};
+    const rawSample =
+      Object.values(rawStatsByPlayerId).find((value) => value && typeof value === "object") || {};
 
     return {
       fixtureId: String(fixtureId),
       hasLivePayload: Boolean(live),
       hasSummary: Boolean(summary),
-      statusShort: live?.statusShort || summary?.short || summary?.statusShort || null,
-      statusLong: live?.statusLong || summary?.statusLong || null,
-      kickoffMs: Number(live?.kickoffMs ?? summary?.kickoffMs ?? 0) || null,
+      statusShort:
+        live?.statusShort ||
+        summary?.short ||
+        summary?.statusShort ||
+        rawSample?.statusShort ||
+        rawSample?.fixtureStatus ||
+        rawSample?.matchStatus ||
+        null,
+      statusLong: live?.statusLong || summary?.statusLong || rawSample?.statusLong || null,
+      kickoffMs: Number(live?.kickoffMs ?? summary?.kickoffMs ?? rawSample?.kickoffMs ?? 0) || null,
       fantasyPlayerCount: Object.keys(fantasyByPlayerId).length,
       rawStatsPlayerCount: Object.keys(rawStatsByPlayerId).length,
     };
   });
 
+  const fixtureStatusById = {};
+  for (const coverage of fixtureCoverage) {
+    if (coverage.statusShort) {
+      fixtureStatusById[String(coverage.fixtureId)] = coverage.statusShort;
+    }
+  }
+
+  const anyInPlay = fixtureCoverage.some((coverage) => isInPlay(coverage.statusShort || null));
+  const allFinished = fixtureIds.length > 0 && fixtureCoverage.every((coverage) =>
+    isFinished(coverage.statusShort || "")
+  );
+  const forcedFinalByExpiredWindow = pastPostWindow && !anyInPlay;
+  const statusValue =
+    allFinished || forcedFinalByExpiredWindow
+      ? "final"
+      : anyInPlay
+        ? "live"
+        : "idle";
+
+  let nextKickoffMs = null;
+  for (const coverage of fixtureCoverage) {
+    const ko = Number(coverage.kickoffMs);
+    if (!Number.isFinite(ko) || ko <= nowMs) continue;
+    if (nextKickoffMs == null || ko < nextKickoffMs) nextKickoffMs = ko;
+  }
+
   const users = await loadRoomUsersLineupsForGlobalAggregation({ db, roomId });
-  const globalRawStatsByPlayerId = buildAggregatedGlobalRawStatsByPlayerId(liveFixturesById);
+  const scoreUsers = users.map((user) => ({
+    ...user,
+    userId: String(user.uid),
+    name: user.displayName || String(user.uid),
+  }));
+  const memberUids = scoreUsers.map((user) => String(user.userId)).filter(Boolean).sort();
+  const globalRawStatsByPlayerId = buildAggregatedGlobalRawStatsByPlayerId(patchedLiveFixturesById);
 
-  const globalTotalsByUid = {};
-  const globalBenchTotalsByUid = {};
-  const globalBreakdownByUserId = {};
+  const weekResultsRef = roomRef.collection("weekResults").doc(String(resolvedWeekIndex));
+  const weekResultsSnap = await weekResultsRef.get();
+  const prevResults = weekResultsSnap.exists ? (weekResultsSnap.data() || {}) : {};
+  const legacyBreakdownByUserId =
+    prevResults?.breakdownByUserId && typeof prevResults.breakdownByUserId === "object"
+      ? prevResults.breakdownByUserId
+      : {};
+  const legacyTotalsByUid =
+    prevResults?.teamScoresByUserId && typeof prevResults.teamScoresByUserId === "object"
+      ? prevResults.teamScoresByUserId
+      : {};
+
+  const playersById = new Map();
+  const rememberPlayer = (player) => {
+    const pid = String(player?.id ?? player?.playerId ?? player?.apiPlayerId ?? "").trim();
+    if (!pid || playersById.has(pid)) return;
+    playersById.set(pid, {
+      id: pid,
+      name: player?.name || player?.playerName || player?.fullName || "Unknown",
+      position: toPos(player?.position || player?.pos || player?.role || "MID"),
+      teamName: player?.teamName || "",
+      nationality: player?.nationality || "",
+      teamLogo: player?.teamLogo || "",
+    });
+  };
+
+  for (const user of scoreUsers) {
+    for (const player of [...(user.starters || []), ...(user.bench || [])]) {
+      rememberPlayer(player);
+    }
+  }
+
+  for (const mapName of ["startersByUserId", "benchByUserId"]) {
+    const byUser = prevResults?.[mapName] && typeof prevResults[mapName] === "object"
+      ? prevResults[mapName]
+      : {};
+    for (const list of Object.values(byUser)) {
+      for (const player of Array.isArray(list) ? list : []) {
+        rememberPlayer(player);
+      }
+    }
+  }
+
+  function rawStatsForPlayer(playerId) {
+    return globalRawStatsByPlayerId[String(playerId)]?.stats || null;
+  }
+
+  function globalMatchStartedForPlayer(playerId) {
+    const rawStats = rawStatsForPlayer(playerId);
+    if (!rawStats) return false;
+    const short = rawStats.statusShort || rawStats.fixtureStatus || rawStats.matchStatus || null;
+    return !short || short !== "NS";
+  }
+
+  function scoreGlobalPlayer(player, counted) {
+    const pid = String(player?.id || "").trim();
+    const aggregated = globalRawStatsByPlayerId[pid] || null;
+    const rawStats = aggregated?.stats || null;
+
+    // Room/fantasy position wins. API position is only a fallback/debug hint.
+    const scorePosition = toPos(
+      player?.position ||
+      playersById.get(pid)?.position ||
+      aggregated?.position ||
+      rawStats?.position ||
+      "MID"
+    );
+
+    const scored = rawStats
+      ? scorePlayer(rawStats, scorePosition)
+      : { points: 0, breakdown: {} };
+
+    return {
+      id: pid,
+      name: player?.name || playersById.get(pid)?.name || "Unknown",
+      position: scorePosition,
+      teamName: rawStats?.teamName || aggregated?.teamName || player?.teamName || "",
+      nationality: player?.nationality || playersById.get(pid)?.nationality || "",
+      opponentName: rawStats?.opponentName || aggregated?.opponentName || "",
+      points: Number(scored?.points ?? scored?.total ?? 0),
+      breakdown: scored?.breakdown || scored?.parts || scored?.pointsBreakdown || {},
+      stats: rawStats || {},
+      counted,
+    };
+  }
+
+  const totalsByUid = {};
+  const benchTotalsByUid = {};
+  const breakdownByUserId = {};
   const missingPlayerIdsByUid = {};
+  const newActiveScorers = {};
+  const finalStartersByUserId = {};
+  const finalBenchByUserId = {};
 
-  for (const user of users) {
-    const uid = String(user.uid);
+  for (const user of scoreUsers) {
+    const uid = String(user.userId);
+    const activeSet = new Set(
+      Array.isArray(prevResults?.activeScorers?.[uid])
+        ? prevResults.activeScorers[uid].map(String)
+        : []
+    );
+
+    for (const player of Array.isArray(user.starters) ? user.starters : []) {
+      const pid = String(player?.id || "").trim();
+      if (pid && globalMatchStartedForPlayer(pid)) {
+        activeSet.add(pid);
+      }
+    }
+
+    const effectiveStarters = [];
+    const addedIds = new Set();
+
+    for (const pid of activeSet) {
+      const player = playersById.get(String(pid)) || {
+        id: String(pid),
+        name: "Unknown",
+        position: "MID",
+      };
+      effectiveStarters.push(player);
+      addedIds.add(String(pid));
+    }
+
+    for (const player of Array.isArray(user.starters) ? user.starters : []) {
+      const pid = String(player?.id || "").trim();
+      if (!pid || addedIds.has(pid)) continue;
+      effectiveStarters.push(player);
+      addedIds.add(pid);
+    }
+
+    const effectiveBench = [];
+    for (const player of Array.isArray(user.bench) ? user.bench : []) {
+      const pid = String(player?.id || "").trim();
+      if (pid && !addedIds.has(pid)) effectiveBench.push(player);
+    }
+
     const perPlayer = {};
     const startersOut = [];
     const benchOut = [];
     const missing = new Set();
-
     let starterTotal = 0;
     let benchTotal = 0;
 
-    const consumePlayer = (player, counted) => {
-      const pid = String(player?.id || "").trim();
-      if (!pid) return;
-
-      const aggregated = globalRawStatsByPlayerId[pid] || null;
-      const rawStats = aggregated?.stats || null;
-
-      // Score global raw stats using the room/fantasy player position,
-      // not API-Football's fixture position.
-      const scorePosition = toPos(
-        player?.position ||
-        aggregated?.position ||
-        rawStats?.position ||
-        "MID"
-      );
-
-      const scored = rawStats
-        ? scorePlayer(rawStats, scorePosition)
-        : { points: 0, breakdown: {} };
-
-      const entry = {
-        id: pid,
-        name: player?.name || "Unknown",
-        position: scorePosition,
-        teamName: rawStats?.teamName || aggregated?.teamName || player?.teamName || "",
-        nationality: player?.nationality || "",
-        opponentName: rawStats?.opponentName || aggregated?.opponentName || "",
-        points: Number(scored?.points ?? scored?.total ?? 0),
-        breakdown: scored?.breakdown || scored?.parts || scored?.pointsBreakdown || {},
-        stats: rawStats || { teamName: player?.teamName || "" },
-        counted,
-      };
-
-      perPlayer[pid] = entry;
-
-      if (aggregated) {
-        if (counted) starterTotal += entry.points;
-        else benchTotal += entry.points;
-      } else {
-        missing.add(pid);
-      }
-
-      if (counted) startersOut.push(entry);
-      else benchOut.push(entry);
-    };
-
-    for (const player of Array.isArray(user.starters) ? user.starters : []) {
-      consumePlayer(player, true);
+    for (const player of effectiveStarters) {
+      const entry = scoreGlobalPlayer(player, true);
+      if (!entry.id) continue;
+      perPlayer[entry.id] = entry;
+      startersOut.push(entry);
+      starterTotal += Number(entry.points || 0);
+      if (!globalRawStatsByPlayerId[entry.id]) missing.add(entry.id);
     }
 
-    for (const player of Array.isArray(user.bench) ? user.bench : []) {
-      consumePlayer(player, false);
+    for (const player of effectiveBench) {
+      const entry = scoreGlobalPlayer(player, false);
+      if (!entry.id) continue;
+      perPlayer[entry.id] = entry;
+      benchOut.push(entry);
+      benchTotal += Number(entry.points || 0);
+      if (!globalRawStatsByPlayerId[entry.id]) missing.add(entry.id);
     }
 
-    globalTotalsByUid[uid] = starterTotal;
-    globalBenchTotalsByUid[uid] = benchTotal;
-    globalBreakdownByUserId[uid] = {
-      uid,
-      displayName: user.displayName || uid,
+    totalsByUid[uid] = starterTotal;
+    benchTotalsByUid[uid] = benchTotal;
+    newActiveScorers[uid] = Array.from(activeSet);
+    finalStartersByUserId[uid] = effectiveStarters;
+    finalBenchByUserId[uid] = effectiveBench;
+    missingPlayerIdsByUid[uid] = Array.from(missing);
+    breakdownByUserId[uid] = {
       total: starterTotal,
       benchTotal,
+      perPlayer,
       starters: startersOut,
       bench: benchOut,
-      perPlayer,
     };
-
-    missingPlayerIdsByUid[uid] = Array.from(missing);
   }
 
-  const weekResultsRef = roomRef.collection("weekResults").doc(String(resolvedWeekIndex));
-  const weekResultsSnap = await weekResultsRef.get();
-  const weekResults = weekResultsSnap.exists ? (weekResultsSnap.data() || {}) : {};
-  const legacyBreakdownByUserId =
-    weekResults?.breakdownByUserId && typeof weekResults.breakdownByUserId === "object"
-      ? weekResults.breakdownByUserId
-      : {};
+  const matchupPairs = Array.isArray(week.matchups) && week.matchups.length
+    ? week.matchups
+    : roundRobinPairings(memberUids, resolvedWeekIndex);
 
-  const legacyTotalsByUid =
-    weekResults?.teamScoresByUserId && typeof weekResults.teamScoresByUserId === "object"
-      ? weekResults.teamScoresByUserId
-      : {};
+  const matchups = matchupPairs.map((pair) => {
+    const homeTotal = totalsByUid[pair.homeUserId] ?? 0;
+    const awayTotal = totalsByUid[pair.awayUserId] ?? 0;
+
+    let homeResult = "L";
+    let awayResult = "W";
+    let winnerUserId = pair.awayUserId;
+
+    if (homeTotal > awayTotal) {
+      homeResult = "W";
+      awayResult = "L";
+      winnerUserId = pair.homeUserId;
+    } else if (homeTotal === awayTotal) {
+      homeResult = "D";
+      awayResult = "D";
+      winnerUserId = null;
+    }
+
+    return {
+      weekIndex: resolvedWeekIndex,
+      homeUserId: pair.homeUserId,
+      awayUserId: pair.awayUserId,
+      homeTotal,
+      awayTotal,
+      homeResult,
+      awayResult,
+      winnerUserId,
+      status: statusValue === "final" ? "FINAL" : (anyInPlay ? "LIVE" : "IDLE"),
+    };
+  });
+
+  const weekLeaderboard = buildLeaderboard(scoreUsers, matchups, totalsByUid);
 
   const diffsByUid = {};
   const allUids = new Set([
-    ...Object.keys(globalTotalsByUid || {}),
+    ...Object.keys(totalsByUid || {}),
     ...Object.keys(legacyTotalsByUid || {}),
   ]);
 
   for (const uid of allUids) {
     diffsByUid[uid] =
-      Number(globalTotalsByUid[uid] || 0) -
+      Number(totalsByUid[uid] || 0) -
       Number(legacyTotalsByUid[uid] || 0);
   }
 
@@ -3366,7 +5096,11 @@ async function computeGlobalRegularShadowResults({ db, roomId, weekIndex, nowMs 
   }
 
   function hasMeaningfulStats(value) {
-    return Boolean(value && typeof value === "object" && Object.keys(value).length > 0);
+    if (!value || typeof value !== "object") return false;
+    return Object.entries(value).some(([key, val]) => {
+      if (["teamName", "opponentName", "fixtureId", "fixtureIds"].includes(key)) return false;
+      return val !== undefined && val !== null && val !== "" && val !== 0 && val !== false;
+    });
   }
 
   const playerMismatches = [];
@@ -3376,9 +5110,9 @@ async function computeGlobalRegularShadowResults({ db, roomId, weekIndex, nowMs 
     const legacyUserBreakdown = legacyBreakdownByUserId?.[uid] || {};
     const legacyPerPlayer = flattenLegacyPerPlayer(legacyUserBreakdown);
     const globalPerPlayer =
-      globalBreakdownByUserId?.[uid]?.perPlayer &&
-      typeof globalBreakdownByUserId[uid].perPlayer === "object"
-        ? globalBreakdownByUserId[uid].perPlayer
+      breakdownByUserId?.[uid]?.perPlayer &&
+      typeof breakdownByUserId[uid].perPlayer === "object"
+        ? breakdownByUserId[uid].perPlayer
         : {};
     const playerIds = new Set([
       ...Object.keys(legacyPerPlayer),
@@ -3423,56 +5157,144 @@ async function computeGlobalRegularShadowResults({ db, roomId, weekIndex, nowMs 
     }
   }
 
+  const diffValues = Object.values(diffsByUid || {}).map((value) =>
+    Math.abs(Number(value || 0))
+  );
+  const maxAbsDiff = diffValues.length ? Math.max(...diffValues) : 0;
+
+  const weekResultPayload = {
+    roomId,
+    weekIndex: resolvedWeekIndex,
+    startAtMs: Number(week.startAtMs || 0) || null,
+    endAtMs: Number(week.endAtMs || 0) || null,
+    roundLabel: week.roundLabel || null,
+    status: statusValue,
+    nextKickoffMs: nextKickoffMs ?? null,
+    forcedFinalByExpiredWindow,
+    pastPostWindow,
+    allFinished,
+    anyInPlay,
+    fixtureStatusById,
+    teamScoresByUserId: totalsByUid,
+    breakdownByUserId,
+    matchups,
+    weekLeaderboard,
+    updatedAtMs: nowMs,
+    computedAtMs: nowMs,
+    source: "global-live-fixtures",
+    activeScorers: newActiveScorers,
+    benchByUserId: finalBenchByUserId,
+    startersByUserId: finalStartersByUserId,
+  };
+
+  const weekResultWritePayload = {
+    ...weekResultPayload,
+    computedAt: FieldValue.serverTimestamp(),
+  };
+
   const payload = {
-    mode: "regular-shadow-aggregator",
+    mode: realWriteAllowed ? "regular-global-aggregator" : "regular-shadow-aggregator",
     source: "global-live-fixtures",
     compareScope: "current-regular-week",
+    writeMode: normalizedWriteMode,
+    dryRun: Boolean(dryRun),
+    realWriteApplied: Boolean(realWriteAllowed),
 
     roomId,
     weekIndex: resolvedWeekIndex,
     seasonKey: seasonContext.seasonKey,
     fixtureIds,
+    fixtureCount: fixtureIds.length,
+    missingFixtureCount: missingFixtureIds.length,
+    userCount: scoreUsers.length,
 
-    globalTotalsByUid,
-    globalBenchTotalsByUid,
-    globalBreakdownByUserId,
+    globalTotalsByUid: totalsByUid,
+    globalBenchTotalsByUid: benchTotalsByUid,
+    globalBreakdownByUserId: breakdownByUserId,
 
     legacyTotalsByUid,
     diffsByUid,
+    maxAbsDiff,
     fixtureCoverage,
     playerMismatches,
     statMismatches,
 
     missingFixtureIds,
     missingPlayerIdsByUid,
+    activeScorers: newActiveScorers,
+    benchByUserId: finalBenchByUserId,
+    startersByUserId: finalStartersByUserId,
+    matchups,
+    weekLeaderboard,
 
-    weekStatus: weekResults.status || week.status || null,
+    weekResultPayload,
+    weekStatus: statusValue,
     roundLabel: week.roundLabel || null,
 
     updatedAtMs: nowMs,
-    updatedAt: FieldValue.serverTimestamp(),
   };
 
-  await roomRef
-    .collection("globalShadowResults")
-    .doc(`week-${resolvedWeekIndex}`)
-    .set(payload, { merge: false });
+  if (realWriteAllowed) {
+    await weekResultsRef.set(weekResultWritePayload, { merge: true });
 
-  return {
-    ...payload,
-    userCount: users.length,
-  };
+    if (statusValue === "final") {
+      const effectiveFinalizedAtMs =
+        pastPostWindow && endAtMs > 0
+          ? Math.min(nowMs, endAtMs + TOURNAMENT_POST_MS)
+          : nowMs;
+
+      await weekRef.set(
+        {
+          status: "final",
+          finalizedAt: FieldValue.serverTimestamp(),
+          finalizedAtMs: effectiveFinalizedAtMs,
+        },
+        { merge: true }
+      );
+
+      await recomputeRegularSeasonStandings({ roomId, users: scoreUsers });
+    }
+  } else {
+    await roomRef
+      .collection("globalShadowResults")
+      .doc(`week-${resolvedWeekIndex}`)
+      .set(
+        {
+          ...payload,
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: false }
+      );
+  }
+
+  return payload;
 }
 
-async function collectActiveSeasonFixtureTargets() {
-  const roomsSnap = await db.collection("rooms")
-    .where("competitionState.weekStatus", "in", ["scheduled", "live", "resolving"])
-    .get();
+async function collectActiveSeasonFixtureTargets(nowMs = Date.now(), roomDocs = null) {
+  const docs = Array.isArray(roomDocs)
+    ? roomDocs
+    : (await db.collection("rooms")
+      .where("competitionState.weekStatus", "in", ["scheduled", "live", "resolving"])
+      .get()).docs;
+
+  const stats = {
+    roomsInput: docs.length,
+    activeRoomCount: 0,
+    sleepingRoomCount: 0,
+    skippedDoneCount: 0,
+    seasonTargetCount: 0,
+  };
 
   const roomTargets = await Promise.all(
-    roomsSnap.docs.map(async (roomDoc) => {
+    docs.map(async (roomDoc) => {
       const roomId = roomDoc.id;
       const room = roomDoc.data() || {};
+      const competitionState = getCompetitionState(room);
+      if (String(room?.seasonPhase || "").toUpperCase() === "COMPLETE" || competitionState?.isDone === true) {
+        stats.skippedDoneCount += 1;
+        return null;
+      }
+
       if (!isGlobalLiveFixtureCacheEnabled(room)) {
         return null;
       }
@@ -3490,6 +5312,43 @@ async function collectActiveSeasonFixtureTargets() {
       }
 
       const phaseLabel = getRoomPhaseLabel(room);
+      const isWorldCupGroupRoom =
+        room?.engineType === "worldCupDaily" ||
+        room?.worldCup?.engineType === "worldCupDaily" ||
+        room?.worldCupPhase === WORLD_CUP_GROUP_PHASE ||
+        room?.worldCup?.phase === WORLD_CUP_GROUP_PHASE ||
+        phaseLabel === "WorldCupGroup";
+
+      if (isWorldCupGroupRoom) {
+        const target = await buildWorldCupGroupSeasonTargetForRoom({
+          db,
+          roomId,
+          room,
+          nowMs,
+          preMs: TOURNAMENT_PRE_MS,
+          postMs: TOURNAMENT_POST_MS,
+        });
+
+        if (target?.skipped || target?.sleeping) {
+          stats.sleepingRoomCount += 1;
+          return null;
+        }
+
+        if (Array.isArray(target?.fixtureIds) && target.fixtureIds.length) {
+          stats.activeRoomCount += 1;
+          console.log("[collectActiveSeasonFixtureTargets] world cup group target", {
+            roomId,
+            seasonKey: target.seasonKey,
+            dayIndex: target.dayIndex,
+            dayLabel: target.dayLabel,
+            fixtureIds: target.fixtureIds,
+          });
+          return target;
+        }
+
+        return null;
+      }
+
       const seasonContext = deriveSeasonContext({
         roomSeasonKey: room?.seasonKey,
         roomCompetitionKey: room?.competitionKey,
@@ -3526,12 +5385,26 @@ async function collectActiveSeasonFixtureTargets() {
           return null;
         }
 
-        fixtureIds = extractFixtureIdsFromWeekDoc(weekSnap.data() || {});
+        const week = weekSnap.data() || {};
+        const weekFixtures = Array.isArray(week.fixtures) ? week.fixtures : [];
+        const activeFixtures = getActivePollingFixtures(weekFixtures, nowMs);
+
+        if (!activeFixtures.length) {
+          stats.sleepingRoomCount += 1;
+          return null;
+        }
+
+        fixtureIds = extractFixtureIdsFromWeekDoc({
+          fixtures: activeFixtures,
+          fixtureIds: [],
+        });
       }
 
       if (!fixtureIds.length) {
         return null;
       }
+
+      stats.activeRoomCount += 1;
 
       return {
         roomId,
@@ -3569,11 +5442,111 @@ async function collectActiveSeasonFixtureTargets() {
     grouped.set(target.seasonKey, existing);
   }
 
-  return Array.from(grouped.values()).map((entry) => ({
+  const targets = Array.from(grouped.values()).map((entry) => ({
     ...entry,
     fixtureIds: Array.from(entry.fixtureIds),
     roomIds: Array.from(entry.roomIds),
   }));
+
+  stats.seasonTargetCount = targets.length;
+  return { targets, stats };
+}
+
+function buildRegularSeasonTargetForRoom({ roomId, room, week, nowMs, includeAllWeekFixtures = false }) {
+  const competition = room?.competition || {};
+  const league = Number(competition?.league);
+  const season = Number(competition?.season);
+
+  if (!roomId || !Number.isFinite(league) || !Number.isFinite(season)) {
+    return null;
+  }
+
+  const phaseLabel = getRoomPhaseLabel(room);
+  if (phaseLabel === "Cup" || phaseLabel === "WorldCupGroup") {
+    return null;
+  }
+
+  const seasonContext = deriveSeasonContext({
+    roomSeasonKey: room?.seasonKey,
+    roomCompetitionKey: room?.competitionKey,
+    roomCompetitionType: room?.competitionType,
+    roomCompetitionName:
+      room?.competitionMeta?.name ||
+      room?.competition?.name ||
+      null,
+    league,
+    season,
+    phaseLabel,
+  });
+
+  if (!seasonContext?.seasonKey) return null;
+
+  const weekFixtures = Array.isArray(week?.fixtures) ? week.fixtures : [];
+  const activeFixtures = includeAllWeekFixtures
+    ? weekFixtures
+    : getActivePollingFixtures(weekFixtures, nowMs);
+
+  const fixtureIds = extractFixtureIdsFromWeekDoc({
+    fixtures: activeFixtures,
+    fixtureIds: [],
+  });
+
+  if (!fixtureIds.length) return null;
+
+  return {
+    roomId: String(roomId),
+    seasonKey: seasonContext.seasonKey,
+    competitionKey: seasonContext.competitionKey || "",
+    competitionType: seasonContext.competitionType || "",
+    league,
+    season,
+    timezone: String(competition?.timezone || "America/Los_Angeles"),
+    fixtureIds,
+    roomIds: [String(roomId)],
+  };
+}
+
+async function refreshRegularGlobalCacheForRoom({
+  roomId,
+  room,
+  week,
+  apiKey,
+  nowMs,
+  reason = "",
+  includeAllWeekFixtures = false,
+}) {
+  const seasonTarget = buildRegularSeasonTargetForRoom({
+    roomId,
+    room,
+    week,
+    nowMs,
+    includeAllWeekFixtures,
+  });
+
+  if (!seasonTarget) {
+    console.warn("[pollLiveTournamentWeeks] skipped global cache refresh before aggregation", {
+      roomId,
+      reason,
+      fixtureCount: Array.isArray(week?.fixtures) ? week.fixtures.length : 0,
+    });
+    return { fixtureCount: 0, payloadCount: 0, skipped: true };
+  }
+
+  const result = await pollGlobalSeasonLiveFixturesOnce({
+    seasonTarget,
+    apiKey,
+    nowMs,
+  });
+
+  console.log("[pollLiveTournamentWeeks] refreshed global cache before room aggregation", {
+    roomId,
+    seasonKey: seasonTarget.seasonKey,
+    fixtureCount: result.fixtureCount,
+    payloadCount: result.payloadCount,
+    reason,
+  });
+
+  return result;
 }
 
 function buildGlobalFantasyByPlayerId(rawStatsByPlayerId = {}) {
@@ -3581,12 +5554,6 @@ function buildGlobalFantasyByPlayerId(rawStatsByPlayerId = {}) {
 
   for (const [playerId, stats] of Object.entries(rawStatsByPlayerId || {})) {
     const position = toPos(stats?.position || stats?.pos || stats?.role);
-
-    const playerObj = {
-      id: String(playerId),
-      name: stats?.name || "Unknown",
-      position,
-    };
 
     const scored = scorePlayer(stats || {}, position);
 
@@ -3818,6 +5785,92 @@ async function recomputeRegularSeasonStandings({ roomId, users = [] }) {
   );
 
   return standings;
+}
+
+function getWeekFinalizedAtMs(week = {}) {
+  return (
+    Number(week.finalizedAtMs || 0) ||
+    (week.finalizedAt?.toMillis ? week.finalizedAt.toMillis() : 0)
+  );
+}
+
+function getRegularFinalHoldPollAtMs(week = {}, nowMs = Date.now()) {
+  const finalizedAtMs = getWeekFinalizedAtMs(week);
+  return finalizedAtMs
+    ? finalizedAtMs + REGULAR_FINAL_HOLD_MS
+    : nowMs + TOURNAMENT_UNKNOWN_RECHECK_MS;
+}
+
+async function putRegularRoomToFinalHold({ roomId, finalizedAtMs, roomData = null }) {
+  const nowMs = Number(finalizedAtMs || Date.now());
+  const nextPollAtMs = Number(finalizedAtMs || 0)
+    ? Number(finalizedAtMs) + REGULAR_FINAL_HOLD_MS
+    : nowMs + TOURNAMENT_UNKNOWN_RECHECK_MS;
+  const roomRef = db.doc(`rooms/${roomId}`);
+
+  await Promise.all([
+    setCompetitionState(
+      roomRef,
+      {
+        weekStatus: "scheduled",
+        nextKickoffMs: null,
+        nextPollAtMs,
+      },
+      {
+        ...(roomData ? { roomData } : {}),
+        nowMs,
+      }
+    ),
+    upsertTournamentPollTask({
+      roomId,
+      phase: "RegularSeason",
+      nextPollAtMs,
+      reason: "regular-final-hold",
+      nowMs,
+    }),
+  ]);
+
+  return nextPollAtMs;
+}
+
+async function putRegularFinalWeekToHoldIfNeeded({
+  roomId,
+  roomRef,
+  weekRef,
+  roomData,
+  competitionState,
+  phase = "RegularSeason",
+  nowMs = Date.now(),
+}) {
+  const freshWeekSnap = await weekRef.get();
+  const freshWeek = freshWeekSnap.exists ? (freshWeekSnap.data() || {}) : {};
+  if (freshWeek.status !== "final") return false;
+
+  const nextPollAtMs = getRegularFinalHoldPollAtMs(freshWeek, nowMs);
+
+  await Promise.all([
+    setCompetitionState(
+      roomRef,
+      {
+        weekStatus: "scheduled",
+        nextKickoffMs: null,
+        nextPollAtMs,
+      },
+      {
+        roomData: { ...roomData, competitionState },
+        nowMs,
+      }
+    ),
+    upsertTournamentPollTask({
+      roomId,
+      phase,
+      nextPollAtMs,
+      reason: "regular-final-hold",
+      nowMs,
+    }),
+  ]);
+
+  return true;
 }
 
 // ---------------- Live Week Compute (API stats) ----------------
@@ -4184,15 +6237,17 @@ async function computeAndWriteLiveWeek({ roomId, weekIndex, apiKey }) {
     await weekResultsRef.set(keepPatch, { merge: true });
 
     if (shouldFinalize) {
+      const finalizedAtMs = Date.now();
       await weekRef.set(
         {
           status: "final",
           finalizedAt: admin.firestore.FieldValue.serverTimestamp(),
-          finalizedAtMs: Date.now(),
+          finalizedAtMs,
         },
         { merge: true }
       );
 
+      await putRegularRoomToFinalHold({ roomId, finalizedAtMs });
       await recomputeRegularSeasonStandings({ roomId, users });
     }
 
@@ -4384,15 +6439,17 @@ async function computeAndWriteLiveWeek({ roomId, weekIndex, apiKey }) {
 
 
   if (shouldFinalize) {
+    const finalizedAtMs = Date.now();
     await weekRef.set(
       {
         status: "final",
         finalizedAt: admin.firestore.FieldValue.serverTimestamp(),
-        finalizedAtMs: Date.now(),
+        finalizedAtMs,
       },
       { merge: true }
     );
 
+    await putRegularRoomToFinalHold({ roomId, finalizedAtMs });
     await recomputeRegularSeasonStandings({ roomId, users });
   }
 
@@ -4400,6 +6457,121 @@ async function computeAndWriteLiveWeek({ roomId, weekIndex, apiKey }) {
   if (prevResults.forceRecompute) {
     await weekResultsRef.set({ forceRecompute: admin.firestore.FieldValue.delete() }, { merge: true });
   }
+}
+
+async function completeRegularSeasonRoom({ roomId, room, nowMs = Date.now() }) {
+  const users = await loadRegularStandingUsersForRoom(roomId).catch((e) => {
+    console.warn("[completeRegularSeasonRoom] failed to load user names for standings", {
+      roomId,
+      error: String(e?.message || e),
+    });
+    return [];
+  });
+
+  if (users.length) {
+    await recomputeRegularSeasonStandings({ roomId, users });
+  } else {
+    console.warn("[completeRegularSeasonRoom] skipping final standings recompute without user names", {
+      roomId,
+    });
+  }
+  await writeFinalResultsSnapshot({ roomId });
+
+  const roomRef = db.doc(`rooms/${roomId}`);
+  await roomRef.set(
+    {
+      seasonPhase: "COMPLETE",
+      currentWeekIndex: null,
+      completedAtMs: nowMs,
+      completedAt: FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+
+  await setCompetitionState(
+    roomRef,
+    {
+      phaseLabel: "RegularSeason",
+      isDone: true,
+      weekStatus: "complete",
+      nextKickoffMs: null,
+      nextPollAtMs: null,
+    },
+    {
+      roomData: room,
+      nowMs,
+    }
+  );
+
+  await deleteTournamentPollTask(roomId);
+  return "COMPLETE";
+}
+
+async function loadRegularStandingUsersForRoom(roomId) {
+  const [membersSnap, standingsSnap] = await Promise.all([
+    db.collection(`rooms/${roomId}/members`).get(),
+    db.doc(`rooms/${roomId}/standings/current`).get(),
+  ]);
+
+  const existingNamesByUid = new Map();
+  const standings = standingsSnap.exists ? (standingsSnap.data() || {}) : {};
+  const rows = Array.isArray(standings.standings) ? standings.standings : [];
+
+  for (const row of rows) {
+    const uid = String(row?.userId || row?.uid || "").trim();
+    if (!uid) continue;
+    const name = String(row?.name || row?.displayName || "").trim();
+    if (name) existingNamesByUid.set(uid, name);
+  }
+
+  const memberDataByUid = new Map();
+  membersSnap.forEach((doc) => {
+    const data = doc.data() || {};
+    const uid = String(doc.id || data.uid || "").trim();
+    if (!uid) return;
+    memberDataByUid.set(uid, data);
+  });
+
+  const uids = Array.from(
+    new Set([...memberDataByUid.keys(), ...existingNamesByUid.keys()])
+  ).filter(Boolean).sort();
+
+  if (!uids.length) return [];
+
+  const refs = [];
+  for (const uid of uids) {
+    refs.push(db.doc(`users/${uid}`));
+    refs.push(db.doc(`rooms/${roomId}/teamNames/${uid}`));
+  }
+
+  const snaps = await db.getAll(...refs);
+  const out = [];
+
+  for (let i = 0; i < uids.length; i++) {
+    const uid = uids[i];
+    const userSnap = snaps[i * 2];
+    const teamSnap = snaps[i * 2 + 1];
+    const member = memberDataByUid.get(uid) || {};
+    const profile = userSnap?.exists ? (userSnap.data() || {}) : {};
+    const teamDoc = teamSnap?.exists ? (teamSnap.data() || {}) : {};
+    const displayName =
+      profile.displayName ||
+      profile.name ||
+      member.displayName ||
+      member.name ||
+      existingNamesByUid.get(uid) ||
+      uid;
+    const teamName = String(teamDoc.teamName || member.teamName || "").trim();
+
+    out.push({
+      userId: uid,
+      uid,
+      name: teamName ? `${displayName} - ${teamName}` : String(displayName),
+      displayName: String(displayName),
+    });
+  }
+
+  return out;
 }
 
 async function autoAdvanceWeekIfFinal({ roomId, room, currentWeekIndex, apiKey }) {
@@ -4412,13 +6584,10 @@ async function autoAdvanceWeekIfFinal({ roomId, room, currentWeekIndex, apiKey }
 
   const curWeek = curSnap.data() || {};
   if (curWeek.status !== "final") return null;
-  const HOLD_FINAL_MS = 24 * 60 * 60 * 1000;
 
-  const finalizedAtMs =
-    Number(curWeek.finalizedAtMs || 0) ||
-    (curWeek.finalizedAt?.toMillis ? curWeek.finalizedAt.toMillis() : 0);
+  const finalizedAtMs = getWeekFinalizedAtMs(curWeek);
 
-  if (finalizedAtMs && nowMs < finalizedAtMs + HOLD_FINAL_MS) {
+  if (finalizedAtMs && nowMs < finalizedAtMs + REGULAR_FINAL_HOLD_MS) {
     return null; // stay on FINAL for 24h
   }
 
@@ -4431,15 +6600,15 @@ async function autoAdvanceWeekIfFinal({ roomId, room, currentWeekIndex, apiKey }
     return null; // or throw, depending on your preference
   }
 
-  const totalRounds = await ensureRoomTotalRounds({ roomId, room, competition, apiKey });
   const curRound = parseRoundNumber(curWeek.roundLabel);
+  const totalRounds = Number.isFinite(curRound)
+    ? await ensureRoomTotalRounds({ roomId, room, competition, apiKey })
+    : null;
 
   // If this was the LAST matchday, finalize season instead of creating next week
   // If this was the LAST matchday, finalize season instead of creating next week
   if (Number.isFinite(totalRounds) && Number.isFinite(curRound) && curRound >= totalRounds) {
-    await writeFinalResultsSnapshot({ roomId });
-    await db.doc(`rooms/${roomId}`).set({ seasonPhase: "COMPLETE", currentWeekIndex: null }, { merge: true });
-    return null;
+    return completeRegularSeasonRoom({ roomId, room, nowMs });
   }
 
   // If a future week already exists, move to the next one instead of creating a new one
@@ -4483,6 +6652,7 @@ async function autoAdvanceWeekIfFinal({ roomId, room, currentWeekIndex, apiKey }
   const membersSnap = await db.collection(`rooms/${roomId}/members`).get();
   const memberUids = membersSnap.docs.map((d) => d.id).filter(Boolean);
   if (memberUids.length < 2 || memberUids.length % 2 !== 0) return null;
+  await ensureDefaultLineupsForRoom(roomId, memberUids);
 
   const nextWeekIndex = (indices.length ? Math.max(...indices) : Number(currentWeekIndex)) + 1;
 
@@ -4494,7 +6664,17 @@ async function autoAdvanceWeekIfFinal({ roomId, room, currentWeekIndex, apiKey }
     minKickoffMs: endAtMs + 60 * 1000, // +1 minute
   });
 
-  if (!window) return null;
+  if (!window) {
+    if (!curWeek.roundLabel || !Number.isFinite(curRound)) {
+      console.log("[autoAdvanceWeekIfFinal] no next fixture window; marking complete", {
+        roomId,
+        currentWeekIndex,
+      });
+      return completeRegularSeasonRoom({ roomId, room, nowMs });
+    }
+
+    return null;
+  }
 
   const pairs = roundRobinPairings(memberUids, nextWeekIndex);
 
@@ -4503,6 +6683,7 @@ async function autoAdvanceWeekIfFinal({ roomId, room, currentWeekIndex, apiKey }
     startAtMs: window.startAtMs,
     endAtMs: window.endAtMs,
     roundLabel: window.roundLabel || null,
+    windowMode: window.windowMode || (window.roundLabel ? "round" : "fixture-cluster"),
     fixtures: window.fixtures,
     fixtureIds: window.fixtures.map((f) => f.id),
     competition,
@@ -4512,6 +6693,14 @@ async function autoAdvanceWeekIfFinal({ roomId, room, currentWeekIndex, apiKey }
   };
 
   await db.doc(`rooms/${roomId}/weeks/${String(nextWeekIndex)}`).set(weekDoc, { merge: true });
+  await writeInitialWeekResultsPlaceholder({
+    roomId,
+    weekIndex: nextWeekIndex,
+    weekDoc,
+    memberUids,
+    nowMs,
+  });
+
   const pollInfo = getNextPollAtMsFromFixtures(window.fixtures, nowMs);
 
   // Move the room forward ✅
@@ -4539,30 +6728,15 @@ async function autoAdvanceWeekIfFinal({ roomId, room, currentWeekIndex, apiKey }
     nowMs,
   });
 
-  // Create a weekResults doc so UI immediately has something
-  await db.doc(`rooms/${roomId}/weekResults/${String(nextWeekIndex)}`).set(
-    {
-      roomId,
-      weekIndex: nextWeekIndex,
-      startAtMs: window.startAtMs,
-      endAtMs: window.endAtMs,
-      roundLabel: window.roundLabel || null,
-      status: "scheduled",
-      teamScoresByUserId: {},
-      breakdownByUserId: {},
-      matchups: pairs.map((p) => ({
-        ...p,
-        homeTotal: 0,
-        awayTotal: 0,
-        homeResult: "D",
-        awayResult: "D",
-        winnerUserId: null,
-      })),
-      weekLeaderboard: [],
-      updatedAtMs: Date.now(),
-    },
-    { merge: true }
-  );
+  console.log("[autoAdvanceWeekIfFinal] created next week", {
+    roomId,
+    previousWeekIndex: currentWeekIndex,
+    nextWeekIndex,
+    roundLabel: window.roundLabel || null,
+    startAtMs: window.startAtMs,
+    endAtMs: window.endAtMs,
+    fixtureCount: Array.isArray(window.fixtures) ? window.fixtures.length : 0,
+  });
 
   return nextWeekIndex;
 }
@@ -4577,6 +6751,7 @@ async function ensureCurrentWeekIfMissing({ roomId, room, apiKey }) {
   const membersSnap = await db.collection(`rooms/${roomId}/members`).get();
   const memberUids = membersSnap.docs.map((d) => d.id).filter(Boolean);
   if (memberUids.length < 2 || memberUids.length % 2 !== 0) return null;
+  await ensureDefaultLineupsForRoom(roomId, memberUids);
 
   // determine next weekIndex
   const weeksSnap = await db.collection(`rooms/${roomId}/weeks`).get();
@@ -4604,6 +6779,7 @@ async function ensureCurrentWeekIfMissing({ roomId, room, apiKey }) {
     startAtMs: window.startAtMs,
     endAtMs: window.endAtMs,
     roundLabel: window.roundLabel || null,
+    windowMode: window.windowMode || (window.roundLabel ? "round" : "fixture-cluster"),
     fixtures: window.fixtures,
     fixtureIds: window.fixtures.map((f) => f.id),
     competition,
@@ -4613,6 +6789,14 @@ async function ensureCurrentWeekIfMissing({ roomId, room, apiKey }) {
   };
 
   await db.doc(`rooms/${roomId}/weeks/${String(weekIndex)}`).set(weekDoc, { merge: true });
+  await writeInitialWeekResultsPlaceholder({
+    roomId,
+    weekIndex,
+    weekDoc,
+    memberUids,
+    nowMs,
+  });
+
   const pollInfo = getNextPollAtMsFromFixtures(window.fixtures, nowMs);
   await db.doc(`rooms/${roomId}`).set({ currentWeekIndex: weekIndex, competition }, { merge: true });
   await setCompetitionState(
@@ -4634,31 +6818,6 @@ async function ensureCurrentWeekIfMissing({ roomId, room, apiKey }) {
     reason: "ensure-current-week",
     nowMs,
   });
-
-  // Create an empty weekResults doc so the UI has something immediately.
-  await db.doc(`rooms/${roomId}/weekResults/${String(weekIndex)}`).set(
-    {
-      roomId,
-      weekIndex,
-      startAtMs: window.startAtMs,
-      endAtMs: window.endAtMs,
-      roundLabel: window.roundLabel || null,
-      status: "scheduled",
-      teamScoresByUserId: {},
-      breakdownByUserId: {},
-      matchups: pairs.map((p) => ({
-        ...p,
-        homeTotal: 0,
-        awayTotal: 0,
-        homeResult: "D",
-        awayResult: "D",
-        winnerUserId: null,
-      })),
-      weekLeaderboard: [],
-      updatedAtMs: Date.now(),
-    },
-    { merge: true }
-  );
 
   return weekIndex;
 }
@@ -5114,37 +7273,162 @@ exports.debugComputeGlobalShadowRegularRoom = onCall(
       );
     }
 
-    const result = await computeGlobalRegularShadowResults({
+    const result = await computeRegularWeekFromGlobalCache({
       db,
       roomId,
       weekIndex: weekIndexRaw,
       nowMs: Date.now(),
+      writeMode: "shadow",
+      dryRun: true,
     });
-
-    const diffValues = Object.values(result.diffsByUid || {}).map((value) =>
-      Math.abs(Number(value || 0))
-    );
-    const maxAbsDiff = diffValues.length ? Math.max(...diffValues) : 0;
 
     return {
       ok: true,
       roomId,
       weekIndex: result.weekIndex,
       seasonKey: result.seasonKey,
-      fixtureCount: Array.isArray(result.fixtureIds) ? result.fixtureIds.length : 0,
-      missingFixtureCount: Array.isArray(result.missingFixtureIds)
-        ? result.missingFixtureIds.length
-        : 0,
+      fixtureCount: Number(result.fixtureCount || 0),
+      missingFixtureCount: Number(result.missingFixtureCount || 0),
       userCount: Number(result.userCount || 0),
-      maxAbsDiff,
+      maxAbsDiff: Number(result.maxAbsDiff || 0),
       diffsByUid: result.diffsByUid || {},
       globalTotalsByUid: result.globalTotalsByUid || {},
       legacyTotalsByUid: result.legacyTotalsByUid || {},
       fixtureCoverage: result.fixtureCoverage || [],
       playerMismatches: result.playerMismatches || [],
       statMismatches: result.statMismatches || [],
+      matchups: result.matchups || [],
+      weekLeaderboard: result.weekLeaderboard || [],
       compareScope: "current-regular-week",
       source: "global-live-fixtures",
+    };
+  }
+);
+
+exports.debugRunRegularGlobalAggregatorDryRun = onCall(
+  { region: "us-west2" },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) throw new HttpsError("unauthenticated", "Sign in required.");
+
+    const roomId = String(request.data?.roomId || "").trim();
+    const weekIndexRaw = request.data?.weekIndex;
+
+    if (!roomId) throw new HttpsError("invalid-argument", "roomId is required.");
+
+    const roomRef = db.doc(`rooms/${roomId}`);
+    const roomSnap = await roomRef.get();
+    if (!roomSnap.exists) throw new HttpsError("not-found", "Room not found.");
+
+    const room = roomSnap.data() || {};
+    if (!isHost(room, uid)) throw new HttpsError("permission-denied", "Host only.");
+
+    const phase = getRoomPhaseLabel(room);
+    if (phase === "Cup") {
+      throw new HttpsError("failed-precondition", "Room is Cup phase. This dry run is regular-season only.");
+    }
+
+    const pipelineMode = getGlobalPipelineMode(room);
+    const liveFixtureCacheEnabled =
+      isGlobalLiveFixtureCacheEnabled(room) ||
+      pipelineMode === "shadow" ||
+      pipelineMode === "global";
+
+    if (!liveFixtureCacheEnabled) {
+      throw new HttpsError(
+        "failed-precondition",
+        "Room does not have global live fixture cache enabled."
+      );
+    }
+
+    const result = await computeRegularWeekFromGlobalCache({
+      db,
+      roomId,
+      weekIndex: weekIndexRaw,
+      nowMs: Date.now(),
+      writeMode: "shadow",
+      dryRun: true,
+    });
+
+    return {
+      ok: true,
+      dryRun: true,
+      roomId,
+      weekIndex: result.weekIndex,
+      seasonKey: result.seasonKey,
+      fixtureCount: Number(result.fixtureCount || 0),
+      missingFixtureCount: Number(result.missingFixtureCount || 0),
+      userCount: Number(result.userCount || 0),
+      maxAbsDiff: Number(result.maxAbsDiff || 0),
+      diffsByUid: result.diffsByUid || {},
+      globalTotalsByUid: result.globalTotalsByUid || {},
+      legacyTotalsByUid: result.legacyTotalsByUid || {},
+      fixtureCoverage: result.fixtureCoverage || [],
+      playerMismatches: result.playerMismatches || [],
+      statMismatches: result.statMismatches || [],
+      matchups: result.matchups || [],
+      weekLeaderboard: result.weekLeaderboard || [],
+      compareScope: "current-regular-week",
+      source: "global-live-fixtures",
+    };
+  }
+);
+
+exports.debugApplyRegularGlobalAggregatorOnce = onCall(
+  { region: "us-west2" },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) throw new HttpsError("unauthenticated", "Sign in required.");
+
+    const roomId = String(request.data?.roomId || "").trim();
+    const weekIndexRaw = request.data?.weekIndex;
+
+    if (!roomId) throw new HttpsError("invalid-argument", "roomId is required.");
+
+    const roomRef = db.doc(`rooms/${roomId}`);
+    const roomSnap = await roomRef.get();
+    if (!roomSnap.exists) throw new HttpsError("not-found", "Room not found.");
+
+    const room = roomSnap.data() || {};
+    if (!isHost(room, uid)) throw new HttpsError("permission-denied", "Host only.");
+
+    const phase = getRoomPhaseLabel(room);
+    if (phase === "Cup") {
+      throw new HttpsError("failed-precondition", "Room is Cup phase. This callable is regular-season only.");
+    }
+
+    const pipelineMode = getGlobalPipelineMode(room);
+    if (pipelineMode !== "global" || !isGlobalRoomAggregatorEnabled(room)) {
+      throw new HttpsError(
+        "failed-precondition",
+        "Regular global aggregator is disabled. Set globalPipeline.mode='global' and globalPipeline.roomAggregator=true first."
+      );
+    }
+
+    const result = await computeRegularWeekFromGlobalCache({
+      db,
+      roomId,
+      weekIndex: weekIndexRaw,
+      nowMs: Date.now(),
+      writeMode: "global",
+      dryRun: false,
+    });
+
+    return {
+      ok: true,
+      realWriteApplied: Boolean(result.realWriteApplied),
+      roomId,
+      weekIndex: result.weekIndex,
+      seasonKey: result.seasonKey,
+      fixtureCount: Number(result.fixtureCount || 0),
+      missingFixtureCount: Number(result.missingFixtureCount || 0),
+      userCount: Number(result.userCount || 0),
+      maxAbsDiff: Number(result.maxAbsDiff || 0),
+      diffsByUid: result.diffsByUid || {},
+      matchups: result.matchups || [],
+      weekLeaderboard: result.weekLeaderboard || [],
+      weekStatus: result.weekStatus || null,
+      source: result.source || "global-live-fixtures",
     };
   }
 );
@@ -5189,18 +7473,29 @@ exports.debugComputeGlobalShadowCupRoom = onCall(
       nowMs: Date.now(),
     });
 
-    const diffValues = Object.values(result.diffsByUid || {}).map((value) => Math.abs(Number(value || 0)));
-    const maxAbsDiff = diffValues.length ? Math.max(...diffValues) : 0;
-
     return {
       ok: true,
       roomId,
       seasonKey: result.seasonKey,
-      fixtureCount: Array.isArray(result.fixtureIds) ? result.fixtureIds.length : 0,
-      missingFixtureCount: Array.isArray(result.missingFixtureIds) ? result.missingFixtureIds.length : 0,
+      fixtureIds: result.fixtureIds || [],
+      fixtureCount: Number(result.fixtureCount || 0),
+      missingFixtureCount: Number(result.missingFixtureCount || 0),
       userCount: Number(result.userCount || 0),
-      maxAbsDiff,
+      maxAbsDiff: Number(result.maxAbsDiff || 0),
       diffsByUid: result.diffsByUid || {},
+      globalTotalsByUid: result.globalTotalsByUid || {},
+      globalBenchTotalsByUid: result.globalBenchTotalsByUid || {},
+      globalBreakdownByUserId: result.globalBreakdownByUserId || {},
+      legacyWindowPointsByUid: result.legacyWindowPointsByUid || {},
+      legacyLivePointsByUid: result.legacyLivePointsByUid || {},
+      legacyCurrentWindowTotalsByUid: result.legacyCurrentWindowTotalsByUid || {},
+      fixtureCoverage: result.fixtureCoverage || [],
+      playerMismatches: result.playerMismatches || [],
+      statMismatches: result.statMismatches || [],
+      missingFixtureIds: result.missingFixtureIds || [],
+      missingPlayerIdsByUid: result.missingPlayerIdsByUid || {},
+      compareScope: "current-cup-window",
+      source: "global-live-fixtures",
     };
   }
 );
@@ -5449,11 +7744,118 @@ exports.pollGlobalSeasonLiveFixtures = onSchedule(
   async () => {
     const apiKey = APIFOOTBALL_KEY.value();
     const nowMs = Date.now();
-    const seasonTargets = await collectActiveSeasonFixtureTargets();            //Temp for debuging -------------------------------------------------------------
-        console.log("[pollGlobalSeasonLiveFixtures] summary", {
+    const runSweep = await shouldRunGlobalSeasonFixtureSweep(nowMs);
+
+    const [
+      queueSnap,
+      activeSnap,
+      scheduledWorldCupSnap,
+      scheduledWorldCupNestedSnap,
+      scheduledWorldCupPhaseSnap,
+      sweepSnap,
+    ] = await Promise.all([
+      db.collection("tournamentPollQueue")
+        .where("nextPollAtMs", "<=", nowMs)
+        .limit(100)
+        .get(),
+
+      db.collection("rooms")
+        .where("competitionState.weekStatus", "in", ["live", "resolving"])
+        .get(),
+
+      db.collection("rooms")
+        .where("competitionState.weekStatus", "==", "scheduled")
+        .where("engineType", "==", "worldCupDaily")
+        .limit(50)
+        .get(),
+
+      db.collection("rooms")
+        .where("competitionState.weekStatus", "==", "scheduled")
+        .where("worldCup.engineType", "==", "worldCupDaily")
+        .limit(50)
+        .get(),
+
+      db.collection("rooms")
+        .where("competitionState.weekStatus", "==", "scheduled")
+        .where("competitionState.phaseLabel", "==", "WorldCupGroup")
+        .limit(50)
+        .get(),
+
+      runSweep
+        ? db.collection("rooms")
+            .where("competitionState.weekStatus", "in", ["scheduled", "live", "resolving"])
+            .get()
+        : Promise.resolve({ docs: [], size: 0 }),
+    ]);
+
+    const roomDocsById = new Map();
+
+    for (const taskDoc of queueSnap.docs) {
+      const task = taskDoc.data() || {};
+      const roomId = String(task.roomId || taskDoc.id || "");
+      if (!roomId) continue;
+
+      const roomSnap = await db.doc(`rooms/${roomId}`).get();
+      if (!roomSnap.exists) {
+        await taskDoc.ref.delete().catch(() => {});
+        continue;
+      }
+
+      roomDocsById.set(roomId, roomSnap);
+    }
+
+    for (const roomDoc of activeSnap.docs) {
+      roomDocsById.set(roomDoc.id, roomDoc);
+    }
+
+    for (const roomDoc of scheduledWorldCupSnap.docs) {
+      roomDocsById.set(roomDoc.id, roomDoc);
+    }
+
+    for (const roomDoc of scheduledWorldCupNestedSnap.docs) {
+      roomDocsById.set(roomDoc.id, roomDoc);
+    }
+
+    for (const roomDoc of scheduledWorldCupPhaseSnap.docs) {
+      roomDocsById.set(roomDoc.id, roomDoc);
+    }
+
+    for (const roomDoc of sweepSnap.docs) {
+      roomDocsById.set(roomDoc.id, roomDoc);
+    }
+
+    const { targets: seasonTargets, stats } = await collectActiveSeasonFixtureTargets(
+      nowMs,
+      Array.from(roomDocsById.values())
+    );
+
+    console.log("[pollGlobalSeasonLiveFixtures] summary", {
       seasonTargets: seasonTargets.length,
+      queueDue: queueSnap.size,
+      activeRooms: activeSnap.size,
+      scheduledWorldCupRooms: scheduledWorldCupSnap.size,
+      scheduledWorldCupNestedRooms: scheduledWorldCupNestedSnap.size,
+      scheduledWorldCupPhaseRooms: scheduledWorldCupPhaseSnap.size,
+      sweepRooms: sweepSnap.size || 0,
+      roomsRead: roomDocsById.size,
+      sleepingRoomCount: stats.sleepingRoomCount,
+      activeRoomCount: stats.activeRoomCount,
+      skippedDoneCount: stats.skippedDoneCount,
+      runSweep,
       nowMs,
     });
+
+    console.log("[pollGlobalSeasonLiveFixtures] target roomIds", {
+      seasonTargets: seasonTargets.map((target) => ({
+        seasonKey: target.seasonKey,
+        fixtureCount: Array.isArray(target.fixtureIds) ? target.fixtureIds.length : 0,
+        roomIds: target.roomIds || [],
+      })),
+    });
+
+    if (!seasonTargets.length) {
+      console.log("[pollGlobalSeasonLiveFixtures] no active fixtures", { nowMs });
+    }
 
     for (const seasonTarget of seasonTargets) {
       try {
@@ -5490,6 +7892,33 @@ function kickoffMsFromFixture(g) {
   );
 }
 
+function shouldPollFixtureNow(fixture, nowMs) {
+  const koMs = kickoffMsFromFixture(fixture);
+  if (!Number.isFinite(koMs)) return false;
+  return nowMs >= koMs - TOURNAMENT_PRE_MS && nowMs <= koMs + TOURNAMENT_POST_MS;
+}
+
+function filterFixturesForActivePolling(fixtures, nowMs) {
+  return (Array.isArray(fixtures) ? fixtures : []).filter((fixture) =>
+    shouldPollFixtureNow(fixture, nowMs)
+  );
+}
+
+function getActivePollingFixtures(fixtures, nowMs) {
+  return filterFixturesForActivePolling(fixtures, nowMs);
+}
+
+function getActivePollingFixtureIds(fixtures, nowMs) {
+  return extractFixtureIdsFromWeekDoc({
+    fixtures: getActivePollingFixtures(fixtures, nowMs),
+    fixtureIds: [],
+  });
+}
+
+function hasActivePollingFixture(fixtures, nowMs) {
+  return getActivePollingFixtureIds(fixtures, nowMs).length > 0;
+}
+
 function getFutureKickoffs(fixtures, nowMs) {
   return (Array.isArray(fixtures) ? fixtures : [])
     .map(kickoffMsFromFixture)
@@ -5499,6 +7928,17 @@ function getFutureKickoffs(fixtures, nowMs) {
 }
 
 function getNextPollAtMsFromFixtures(fixtures, nowMs) {
+  const activeFixtureIds = getActivePollingFixtureIds(fixtures, nowMs);
+
+  if (activeFixtureIds.length > 0) {
+    return {
+      nextKickoffMs: null,
+      nextPollAtMs: nowMs + TOURNAMENT_ACTIVE_POLL_MS,
+      reason: "active-fixture-window",
+      activeFixtureIds,
+    };
+  }
+
   const futureKickoffs = getFutureKickoffs(fixtures, nowMs);
   const nextKickoffMs = futureKickoffs[0] || null;
 
@@ -5515,6 +7955,23 @@ function getNextPollAtMsFromFixtures(fixtures, nowMs) {
     nextKickoffMs,
     nextPollAtMs: Math.max(nowMs + TOURNAMENT_ACTIVE_POLL_MS, nextKickoffMs - TOURNAMENT_PRE_MS),
     reason: "next-kickoff-minus-20min",
+  };
+}
+
+function buildTournamentPollDebugLabels(room, nextPollAtMs, nextKickoffMs) {
+  const timeZone = getRoomTimeZone(room || {});
+  const hasNextPollAtMs = nextPollAtMs != null && nextPollAtMs !== "";
+  const hasNextKickoffMs = nextKickoffMs != null && nextKickoffMs !== "";
+  const safeNextPollAtMs = hasNextPollAtMs ? Number(nextPollAtMs) : NaN;
+  const safeNextKickoffMs = hasNextKickoffMs ? Number(nextKickoffMs) : NaN;
+
+  return {
+    nextPollAtLabel: Number.isFinite(safeNextPollAtMs)
+      ? formatWhen(safeNextPollAtMs, timeZone)
+      : null,
+    nextKickoffLabel: Number.isFinite(safeNextKickoffMs)
+      ? formatWhen(safeNextKickoffMs, timeZone)
+      : null,
   };
 }
 
@@ -5536,6 +7993,7 @@ async function upsertTournamentPollTask({
       roomId,
       phase,
       nextPollAtMs: safeNextPollAtMs,
+      nextPollAtLabel: formatWhen(safeNextPollAtMs, "America/Los_Angeles"),
       reason,
       updatedAtMs: nowMs,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -5574,6 +8032,30 @@ async function shouldRunTournamentSweep(nowMs) {
   return shouldSweep;
 }
 
+async function shouldRunGlobalSeasonFixtureSweep(nowMs) {
+  const sweepRef = db.doc("system/globalSeasonFixturePollSweep");
+  let shouldSweep = false;
+
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(sweepRef);
+    const lastSweepAtMs = snap.exists ? Number(snap.data()?.lastSweepAtMs || 0) : 0;
+
+    if (!lastSweepAtMs || nowMs - lastSweepAtMs >= TOURNAMENT_SWEEP_MS) {
+      shouldSweep = true;
+      tx.set(
+        sweepRef,
+        {
+          lastSweepAtMs: nowMs,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+    }
+  });
+
+  return shouldSweep;
+}
+
 exports.pollLiveTournamentWeeks = onSchedule(
   { schedule: "*/1 * * * *", timeZone: "America/Los_Angeles", region: "us-west2", secrets: [APIFOOTBALL_KEY] },
   async () => {
@@ -5585,6 +8067,10 @@ exports.pollLiveTournamentWeeks = onSchedule(
     const [
       queueSnap,
       activeSnap,
+      scheduledWorldCupSnap,
+      scheduledWorldCupNestedSnap,
+      scheduledWorldCupPhaseSnap,
+      scheduledGlobalSnap,
       sweepSnap,
     ] = await Promise.all([
       // ✅ Main cheap path: only rooms whose wake time is due.
@@ -5599,6 +8085,30 @@ exports.pollLiveTournamentWeeks = onSchedule(
         .get(),
 
       // ✅ Hourly safety check for scheduled rooms without queue/missing kickoff.
+      db.collection("rooms")
+        .where("competitionState.weekStatus", "==", "scheduled")
+        .where("engineType", "==", "worldCupDaily")
+        .limit(50)
+        .get(),
+
+      db.collection("rooms")
+        .where("competitionState.weekStatus", "==", "scheduled")
+        .where("worldCup.engineType", "==", "worldCupDaily")
+        .limit(50)
+        .get(),
+
+      db.collection("rooms")
+        .where("competitionState.weekStatus", "==", "scheduled")
+        .where("competitionState.phaseLabel", "==", "WorldCupGroup")
+        .limit(50)
+        .get(),
+
+      db.collection("rooms")
+        .where("competitionState.weekStatus", "==", "scheduled")
+        .where("globalPipeline.mode", "==", "global")
+        .limit(50)
+        .get(),
+
       runSweep
         ? db.collection("rooms")
             .where("competitionState.weekStatus", "==", "scheduled")
@@ -5628,6 +8138,22 @@ exports.pollLiveTournamentWeeks = onSchedule(
       roomDocsById.set(roomDoc.id, roomDoc);
     }
 
+    for (const roomDoc of scheduledWorldCupSnap.docs) {
+      roomDocsById.set(roomDoc.id, roomDoc);
+    }
+
+    for (const roomDoc of scheduledWorldCupNestedSnap.docs) {
+      roomDocsById.set(roomDoc.id, roomDoc);
+    }
+
+    for (const roomDoc of scheduledWorldCupPhaseSnap.docs) {
+      roomDocsById.set(roomDoc.id, roomDoc);
+    }
+
+    for (const roomDoc of scheduledGlobalSnap.docs) {
+      roomDocsById.set(roomDoc.id, roomDoc);
+    }
+
     // Hourly sweep: keeps old/missing queue rooms from being forgotten.
     for (const roomDoc of sweepSnap.docs) {
       roomDocsById.set(roomDoc.id, roomDoc);
@@ -5639,6 +8165,10 @@ exports.pollLiveTournamentWeeks = onSchedule(
       roomsFound: roomDocs.length,
       queueDue: queueSnap.size,
       activeRooms: activeSnap.size,
+      scheduledWorldCupRooms: scheduledWorldCupSnap.size,
+      scheduledWorldCupNestedRooms: scheduledWorldCupNestedSnap.size,
+      scheduledWorldCupPhaseRooms: scheduledWorldCupPhaseSnap.size,
+      scheduledGlobalRooms: scheduledGlobalSnap.size,
       sweepRooms: sweepSnap.size || 0,
       runSweep,
       nowMs,
@@ -5651,15 +8181,78 @@ exports.pollLiveTournamentWeeks = onSchedule(
 
       try {
         const competitionState = getCompetitionState(room);
-        const weekStatus = String(competitionState?.weekStatus || "").toLowerCase();
-
-        // If room is no longer active/scheduled, remove it from the queue.
-        if (!["scheduled", "live", "resolving"].includes(weekStatus)) {
+        if (String(room?.seasonPhase || "").toUpperCase() === "COMPLETE" || competitionState?.isDone === true) {
           await deleteTournamentPollTask(roomId);
           continue;
         }
 
+        const weekStatus = String(competitionState?.weekStatus || "").toLowerCase();
         const phase = getRoomPhaseLabel(room);
+        const engineType = String(room?.engineType || room?.worldCup?.engineType || "").trim();
+        const isWorldCupDailyRoom =
+          engineType === "worldCupDaily" ||
+          phase === "WorldCupGroup" ||
+          competitionState?.phaseLabel === "WorldCupGroup";
+
+        // If room is no longer active/scheduled, remove it from the queue.
+        if (!["scheduled", "live", "resolving"].includes(weekStatus)) {
+          if (!isWorldCupDailyRoom || weekStatus !== "idle") {
+            await deleteTournamentPollTask(roomId);
+            continue;
+          }
+        }
+
+        // -------------------------
+        // WORLD CUP GROUP ROOMS
+        // -------------------------
+        if (isWorldCupDailyRoom) {
+          if (weekStatus === "scheduled") {
+            console.log("[pollLiveTournamentWeeks] world cup scheduled room checked", {
+              roomId,
+              engineType: room?.engineType || room?.worldCup?.engineType || "",
+              worldCupPhase: room?.worldCupPhase || room?.worldCup?.phase || "",
+              weekStatus: competitionState?.weekStatus || null,
+            });
+          }
+
+          console.log("[pollLiveTournamentWeeks] running world cup daily engine", {
+            roomId,
+            weekStatus,
+            nowMs,
+          });
+
+          const result = await runWorldCupGroupEngine({
+            db,
+            roomId,
+            room,
+            nowMs,
+            apiKey,
+            getFixtureStatusMap,
+            getFixturePlayersStatsMapCached,
+            setCompetitionState,
+            ensureDefaultLineupsForRoom,
+          });
+
+          const resultWeekStatus = String(result?.weekStatus || result?.status || "").toLowerCase();
+          if (!["scheduled", "live", "resolving"].includes(resultWeekStatus)) {
+            await deleteTournamentPollTask(roomId);
+            continue;
+          }
+
+          const nextPollAtMs = Number(result?.nextPollAtMs || 0);
+          await upsertTournamentPollTask({
+            roomId,
+            phase: "WorldCupGroup",
+            nextPollAtMs:
+              Number.isFinite(nextPollAtMs) && nextPollAtMs > nowMs
+                ? nextPollAtMs
+                : nowMs + TOURNAMENT_UNKNOWN_RECHECK_MS,
+            reason: "world-cup-daily-engine-next",
+            nowMs,
+          });
+
+          continue;
+        }
 
         // -------------------------
         // CUP ROOMS
@@ -5769,13 +8362,33 @@ exports.pollLiveTournamentWeeks = onSchedule(
           });
 
           if (!nextIdx) {
+            const holdPollAtMs = getRegularFinalHoldPollAtMs(week, nowMs);
+            const nextPollAtMs =
+              holdPollAtMs > nowMs ? holdPollAtMs : nowMs + TOURNAMENT_UNKNOWN_RECHECK_MS;
+            await setCompetitionState(
+              roomRef,
+              {
+                weekStatus: "scheduled",
+                nextPollAtMs,
+                nextKickoffMs: null,
+                ...buildTournamentPollDebugLabels(room, nextPollAtMs, null),
+              },
+              {
+                roomData: { ...room, competitionState },
+                nowMs,
+              }
+            );
             await upsertTournamentPollTask({
               roomId,
               phase: phase || "RegularSeason",
-              nextPollAtMs: nowMs + TOURNAMENT_UNKNOWN_RECHECK_MS,
-              reason: "final-no-next-week",
+              nextPollAtMs,
+              reason: holdPollAtMs > nowMs ? "regular-final-hold" : "final-no-next-week",
               nowMs,
             });
+            continue;
+          }
+
+          if (nextIdx === "COMPLETE") {
             continue;
           }
 
@@ -5800,10 +8413,11 @@ exports.pollLiveTournamentWeeks = onSchedule(
         const fixtures = Array.isArray(week.fixtures) ? week.fixtures : [];
 
         if (!fixtures.length) {
+          const nextPollAtMs = nowMs + TOURNAMENT_UNKNOWN_RECHECK_MS;
           await upsertTournamentPollTask({
             roomId,
             phase: phase || "RegularSeason",
-            nextPollAtMs: nowMs + TOURNAMENT_UNKNOWN_RECHECK_MS,
+            nextPollAtMs,
             reason: "no-fixtures",
             nowMs,
           });
@@ -5812,7 +8426,9 @@ exports.pollLiveTournamentWeeks = onSchedule(
             roomRef,
             {
               weekStatus: "scheduled",
-              nextPollAtMs: nowMs + TOURNAMENT_UNKNOWN_RECHECK_MS,
+              nextPollAtMs,
+              nextKickoffMs: null,
+              ...buildTournamentPollDebugLabels(room, nextPollAtMs, null),
             },
             {
               roomData: { ...room, competitionState },
@@ -5823,30 +8439,70 @@ exports.pollLiveTournamentWeeks = onSchedule(
           continue;
         }
 
-        let shouldRun = false;
-
-        for (const g of fixtures) {
-          const koMs = kickoffMsFromFixture(g);
-          if (!Number.isFinite(koMs)) continue;
-
-          if (nowMs >= koMs - TOURNAMENT_PRE_MS && nowMs <= koMs + TOURNAMENT_POST_MS) {
-            shouldRun = true;
-            break;
-          }
-        }
+        const activeFixtureIds = getActivePollingFixtureIds(fixtures, nowMs);
+        const hasActiveFixture = activeFixtureIds.length > 0;
+        const shouldRun = hasActiveFixture;
 
         const sleepInfo = getNextPollAtMsFromFixtures(fixtures, nowMs);
+        const useRegularGlobalAggregator =
+          getGlobalPipelineMode(room) === "global" &&
+          isGlobalRoomAggregatorEnabled(room);
 
         console.log("[pollLiveTournamentWeeks] time gate", {
           roomId,
           weekIndex,
           shouldRun,
+          hasActiveFixture,
+          activeFixtureIds,
           nowMs,
           fixtureCount: fixtures.length,
           nextKickoffMs: sleepInfo.nextKickoffMs,
           nextPollAtMs: sleepInfo.nextPollAtMs,
           reason: sleepInfo.reason,
         });
+
+        if (hasActiveFixture) {
+          const nextPollAtMs = nowMs + TOURNAMENT_ACTIVE_POLL_MS;
+          console.log("[pollLiveTournamentWeeks] active fixture wake guard", {
+            roomId,
+            weekIndex,
+            weekStatus,
+            activeFixtureIds,
+            nowMs,
+            nextPollAtMs,
+          });
+
+          if (useRegularGlobalAggregator && weekStatus === "scheduled") {
+            console.log("[pollLiveTournamentWeeks] scheduled global room auto-woke from active fixture window", {
+              roomId,
+              weekIndex,
+              activeFixtureIds,
+            });
+          }
+
+          await Promise.all([
+            upsertTournamentPollTask({
+              roomId,
+              phase: phase || "RegularSeason",
+              nextPollAtMs,
+              reason: "active-fixture-window-guard",
+              nowMs,
+            }),
+            setCompetitionState(
+              roomRef,
+              {
+                weekStatus: "live",
+                nextPollAtMs,
+                nextKickoffMs: null,
+                ...buildTournamentPollDebugLabels(room, nextPollAtMs, null),
+              },
+              {
+                roomData: { ...room, competitionState },
+                nowMs,
+              }
+            ),
+          ]);
+        }
 
         if (!shouldRun) {
           const endAtMs = Number(week.endAtMs || 0);
@@ -5858,16 +8514,98 @@ exports.pollLiveTournamentWeeks = onSchedule(
             endAtMs > 0 &&
             nowMs >= endAtMs + TOURNAMENT_POST_MS
           ) {
-            console.log("[pollLiveTournamentWeeks] running finalization compute", {
-              roomId,
-              weekIndex,
-            });
+            if (useRegularGlobalAggregator) {
+              console.log(`[pollLiveTournamentWeeks] regular global aggregator room=${roomId}`, {
+                roomId,
+                weekIndex,
+                reason: "finalization",
+              });
 
-            await computeAndWriteLiveWeek({
+              await refreshRegularGlobalCacheForRoom({
+                roomId,
+                room,
+                week,
+                apiKey,
+                nowMs,
+                reason: "finalization",
+                includeAllWeekFixtures: true,
+              });
+
+              const result = await computeRegularWeekFromGlobalCache({
+                db,
+                roomId,
+                weekIndex: Number(weekIndex),
+                nowMs,
+                writeMode: "global",
+                dryRun: false,
+              });
+
+              const freshAfterComputeSnap = await weekRef.get();
+              const freshAfterCompute = freshAfterComputeSnap.exists
+                ? (freshAfterComputeSnap.data() || {})
+                : {};
+
+              if (freshAfterCompute.status === "final") {
+                const holdPollAtMs = getRegularFinalHoldPollAtMs(freshAfterCompute, nowMs);
+                console.log("[pollLiveTournamentWeeks] regular global finalization catch-up", {
+                  roomId,
+                  weekIndex,
+                  endAtMs,
+                  nowMs,
+                  pastPostWindow:
+                    Boolean(result?.weekResultPayload?.pastPostWindow) ||
+                    (Number.isFinite(endAtMs) && endAtMs > 0 && nowMs >= endAtMs + TOURNAMENT_POST_MS),
+                  forcedFinalByExpiredWindow: Boolean(result?.weekResultPayload?.forcedFinalByExpiredWindow),
+                  holdPollAtMs,
+                });
+
+                if (holdPollAtMs <= nowMs) {
+                  const nextIdx = await autoAdvanceWeekIfFinal({
+                    roomId,
+                    room,
+                    currentWeekIndex: weekIndex,
+                    apiKey,
+                  });
+
+                  if (nextIdx === "COMPLETE") continue;
+                  if (nextIdx) continue;
+                }
+
+                const finalized = await putRegularFinalWeekToHoldIfNeeded({
+                  roomId,
+                  roomRef,
+                  weekRef,
+                  roomData: room,
+                  competitionState,
+                  phase: phase || "RegularSeason",
+                  nowMs,
+                });
+                if (finalized) continue;
+              }
+            } else {
+              console.log(`[pollLiveTournamentWeeks] regular legacy scorer room=${roomId}`, {
+                roomId,
+                weekIndex,
+                reason: "finalization",
+              });
+
+              await computeAndWriteLiveWeek({
+                roomId,
+                weekIndex: Number(weekIndex),
+                apiKey,
+              });
+            }
+
+            const finalized = await putRegularFinalWeekToHoldIfNeeded({
               roomId,
-              weekIndex: Number(weekIndex),
-              apiKey,
+              roomRef,
+              weekRef,
+              roomData: room,
+              competitionState,
+              phase: phase || "RegularSeason",
+              nowMs,
             });
+            if (finalized) continue;
 
             await upsertTournamentPollTask({
               roomId,
@@ -5896,6 +8634,11 @@ exports.pollLiveTournamentWeeks = onSchedule(
                 weekStatus: "scheduled",
                 nextPollAtMs: sleepInfo.nextPollAtMs,
                 nextKickoffMs: sleepInfo.nextKickoffMs,
+                ...buildTournamentPollDebugLabels(
+                  room,
+                  sleepInfo.nextPollAtMs,
+                  sleepInfo.nextKickoffMs
+                ),
               },
               {
                 roomData: { ...room, competitionState },
@@ -5908,16 +8651,241 @@ exports.pollLiveTournamentWeeks = onSchedule(
         }
 
         // ✅ Active window: now we actually compute.
-        console.log("[pollLiveTournamentWeeks] running computeAndWriteLiveWeek", {
-          roomId,
-          weekIndex,
-        });
+        let regularGlobalResult = null;
+        if (useRegularGlobalAggregator) {
+          console.log(`[pollLiveTournamentWeeks] regular global aggregator room=${roomId}`, {
+            roomId,
+            weekIndex,
+            reason: "active-window",
+          });
 
-        await computeAndWriteLiveWeek({
+          await refreshRegularGlobalCacheForRoom({
+            roomId,
+            room,
+            week,
+            apiKey,
+            nowMs,
+            reason: "active-window",
+          });
+
+          regularGlobalResult = await computeRegularWeekFromGlobalCache({
+            db,
+            roomId,
+            weekIndex: Number(weekIndex),
+            nowMs,
+            writeMode: "global",
+            dryRun: false,
+          });
+        } else {
+          console.log(`[pollLiveTournamentWeeks] regular legacy scorer room=${roomId}`, {
+            roomId,
+            weekIndex,
+            reason: "active-window",
+          });
+
+          await computeAndWriteLiveWeek({
+            roomId,
+            weekIndex: Number(weekIndex),
+            apiKey,
+          });
+        }
+
+        if (useRegularGlobalAggregator && regularGlobalResult) {
+          const resultStatus = String(
+            regularGlobalResult?.weekStatus ||
+            regularGlobalResult?.weekResultPayload?.status ||
+            ""
+          ).toLowerCase();
+          const resultNextKickoffMs = Number(
+            regularGlobalResult?.weekResultPayload?.nextKickoffMs ||
+            regularGlobalResult?.nextKickoffMs ||
+            0
+          );
+          const resultFixtureCoverage = Array.isArray(regularGlobalResult?.fixtureCoverage)
+            ? regularGlobalResult.fixtureCoverage
+            : [];
+          const resultAnyInPlay = resultFixtureCoverage.some((coverage) =>
+            isInPlay(coverage?.statusShort || coverage?.fixtureStatus || coverage?.matchStatus || "")
+          );
+          const fixtureStatuses = resultFixtureCoverage.map((coverage) => ({
+            fixtureId: coverage?.fixtureId || null,
+            statusShort:
+              coverage?.statusShort ||
+              coverage?.fixtureStatus ||
+              coverage?.matchStatus ||
+              null,
+          }));
+          const computedNextKickoffMs =
+            Number.isFinite(resultNextKickoffMs) && resultNextKickoffMs > nowMs
+              ? resultNextKickoffMs
+              : null;
+          const scheduledNextKickoffMs = computedNextKickoffMs || sleepInfo.nextKickoffMs || null;
+          const scheduledNextPollAtMs = scheduledNextKickoffMs
+            ? Math.max(nowMs + TOURNAMENT_ACTIVE_POLL_MS, scheduledNextKickoffMs - TOURNAMENT_PRE_MS)
+            : sleepInfo.nextPollAtMs;
+
+          if (resultStatus === "final") {
+            const finalized = await putRegularFinalWeekToHoldIfNeeded({
+              roomId,
+              roomRef,
+              weekRef,
+              roomData: room,
+              competitionState,
+              phase: phase || "RegularSeason",
+              nowMs,
+            });
+            const fallbackNextPollAtMs = getRegularFinalHoldPollAtMs(
+              { finalizedAtMs: nowMs },
+              nowMs
+            );
+
+            console.log("[pollLiveTournamentWeeks] global active result scheduling", {
+              roomId,
+              weekIndex,
+              resultStatus,
+              nextKickoffMs: null,
+              nextPollAtMs: finalized ? null : fallbackNextPollAtMs,
+              reason: finalized ? "regular-global-final-hold" : "regular-global-final-hold-fallback",
+            });
+
+            if (!finalized) {
+              await Promise.all([
+                upsertTournamentPollTask({
+                  roomId,
+                  phase: phase || "RegularSeason",
+                  nextPollAtMs: fallbackNextPollAtMs,
+                  reason: "regular-global-final-hold-fallback",
+                  nowMs,
+                }),
+                setCompetitionState(
+                  roomRef,
+                  {
+                    weekStatus: "scheduled",
+                    nextPollAtMs: fallbackNextPollAtMs,
+                    nextKickoffMs: null,
+                    ...buildTournamentPollDebugLabels(room, fallbackNextPollAtMs, null),
+                  },
+                  {
+                    roomData: { ...room, competitionState },
+                    nowMs,
+                  }
+                ),
+              ]);
+            }
+
+            continue;
+          }
+
+          if (resultStatus === "idle" && hasActiveFixture) {
+            const nextPollAtMs = nowMs + TOURNAMENT_ACTIVE_POLL_MS;
+            await Promise.all([
+              setCompetitionState(
+                roomRef,
+                {
+                  weekStatus: "live",
+                  nextKickoffMs: null,
+                  nextPollAtMs,
+                  ...buildTournamentPollDebugLabels(room, nextPollAtMs, null),
+                },
+                {
+                  roomData: { ...room, competitionState },
+                  nowMs,
+                }
+              ),
+              upsertTournamentPollTask({
+                roomId,
+                phase: "RegularSeason",
+                nextPollAtMs,
+                reason: "regular-global-idle-but-active-fixture-window",
+                nowMs,
+              }),
+            ]);
+
+            console.log("[pollLiveTournamentWeeks] regular global idle but active fixture window", {
+              roomId,
+              weekIndex,
+              resultStatus,
+              activeFixtureIds,
+              nextPollAtMs,
+            });
+
+            continue;
+          }
+
+          if (resultStatus === "idle" && !hasActiveFixture) {
+            console.log("[pollLiveTournamentWeeks] global active result scheduling", {
+              roomId,
+              weekIndex,
+              resultStatus,
+              resultAnyInPlay,
+              fixtureStatuses,
+              nextKickoffMs: scheduledNextKickoffMs,
+              nextPollAtMs: scheduledNextPollAtMs,
+              reason: "regular-global-idle-after-compute",
+            });
+
+            await Promise.all([
+              upsertTournamentPollTask({
+                roomId,
+                phase: phase || "RegularSeason",
+                nextPollAtMs: scheduledNextPollAtMs,
+                reason: "regular-global-idle-after-compute",
+                nowMs,
+              }),
+              setCompetitionState(
+                roomRef,
+                {
+                  weekStatus: "scheduled",
+                  nextPollAtMs: scheduledNextPollAtMs,
+                  nextKickoffMs: scheduledNextKickoffMs,
+                  ...buildTournamentPollDebugLabels(
+                    room,
+                    scheduledNextPollAtMs,
+                    scheduledNextKickoffMs
+                  ),
+                },
+                {
+                  roomData: { ...room, competitionState },
+                  nowMs,
+                }
+              ),
+            ]);
+
+            continue;
+          }
+        }
+
+        const finalized = await putRegularFinalWeekToHoldIfNeeded({
           roomId,
-          weekIndex: Number(weekIndex),
-          apiKey,
+          roomRef,
+          weekRef,
+          roomData: room,
+          competitionState,
+          phase: phase || "RegularSeason",
+          nowMs,
         });
+        if (finalized) continue;
+
+        if (useRegularGlobalAggregator && regularGlobalResult) {
+          const resultStatus = String(
+            regularGlobalResult?.weekStatus ||
+            regularGlobalResult?.weekResultPayload?.status ||
+            ""
+          ).toLowerCase();
+          const resultFixtureCoverage = Array.isArray(regularGlobalResult?.fixtureCoverage)
+            ? regularGlobalResult.fixtureCoverage
+            : [];
+          const resultAnyInPlay = resultFixtureCoverage.some((coverage) =>
+            isInPlay(coverage?.statusShort || coverage?.fixtureStatus || coverage?.matchStatus || "")
+          );
+
+          console.warn("[pollLiveTournamentWeeks] global result fell through to active polling", {
+            roomId,
+            weekIndex,
+            resultStatus,
+            resultAnyInPlay,
+          });
+        }
 
         // Keep polling every minute while active.
         await Promise.all([
@@ -5934,6 +8902,12 @@ exports.pollLiveTournamentWeeks = onSchedule(
             {
               weekStatus: "live",
               nextPollAtMs: nowMs + TOURNAMENT_ACTIVE_POLL_MS,
+              nextKickoffMs: null,
+              ...buildTournamentPollDebugLabels(
+                room,
+                nowMs + TOURNAMENT_ACTIVE_POLL_MS,
+                null
+              ),
             },
             {
               roomData: { ...room, competitionState },
@@ -6927,3 +9901,142 @@ exports.resolveMarketNow = onCall({ region: "us-west2" }, async (req) => {
   if (!roomId) throw new HttpsError("invalid-argument", "roomId required.");
   return await resolveMarketForRoom(roomId, { trigger: "manual" });
 });
+
+exports.submitSupportMessage = onCall(
+  {
+    region: "us-west2",
+    secrets: [SUPPORT_EMAIL_USER, SUPPORT_EMAIL_PASS, SUPPORT_TO_EMAIL],
+    maxInstances: 5,
+  },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError(
+        "unauthenticated",
+        "You must be signed in to send feedback."
+      );
+    }
+
+    const uid = request.auth.uid;
+    const email = request.auth.token.email || "";
+    const name =
+      request.auth.token.name ||
+      request.auth.token.email ||
+      "Unknown user";
+
+    const {
+      type = "other",
+      typeLabel = "Other",
+      message = "",
+      pageUrl = "",
+      userAgent = "",
+    } = request.data || {};
+
+    const cleanMessage = String(message || "").trim();
+    const cleanType = String(type || "other").trim().slice(0, 40);
+    const cleanTypeLabel = String(typeLabel || "Other").trim().slice(0, 80);
+    const cleanPageUrl = String(pageUrl || "").trim().slice(0, 500);
+    const cleanUserAgent = String(userAgent || "").trim().slice(0, 500);
+
+    if (cleanMessage.length < 10) {
+      throw new HttpsError(
+        "invalid-argument",
+        "Message must be at least 10 characters."
+      );
+    }
+
+    if (cleanMessage.length > 2000) {
+      throw new HttpsError(
+        "invalid-argument",
+        "Message must be under 2,000 characters."
+      );
+    }
+
+    const now = Date.now();
+
+    const docRef = await db.collection("supportMessages").add({
+      uid,
+      email,
+      name,
+      type: cleanType,
+      typeLabel: cleanTypeLabel,
+      message: cleanMessage,
+      pageUrl: cleanPageUrl,
+      userAgent: cleanUserAgent,
+      status: "new",
+      source: "support_page",
+      createdAtMs: now,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+
+    const emailUser = SUPPORT_EMAIL_USER.value();
+    const emailPass = SUPPORT_EMAIL_PASS.value();
+    const supportToEmail = SUPPORT_TO_EMAIL.value();
+
+    const transporter = nodemailer.createTransport({
+      service: "gmail",
+      auth: {
+        user: emailUser,
+        pass: emailPass,
+      },
+    });
+
+    const subject = `Fútbol Fantasy Support: ${cleanTypeLabel}`;
+
+    const text = [
+      "New Fútbol Fantasy Support Message",
+      "",
+      `Type: ${cleanTypeLabel}`,
+      `Name: ${name}`,
+      `Email: ${email}`,
+      `UID: ${uid}`,
+      `Message ID: ${docRef.id}`,
+      "",
+      "Message:",
+      cleanMessage,
+      "",
+      "User Agent:",
+      cleanUserAgent || "Not provided",
+    ].join("\n");
+
+    try {
+      await transporter.sendMail({
+        from: `"Fútbol Fantasy Support" <${emailUser}>`,
+        to: supportToEmail,
+        replyTo: email || emailUser,
+        subject,
+        text,
+      });
+
+      await docRef.update({
+        emailStatus: "sent",
+        emailedAtMs: Date.now(),
+        emailedAt: FieldValue.serverTimestamp(),
+      });
+
+      logger.info("Support message sent", {
+        messageId: docRef.id,
+        uid,
+        type: cleanType,
+      });
+
+      return {
+        ok: true,
+        messageId: docRef.id,
+      };
+    } catch (err) {
+      logger.error("Support email failed", err);
+
+      await docRef.update({
+        emailStatus: "failed",
+        emailError: String(err?.message || err).slice(0, 500),
+        emailFailedAtMs: Date.now(),
+        emailFailedAt: FieldValue.serverTimestamp(),
+      });
+
+      throw new HttpsError(
+        "internal",
+        "Your message was saved, but the email failed to send."
+      );
+    }
+  }
+);

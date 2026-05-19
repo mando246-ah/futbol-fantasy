@@ -27,6 +27,23 @@ import {
 import { Avatar, AvatarImage, AvatarFallback } from "../components/ui/avatar";
 import "./Profile.css";
 
+function getRoomCompetitionLabel(r = {}) {
+  return (
+    r.competitionMeta?.name ||
+    r.competitionMeta?.label ||
+    r.competitionName ||
+    r.competition?.name ||
+    r.competition?.label ||
+    r.leagueName ||
+    r.league?.name ||
+    r.cupName ||
+    r.tournamentName ||
+    r.competitionLabel ||
+    (r.worldCupMode || r.engineType === "worldCupDaily" ? "World Cup" : "") ||
+    "Competition not set"
+  );
+}
+
 export default function Profile() {
   const [user, setUser] = useState(null);
   const [profile, setProfile] = useState(null);
@@ -128,8 +145,14 @@ export default function Profile() {
     const unsub = onSnapshot(
       q,
       (snap) => {
-        const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-        setRooms(list);
+        const ids = snap.docs
+          .map((d) => {
+            const data = d.data() || {};
+            return String(data.roomId || d.id || "").trim();
+          })
+          .filter(Boolean);
+
+        setRoomIdsByDocId(ids);
         setRoomsLoading(false);
       },
       (err) => {
@@ -180,6 +203,7 @@ export default function Profile() {
               id,
               code: r.code || id,
               name: r.name || "Room",
+              competitionLabel: getRoomCompetitionLabel(r),
               hostUid: r.hostUid || "",
               membersCount: Array.isArray(r.members) ? r.members.length : null,
               started: !!r.started,
@@ -229,6 +253,7 @@ export default function Profile() {
               // always show freshest name + code + started
               name: data.name || x.name,
               code: data.code || x.code,
+              competitionLabel: getRoomCompetitionLabel(data) || x.competitionLabel,
               started: !!data.started,
               hostUid: data.hostUid || x.hostUid,
               updatedAt:
@@ -378,16 +403,12 @@ export default function Profile() {
             <button type="button" className="profileBtn profileBtnPrimary" onClick={onSaveRemember}>
               Save preference
             </button>
-            <button type="button" className="profileBtn profileBtnOutline" onClick={applyRememberNow}>
-              Apply now (sign out)
-            </button>
+            
           </div>
 
           {savedPref ? <div className="profileSaved">Saved!</div> : null}
 
-          <p className="hint hintTop" >
-            This applies on your next sign-in. Click “Apply now” to sign out so the change takes effect immediately.
-          </p>
+          
         </section>
 
         {/* ✅ My Rooms */}
@@ -411,6 +432,9 @@ export default function Profile() {
               <div className="roomRow" key={r.id}>
                 <div className="roomInfo">
                   <div className="roomName">{r.name}</div>
+                  <div className="roomCompetition">
+                    {r.competitionLabel || "Competition not set"}
+                  </div>
 
                   <div className="roomMeta">
                     <span className="roomCode">{r.code}</span>
@@ -420,7 +444,6 @@ export default function Profile() {
                   </div>
 
                   <div className="roomBadges">
-                    {r.hostUid === user.uid ? <span className="badge badgeHost">Host</span> : null}
                     {r.started ? (
                       <span className="badge badgeLive">Live</span>
                     ) : (
