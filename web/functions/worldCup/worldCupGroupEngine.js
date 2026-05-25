@@ -12,7 +12,6 @@ const PRE_MS = 20 * 60 * 1000;
 const ACTIVE_POLL_MS = 60 * 1000;
 const UNKNOWN_RECHECK_MS = 60 * 60 * 1000;
 const POST_MS = 2 * 60 * 60 * 1000;
-const MATCH_RUNTIME_MS = 135 * 60 * 1000;
 
 function toPos(pos) {
   const s = String(pos || "").toUpperCase();
@@ -46,6 +45,10 @@ function hasFixtureStarted(short) {
   if (!s) return false;
   if (["NS", "TBD", "PST", "CANC"].includes(s)) return false;
   return true;
+}
+
+function isNotStarted(short) {
+  return ["", "NS", "TBD"].includes(String(short || "").trim().toUpperCase());
 }
 
 function kickoffMsFromFixture(fixture) {
@@ -372,34 +375,26 @@ function dayFixtureById(day = {}) {
   return map;
 }
 
-function computeDayWindowStatus({ day, fixtureIds, statusByFixtureId, nowMs }) {
+function computeDayWindowStatus({ day, fixtureIds, statusByFixtureId }) {
   const fixturesById = dayFixtureById(day);
-  const kickoffs = fixtureIds
-    .map((id) => kickoffMsFromFixture(fixturesById.get(id) || {}))
-    .filter(Number.isFinite)
-    .sort((a, b) => a - b);
-
   const statuses = fixtureIds.map((id) =>
     String(statusByFixtureId[id] || fixturesById.get(id)?.statusShort || "").toUpperCase()
   );
 
   const anyInPlay = statuses.some(isInPlay);
   const allFinished = statuses.length > 0 && statuses.every(isFinished);
-  const anyStarted =
-    statuses.some(hasFixtureStarted) ||
-    kickoffs.some((ko) => nowMs >= ko && nowMs <= ko + MATCH_RUNTIME_MS);
-  const lastKickoffMs = toNumber(day.lastKickoffMs, kickoffs[kickoffs.length - 1] || NaN);
+  const allNotStarted = statuses.length > 0 && statuses.every(isNotStarted);
 
-  if (allFinished && (!Number.isFinite(lastKickoffMs) || nowMs >= lastKickoffMs + POST_MS)) {
+  if (anyInPlay) {
+    return "live";
+  }
+
+  if (allFinished) {
     return "final";
   }
 
-  if (
-    anyInPlay ||
-    anyStarted ||
-    kickoffs.some((ko) => nowMs >= ko - PRE_MS && nowMs <= ko + MATCH_RUNTIME_MS)
-  ) {
-    return "live";
+  if (allNotStarted) {
+    return "scheduled";
   }
 
   return "scheduled";
@@ -835,7 +830,6 @@ async function runWorldCupGroupEngine({
     day: currentDay,
     fixtureIds,
     statusByFixtureId,
-    nowMs,
   });
 
   const {

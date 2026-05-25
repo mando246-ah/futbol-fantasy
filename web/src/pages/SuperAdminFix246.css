@@ -1,0 +1,619 @@
+.ownerStatusPage {
+  min-height: 100vh;
+  padding: 32px clamp(16px, 4vw, 48px) 56px;
+  color: rgba(255, 255, 255, 0.92);
+  background:
+    radial-gradient(circle at 12% 10%, rgba(34, 211, 238, 0.18), transparent 28%),
+    radial-gradient(circle at 88% 4%, rgba(250, 204, 21, 0.18), transparent 26%),
+    linear-gradient(135deg, #06111f 0%, #0f172a 52%, #111827 100%);
+}
+
+.ownerHero {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 22px;
+  padding: 24px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 26px;
+  background: rgba(15, 23, 42, 0.72);
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(16px);
+}
+
+.ownerEyebrow {
+  margin: 0 0 6px;
+  color: #fde68a;
+  font-size: 0.82rem;
+  font-weight: 900;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.ownerHero h1 {
+  margin: 0;
+  font-size: clamp(2.1rem, 4vw, 4rem);
+  line-height: 0.92;
+}
+
+.ownerIntro {
+  max-width: 700px;
+  margin: 12px 0 0;
+  color: rgba(226, 232, 240, 0.8);
+}
+
+.ownerRefreshBtn {
+  flex: 0 0 auto;
+  padding: 11px 16px;
+  border: 1px solid rgba(250, 204, 21, 0.45);
+  border-radius: 999px;
+  color: #111827;
+  background: linear-gradient(135deg, #fde047, #22d3ee);
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.ownerRefreshBtn:disabled {
+  cursor: wait;
+  opacity: 0.7;
+}
+
+.ownerError,
+.ownerLoading {
+  margin: 18px 0;
+  padding: 14px 16px;
+  border-radius: 18px;
+  font-weight: 800;
+}
+
+.ownerError {
+  border: 1px solid rgba(248, 113, 113, 0.45);
+  background: rgba(127, 29, 29, 0.36);
+  color: #fecaca;
+}
+
+.ownerLoading {
+  border: 1px solid rgba(125, 211, 252, 0.32);
+  background: rgba(14, 165, 233, 0.12);
+  color: #bae6fd;
+}
+
+.ownerSummaryGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.ownerSummaryCard,
+.ownerGroupCard {
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  background: rgba(15, 23, 42, 0.68);
+  box-shadow: 0 20px 55px rgba(0, 0, 0, 0.2);
+  backdrop-filter: blur(14px);
+}
+
+.ownerSummaryCard {
+  padding: 16px;
+  border-radius: 20px;
+}
+
+.ownerSummaryCard span {
+  display: block;
+  color: rgba(226, 232, 240, 0.72);
+  font-size: 0.82rem;
+  font-weight: 800;
+}
+
+.ownerSummaryCard strong {
+  display: block;
+  margin-top: 6px;
+  font-size: 1.4rem;
+}
+
+.ownerGroups {
+  display: grid;
+  gap: 16px;
+}
+
+.ownerGroupCard {
+  padding: 18px;
+  border-radius: 24px;
+}
+
+.ownerGroupHeader,
+.ownerGroupTitleRow,
+.ownerGroupMetrics,
+.ownerGroupMeta,
+.ownerRoomDetails {
+  display: flex;
+  align-items: center;
+}
+
+.ownerGroupHeader {
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+
+.ownerGroupTitleRow {
+  min-width: 0;
+  gap: 12px;
+}
+
+.ownerGroupLogo {
+  width: 44px;
+  height: 44px;
+  object-fit: contain;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.ownerGroupHeader h2 {
+  margin: 0;
+  font-size: 1.35rem;
+}
+
+.ownerGroupHeader p {
+  margin: 4px 0 0;
+  color: rgba(226, 232, 240, 0.66);
+  font-size: 0.86rem;
+}
+
+.ownerGroupRoomCount,
+.ownerPill,
+.ownerHealth {
+  border-radius: 999px;
+  padding: 6px 10px;
+  font-size: 0.75rem;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.ownerGroupBadges {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+}
+
+.ownerStatusLine {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: rgba(226, 232, 240, 0.72);
+  font-size: 0.8rem;
+  font-weight: 900;
+}
+
+.ownerLastUpdate {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 5px 9px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 999px;
+  color: rgba(226, 232, 240, 0.72);
+  background: rgba(15, 23, 42, 0.5);
+  font-size: 0.76rem;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.ownerGroupRoomCount {
+  border: 1px solid rgba(250, 204, 21, 0.35);
+  color: #fde68a;
+  background: rgba(250, 204, 21, 0.1);
+}
+
+.ownerGroupMetrics,
+.ownerGroupMeta {
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 10px 0;
+}
+
+.ownerGroupMetrics span,
+.ownerGroupMeta span {
+  padding: 7px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.55);
+  color: rgba(226, 232, 240, 0.8);
+  font-size: 0.82rem;
+}
+
+.ownerRoomList {
+  display: grid;
+  gap: 9px;
+  margin-top: 14px;
+}
+
+.ownerRoomRow {
+  display: grid;
+  grid-template-columns: minmax(180px, 260px) minmax(0, 1fr);
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 16px;
+  background: rgba(2, 6, 23, 0.3);
+}
+
+.ownerRoomRow--ignored {
+  opacity: 0.58;
+  border-style: dashed;
+  background: rgba(15, 23, 42, 0.22);
+}
+
+.ownerRoomMain {
+  min-width: 0;
+}
+
+.ownerRoomMain strong,
+.ownerRoomMain span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ownerRoomMain span {
+  margin-top: 3px;
+  color: rgba(226, 232, 240, 0.56);
+  font-size: 0.78rem;
+}
+
+.ownerRoomManageBtn {
+  margin-top: 10px;
+  padding: 7px 11px;
+  border: 1px solid rgba(34, 211, 238, 0.35);
+  border-radius: 999px;
+  color: #bae6fd;
+  background: rgba(14, 165, 233, 0.14);
+  font-size: 0.76rem;
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.ownerRoomManageBtn:hover {
+  border-color: rgba(34, 211, 238, 0.65);
+  background: rgba(14, 165, 233, 0.22);
+}
+
+.ownerRoomDetails {
+  flex-wrap: wrap;
+  gap: 7px;
+  min-width: 0;
+}
+
+.ownerRoomDetails > span:not(.ownerPill) {
+  padding: 5px 8px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.1);
+  color: rgba(226, 232, 240, 0.75);
+  font-size: 0.76rem;
+  font-weight: 800;
+}
+
+.ownerPill {
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  color: #cbd5e1;
+  background: rgba(148, 163, 184, 0.1);
+}
+
+.ownerPill--idle {
+  border-color: rgba(148, 163, 184, 0.28);
+  color: #e2e8f0;
+  background: rgba(100, 116, 139, 0.18);
+  box-shadow: 0 0 16px rgba(148, 163, 184, 0.08);
+}
+
+.ownerPill--scheduled,
+.ownerPillScheduled {
+  border-color: rgba(96, 165, 250, 0.35);
+  color: #bfdbfe;
+  background: rgba(37, 99, 235, 0.16);
+}
+
+.ownerPill--live,
+.ownerPillLive {
+  border-color: rgba(34, 197, 94, 0.42);
+  color: #bbf7d0;
+  background: rgba(22, 163, 74, 0.2);
+}
+
+.ownerPill--resolving,
+.ownerPillResolving {
+  border-color: rgba(250, 204, 21, 0.42);
+  color: #fde68a;
+  background: rgba(202, 138, 4, 0.18);
+}
+
+.ownerPill--complete,
+.ownerPillComplete {
+  border-color: rgba(167, 139, 250, 0.38);
+  color: #ddd6fe;
+  background: rgba(109, 40, 217, 0.18);
+}
+
+.ownerPill--due {
+  border-color: rgba(251, 146, 60, 0.5);
+  color: #fed7aa;
+  background: rgba(234, 88, 12, 0.2);
+}
+
+.ownerPill--problem,
+.ownerPill--stale,
+.ownerPill--missing {
+  border-color: rgba(248, 113, 113, 0.5);
+  color: #fecaca;
+  background: rgba(185, 28, 28, 0.22);
+  box-shadow: 0 0 18px rgba(248, 113, 113, 0.1);
+}
+
+.ownerPill--ignored {
+  border-color: rgba(100, 116, 139, 0.24);
+  color: rgba(203, 213, 225, 0.68);
+  background: rgba(51, 65, 85, 0.14);
+}
+
+.ownerPill--warning {
+  border-color: rgba(250, 204, 21, 0.42);
+  color: #fde68a;
+  background: rgba(202, 138, 4, 0.18);
+}
+
+.ownerPill--unknown {
+  border-color: rgba(148, 163, 184, 0.22);
+  color: rgba(203, 213, 225, 0.76);
+  background: rgba(71, 85, 105, 0.14);
+}
+
+.ownerHealth {
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  color: #cbd5e1;
+  background: rgba(148, 163, 184, 0.1);
+}
+
+.ownerHealth--ok {
+  border-color: rgba(34, 197, 94, 0.38);
+  color: #bbf7d0;
+  background: rgba(22, 163, 74, 0.16);
+}
+
+.ownerHealth--warning {
+  border-color: rgba(250, 204, 21, 0.42);
+  color: #fde68a;
+  background: rgba(202, 138, 4, 0.18);
+}
+
+.ownerHealth--problem {
+  border-color: rgba(248, 113, 113, 0.48);
+  color: #fecaca;
+  background: rgba(185, 28, 28, 0.2);
+}
+
+.ownerHealth--ignored {
+  border-color: rgba(100, 116, 139, 0.24);
+  color: rgba(203, 213, 225, 0.68);
+  background: rgba(51, 65, 85, 0.14);
+}
+
+.ownerRoomActions {
+  grid-column: 1 / -1;
+  min-width: 0;
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid rgba(250, 204, 21, 0.18);
+  border-radius: 16px;
+  background:
+    radial-gradient(circle at 12% 0%, rgba(250, 204, 21, 0.09), transparent 30%),
+    rgba(15, 23, 42, 0.7);
+}
+
+.ownerRoomWarning {
+  grid-column: 1 / -1;
+  width: fit-content;
+  max-width: 100%;
+  padding: 8px 10px;
+  border: 1px solid rgba(250, 204, 21, 0.32);
+  border-radius: 12px;
+  color: #fde68a;
+  background: rgba(202, 138, 4, 0.14);
+  font-size: 0.78rem;
+  font-weight: 900;
+  overflow-wrap: anywhere;
+}
+
+.ownerActionSection {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 14px;
+  background: rgba(2, 6, 23, 0.24);
+}
+
+.ownerActionSectionTitle {
+  margin: 0 0 9px;
+  color: #fde68a;
+  font-size: 0.82rem;
+  font-weight: 950;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.ownerActionGrid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+
+.ownerActionBtn,
+.ownerActionLogBtn {
+  border: 1px solid rgba(125, 211, 252, 0.3);
+  border-radius: 12px;
+  color: #e0f2fe;
+  background: rgba(14, 165, 233, 0.14);
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.ownerActionBtn {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  max-width: 100%;
+  padding: 9px 11px;
+  text-align: left;
+}
+
+.ownerActionBtn:hover,
+.ownerActionLogBtn:hover {
+  border-color: rgba(125, 211, 252, 0.58);
+  background: rgba(14, 165, 233, 0.22);
+}
+
+.ownerActionBtn:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.ownerActionBtn--danger {
+  border-color: rgba(248, 113, 113, 0.44);
+  color: #fecaca;
+  background: rgba(185, 28, 28, 0.2);
+}
+
+.ownerActionBtn--danger:hover {
+  border-color: rgba(248, 113, 113, 0.7);
+  background: rgba(185, 28, 28, 0.28);
+}
+
+.ownerActionBtn--shadow {
+  border-color: rgba(167, 139, 250, 0.42);
+  color: #ddd6fe;
+  background: rgba(109, 40, 217, 0.18);
+}
+
+.ownerActionBtn--shadow:hover {
+  border-color: rgba(167, 139, 250, 0.68);
+  background: rgba(109, 40, 217, 0.26);
+}
+
+.ownerActionResult,
+.ownerActionError,
+.ownerActionWarning {
+  min-width: 0;
+  padding: 10px 12px;
+  border-radius: 14px;
+  overflow-wrap: anywhere;
+}
+
+.ownerActionWarning {
+  border: 1px solid rgba(250, 204, 21, 0.24);
+  color: #fde68a;
+  background: rgba(250, 204, 21, 0.08);
+  font-size: 0.82rem;
+  font-weight: 850;
+}
+
+.ownerActionError {
+  border: 1px solid rgba(248, 113, 113, 0.42);
+  color: #fecaca;
+  background: rgba(127, 29, 29, 0.32);
+  font-weight: 850;
+}
+
+.ownerActionResult {
+  border: 1px solid rgba(34, 197, 94, 0.26);
+  color: rgba(220, 252, 231, 0.92);
+  background: rgba(22, 101, 52, 0.16);
+}
+
+.ownerActionResultHeader {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.ownerActionLogBtn {
+  padding: 6px 9px;
+  font-size: 0.74rem;
+}
+
+.ownerActionResultGrid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  min-width: 0;
+}
+
+.ownerActionResultGrid span {
+  max-width: 100%;
+  padding: 5px 8px;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.44);
+  color: rgba(226, 232, 240, 0.84);
+  font-size: 0.76rem;
+  font-weight: 800;
+  overflow-wrap: anywhere;
+}
+
+.ownerActionMuted {
+  color: rgba(203, 213, 225, 0.62);
+  font-size: 0.72rem;
+  font-weight: 800;
+}
+
+@media (max-width: 720px) {
+  .ownerStatusPage {
+    padding: 18px 12px 42px;
+  }
+
+  .ownerHero,
+  .ownerGroupHeader,
+  .ownerRoomRow {
+    display: block;
+  }
+
+  .ownerRefreshBtn,
+  .ownerGroupRoomCount {
+    margin-top: 14px;
+  }
+
+  .ownerGroupBadges {
+    justify-content: flex-start;
+    margin-top: 14px;
+  }
+
+  .ownerStatusLine,
+  .ownerLastUpdate {
+    width: 100%;
+  }
+
+  .ownerRoomDetails {
+    margin-top: 10px;
+  }
+
+  .ownerRoomActions {
+    margin-top: 12px;
+    padding: 12px;
+  }
+
+  .ownerActionBtn {
+    width: 100%;
+  }
+
+  .ownerActionResultGrid span,
+  .ownerActionLogBtn {
+    width: 100%;
+  }
+}

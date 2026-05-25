@@ -28,8 +28,12 @@ const STARTER_RULES = {
 };
 
 
-function displayNameOf(m) {
-  return m?.displayName || m?.uid || "User";
+function memberUidOf(member) {
+  return String(
+    typeof member === "string"
+      ? member
+      : member?.uid ?? member?.userId ?? member?.id ?? ""
+  ).trim();
 }
 
 function normalizeRosterPosition(pos) {
@@ -247,10 +251,42 @@ export default function DraftSummary() {
     [room?.draftOrder, members]
   );
 
-  // Profiles (photoURL + displayName) for members
-  const memberUids = useMemo(() => members.map((m) => m.uid).filter(Boolean), [members]);
+  // Profiles are the display-name source of truth; denormalized room/pick names are fallback only.
+  const memberUids = useMemo(() => {
+    const ids = new Set();
+
+    for (const m of members) {
+      const uid = memberUidOf(m);
+      if (uid) ids.add(uid);
+    }
+
+    for (const m of Array.isArray(room?.draftOrder) ? room.draftOrder : []) {
+      const uid = memberUidOf(m);
+      if (uid) ids.add(uid);
+    }
+
+    for (const p of Array.isArray(picks) ? picks : []) {
+      const uid = String(p?.uid || p?.ownerUid || "").trim();
+      if (uid) ids.add(uid);
+    }
+
+    return Array.from(ids);
+  }, [members, room?.draftOrder, picks]);
   const profilesByUid = useUserProfiles(memberUids);
-  const profileOf = (uid) => profilesByUid?.[uid] || {};
+  const profileOf = (uid) => profilesByUid?.[String(uid || "")] || {};
+  const managerName = (uid, fallback = "Manager") => {
+    const profile = profileOf(uid);
+    return profile?.displayName || profile?.name || fallback || "Manager";
+  };
+  const displayNameForMember = (member, fallback = "Manager") => {
+    const uid = memberUidOf(member);
+    return managerName(
+      uid,
+      typeof member === "string"
+        ? member
+        : member?.displayName || member?.name || member?.uid || fallback
+    );
+  };
 
 
   // Group picks by manager uid
@@ -281,8 +317,8 @@ export default function DraftSummary() {
       if (bYou && !aYou) return 1;
 
       if (sortMode === "alpha") {
-        const an = (a.manager.displayName || "").toLowerCase();
-        const bn = (b.manager.displayName || "").toLowerCase();
+        const an = managerName(a.manager.uid, a.manager.displayName || "").toLowerCase();
+        const bn = managerName(b.manager.uid, b.manager.displayName || "").toLowerCase();
         return an.localeCompare(bn);
       }
 
@@ -296,7 +332,7 @@ export default function DraftSummary() {
     });
 
     return rows;
-  }, [byManager, draftOrder, currentUid, sortMode]);
+  }, [byManager, draftOrder, currentUid, sortMode, profilesByUid]);
 
   // Header computed values
   const totalRounds = room?.totalRounds ?? 9;
@@ -336,7 +372,7 @@ export default function DraftSummary() {
               {room?.code ? `— ${room.code}` : roomId ? `— ${roomId}` : ""}
             </div>
             <div className="text-sm text-gray-600">
-              Host: <b>{displayNameOf(members.find((m) => m.uid === room?.hostUid))}</b> ·{" "}
+              Host: <b>{displayNameForMember(members.find((m) => m.uid === room?.hostUid), room?.hostUid || "Host")}</b> ·{" "}
               Status: {room?.started ? <b>Live</b> : <b>Waiting</b>} ·{" "}
               Round: <b>{Math.max(1, Math.min(roundNumber, totalRounds))}</b> / {totalRounds} ·{" "}
               Required: <b>{requiredSlot || "-"}</b>
@@ -397,12 +433,13 @@ export default function DraftSummary() {
           <div className="text-sm text-gray-600 mb-1">Members</div>
           <div className="flex flex-wrap gap-2">
               {(members || []).map((m) => {
-                const p = profileOf(m.uid);
-                const name = displayNameOf(m);
+                const uid = memberUidOf(m);
+                const p = profileOf(uid);
+                const name = displayNameForMember(m);
 
                 return (
                   <div
-                    key={m.uid}
+                    key={uid}
                     className="flex items-center gap-2 px-2 py-1 rounded bg-gray-100 text-sm"
                   >
                     <Avatar className="h-6 w-6">
@@ -477,6 +514,7 @@ export default function DraftSummary() {
             picks={picks}
             totalRounds={totalRounds}
             photoURL={profileOf(manager.uid).photoURL || ""}
+            displayName={managerName(manager.uid, manager.displayName || manager.uid)}
             teamName={teamNamesByUid[manager.uid] || ""}
             roomId={roomId}
             room={room}
@@ -506,8 +544,8 @@ export default function DraftSummary() {
   );
 }
 
-function ManagerRosterCard({ manager, picks, totalRounds, photoURL, teamName, roomId, myUid, room }) {
-  const name = displayNameOf(manager);
+function ManagerRosterCard({ manager, picks, totalRounds, photoURL, displayName, teamName, roomId, myUid, room }) {
+  const name = displayName || manager?.displayName || manager?.uid || "Manager";
   const showTeamName = teamName?.trim();
   const title = showTeamName ? `${name} — ${showTeamName}` : name;
   const lineupRoomId = roomId;
@@ -972,7 +1010,7 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, teamName, ro
     <div className="rosterManagerCard rounded-2xl border border-slate-200 bg-white shadow-sm p-4">
       <div className="flex items-center gap-3 mb-1">
         <Avatar className="h-10 w-10 border">
-          <AvatarImage src={photoURL || ""} alt={displayNameOf(manager)} />
+          <AvatarImage src={photoURL || ""} alt={name} />
           <AvatarFallback className="font-bold">
             {(name || "U").slice(0, 2).toUpperCase()}
           </AvatarFallback>
@@ -989,7 +1027,7 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, teamName, ro
               title="Edit team name"
               aria-label="Edit team name"
             >
-              ✏️
+             ✏️
             </button>
           )}
         </div>

@@ -505,7 +505,8 @@ export function watchRoom(roomId, cb) {
 /* =========================
    Draft helpers
    ========================= */
-const TURN_SECONDS = 120; // used for deadline; UI can show a small timer
+const DRAFT_TURN_SECONDS = 45;
+const DRAFT_TURN_MS = DRAFT_TURN_SECONDS * 1000;
 const DEFAULT_DRAFT_PLAN = ["ATT", "ATT", "MID", "MID", "DEF", "DEF", "GK", "SUB", "SUB"];
 
 function requireUser() {
@@ -520,6 +521,43 @@ function shuffleArray(arr) {
     [a[i], a[j]] = [a[j], a[i]];
   }
   return a;
+}
+
+function draftMemberUid(member) {
+  return String(
+    typeof member === "string"
+      ? member
+      : member?.uid ?? member?.userId ?? member?.id ?? ""
+  ).trim();
+}
+
+function getDraftManagerCount(room = {}) {
+  const members = Array.isArray(room?.members) ? room.members : [];
+  const memberUids = members.map(draftMemberUid).filter(Boolean);
+  return new Set(memberUids).size || members.length;
+}
+
+function assertDraftManagerCount(room = {}) {
+  const managerCount = getDraftManagerCount(room);
+
+  if (managerCount < 2) {
+    throw new Error("Need at least 2 managers to start a draft.");
+  }
+
+  if (managerCount % 2 !== 0) {
+    throw new Error("Regular Season head-to-head rooms need an even number of managers.");
+  }
+
+  return managerCount;
+}
+
+function getDraftTurnMs(room = {}) {
+  const turnSeconds = Number(room?.turnSeconds || DRAFT_TURN_SECONDS);
+  const safeSeconds = Math.max(
+    10,
+    Math.min(300, Number.isFinite(turnSeconds) ? turnSeconds : DRAFT_TURN_SECONDS)
+  );
+  return safeSeconds * 1000;
 }
 
 
@@ -541,7 +579,7 @@ export async function callMaybeStartDraft({ roomId }) {
 
     if (startAtMillis && now >= startAtMillis) {
       const members = Array.isArray(room.members) ? room.members : [];
-      if (members.length === 0) throw new Error("No members to start draft");
+      assertDraftManagerCount(room);
       const draftOrder = room.draftOrder?.length ? room.draftOrder : shuffleArray(members);
       const ti = Number.isFinite(room.turnIndex) ? room.turnIndex : 0;
       tx.update(roomRef, {
@@ -549,7 +587,8 @@ export async function callMaybeStartDraft({ roomId }) {
         startedAt: serverTimestamp(),
         draftOrder,
         turnIndex: ti,
-        turnDeadlineAt: now + TURN_SECONDS * 1000,
+        turnSeconds: DRAFT_TURN_SECONDS,
+        turnDeadlineAt: now + DRAFT_TURN_MS,
         updatedAt: serverTimestamp(),
       });
     }
@@ -568,16 +607,18 @@ export async function callStartDraftNow({ roomId }) {
     if (room.hostUid !== user.uid) throw new Error("Only host can start");
 
     const members = Array.isArray(room.members) ? room.members : [];
-    if (members.length === 0) throw new Error("No members to start draft");
+    assertDraftManagerCount(room);
 
     const draftOrder = room.draftOrder?.length ? room.draftOrder : shuffleArray(members);
     const ti = Number.isFinite(room.turnIndex) ? room.turnIndex : 0;
+    const now = Date.now();
     tx.update(roomRef, {
       started: true,
       startedAt: serverTimestamp(),
       draftOrder,
       turnIndex: ti,
-      turnDeadlineAt: Date.now() + TURN_SECONDS * 1000,
+      turnSeconds: DRAFT_TURN_SECONDS,
+      turnDeadlineAt: now + DRAFT_TURN_MS,
       updatedAt: serverTimestamp(),
     });
   });
@@ -640,13 +681,14 @@ export async function callMakePick({
     if (existingPick.exists()) throw new Error("Player already picked");
 
     const pickerName =
-      user.displayName ||
       (await getDisplayNameFallback(tx, user.uid)) ||
+      user.displayName ||
+      user.email ||
       "Manager";
 
     const now = Date.now();
     const nextTurnIndex = turnIndex + 1;
-    const nextDeadline = (nextTurnIndex < maxPicks) ? now + TURN_SECONDS * 1000 : null;
+    const nextDeadline = (nextTurnIndex < maxPicks) ? now + getDraftTurnMs(room) : null;
 
     tx.set(pickRef, {
       playerId: pid,
@@ -729,13 +771,13 @@ export async function callAutoPick({ roomId, candidates }) {
     const pickRef = doc(db, "rooms", roomId, "picks", pid);
 
     const pickerName =
-      picker.displayName ||
       (await getDisplayNameFallback(tx, picker.uid)) ||
+      picker.displayName ||
       "Manager";
 
     const now = Date.now();
     const nextTurnIndex = turnIndex + 1;
-    const nextDeadline = (nextTurnIndex < maxPicks) ? now + TURN_SECONDS * 1000 : null;
+    const nextDeadline = (nextTurnIndex < maxPicks) ? now + getDraftTurnMs(room) : null;
 
     tx.set(pickRef, {
       playerId: pid,
@@ -1242,7 +1284,9 @@ export async function marketResolve({ roomId }) {
 async function getDisplayNameFallback(tx, uid) {
   const uref = doc(db, "users", uid);
   const usnap = await tx.get(uref);
-  return usnap.exists() ? usnap.data()?.displayName : null;
+  if (!usnap.exists()) return null;
+  const data = usnap.data() || {};
+  return data.displayName || data.name || null;
 }
 
 // -------------------------

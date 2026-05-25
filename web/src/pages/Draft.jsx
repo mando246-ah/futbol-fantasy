@@ -104,7 +104,6 @@ const MOCK_PLAYERS = [
 ];
 
 
-
 const fnScheduleDraft = httpsCallable(functions, "scheduleDraft");
 
 // ----- Helpers -----  
@@ -115,10 +114,6 @@ function roundOrder(order, roundIndex) {
   if (!order?.length) return [];
   return roundIndex % 2 === 0 ? order : [...order].reverse();
 }
-function displayNameOf(m, fallback = "User") {
-  return m?.displayName || m?.uid || fallback;
-}
-
 function memberUidOf(member) {
   return String(
     typeof member === "string"
@@ -143,10 +138,15 @@ function getRoomMemberCount(room, members) {
   return fromMembersState || fromRoom || 0;
 }
 
+function getDraftTurnSeconds(room) {
+  const n = Number(room?.turnSeconds);
+  return Number.isFinite(n) && n > 0 ? n : TURN_SECONDS;
+}
+
 function getEstimatedDraftDurationSeconds(room, members) {
   const managerCount = getRoomMemberCount(room, members);
   const totalRounds = Number(room?.totalRounds ?? DRAFT_SIZE_LEAGUE);
-  return Math.max(0, managerCount * totalRounds * TURN_SECONDS);
+  return Math.max(0, managerCount * totalRounds * getDraftTurnSeconds(room));
 }
 
 function isUserRoomMember(room, uid) {
@@ -346,21 +346,70 @@ export default function DraftWithPresence() {
   // User in room 
   const [joinAttempted, setJoinAttempted] = useState(false);
 
-  const managerLabel = (uid, fallback = "Someone") => {
-    const key = String(uid || "");
-    return memberLabelByUid[key] || fallback;
-  };
-
   const membersKey = useMemo(() => (members || []).join("|"), [members]);
   const managerCount = useMemo(
     () => getRoomMemberCount(room, members),
     [room?.members, members]
   );
+  const hasEnoughManagers = managerCount >= 2;
+  const hasEvenManagers = managerCount % 2 === 0;
+  const canStartByManagerCount = hasEnoughManagers && hasEvenManagers;
+  const draftTurnSeconds = getDraftTurnSeconds(room);
   const estimatedDraftDurationLabel = useMemo(
     () => formatDraftDuration(getEstimatedDraftDurationSeconds(room, members)),
-    [room?.totalRounds, room?.members, members]
+    [room?.totalRounds, room?.members, room?.turnSeconds, members]
   );
   const roomIsFull = managerCount >= MAX_ROOM_MANAGERS;
+
+  const memberUids = useMemo(() => {
+    const ids = new Set();
+
+    for (const m of Array.isArray(room?.members) ? room.members : []) {
+      const uid = memberUidOf(m);
+      if (uid) ids.add(uid);
+    }
+
+    for (const m of Array.isArray(room?.draftOrder) ? room.draftOrder : []) {
+      const uid = memberUidOf(m);
+      if (uid) ids.add(uid);
+    }
+
+    for (const p of Array.isArray(picks) ? picks : []) {
+      const uid = String(p?.uid || p?.ownerUid || "").trim();
+      if (uid) ids.add(uid);
+    }
+
+    return Array.from(ids);
+  }, [room?.members, room?.draftOrder, picks]);
+  const profilesByUid = useUserProfiles(memberUids);
+
+  function profileOf(uid) {
+    return profilesByUid?.[String(uid || "")] || {};
+  }
+
+  function managerName(uid, fallback = "Manager") {
+    const id = String(uid || "");
+    const profile = profileOf(id);
+    return (
+      profile?.displayName ||
+      profile?.name ||
+      memberLabelByUid[id] ||
+      fallback ||
+      "Manager"
+    );
+  }
+
+  function displayNameForMember(member, fallback = "Manager") {
+    const uid = memberUidOf(member);
+    return managerName(
+      uid,
+      typeof member === "string"
+        ? member
+        : member?.displayName || member?.name || member?.uid || fallback
+    );
+  }
+
+  const managerLabel = (uid, fallback = "Someone") => managerName(uid, fallback || "Someone");
 
   //Flags
   const competitionName = room?.competitionMeta?.name || "";
@@ -575,7 +624,8 @@ useEffect(() => {
         hostUid: user.uid,
         members: initialMembers,
         turnIndex: 0,
-                totalRounds: DRAFT_SIZE_LEAGUE, // <-- change draft size defaults above
+        totalRounds: DRAFT_SIZE_LEAGUE, 
+        turnSeconds: TURN_SECONDS,
         draftPlan: null,
         started: false,
         startAt: null,
@@ -698,7 +748,7 @@ useEffect(() => {
       return alert("You cannot kick the host.");
     }
 
-    const name = displayNameOf(member, "this user");
+    const name = displayNameForMember(member, "this user");
 
     const ok = window.confirm(
       `Kick ${name} from this room?\n\nThey will be removed from the waiting room and will not be part of the draft.`
@@ -717,6 +767,10 @@ useEffect(() => {
   async function scheduleStart() {
     if (!user || !room) return;
     if (room.hostUid !== user.uid) return alert("Only host can schedule");
+    if (!validateManagerCountForDraftStart()) return;
+    if (!poolReady) {
+      return alert("Pick + lock a competition and load players before scheduling the draft.");
+    }
     if (!startLocalISO) return alert("Pick a date/time");
     const whenMillis = new Date(startLocalISO).getTime();
     await fnScheduleDraft({ roomId, startAtMs: whenMillis });
@@ -738,12 +792,14 @@ useEffect(() => {
     if (!user || !room) return;
     if (room.hostUid !== user.uid) return alert("Only host can start");
 
+    if (!validateManagerCountForDraftStart()) return;
+
     if (!poolReady) {
       return alert("Pick + lock a competition and load players before starting the draft.");
     }
 
     try {
-      await callStartDraftNow({ roomId });
+      await callStartDraftNow({ roomId, turnSeconds: TURN_SECONDS });
       logAnalyticsEvent("draft_started", {
         room_id: roomId,
         start_method: "manual",
@@ -767,7 +823,7 @@ useEffect(() => {
     const tid = setInterval(async () => {
       if (Date.now() >= targetMillis) {
         clearInterval(tid);
-        try { await callMaybeStartDraft({ roomId }); 
+        try { await callMaybeStartDraft({ roomId, turnSeconds: TURN_SECONDS }); 
 
         if(room?.hostUid === user?.uid){
         logAnalyticsEvent("draft_started", {
@@ -793,7 +849,7 @@ useEffect(() => {
       });
     }
     return map;
-  }, [picks]);
+  }, [picks, profilesByUid, memberLabelByUid]);
 
   const isPlayerDrafted = (playerId) => draftedByPlayerId.has(String(playerId));
 
@@ -863,7 +919,7 @@ useEffect(() => {
 
       return player.includes(q) || manager.includes(q) || team.includes(q) || country.includes(q);
     });
-  }, [picks, allPicksQuery, allPicksPos]);
+  }, [picks, allPicksQuery, allPicksPos, profilesByUid, memberLabelByUid]);
 
   const allPicksSuggestions = useMemo(() => {
     const q = allPicksQuery.trim().toLowerCase();
@@ -881,7 +937,7 @@ useEffect(() => {
     }
 
     return Array.from(set).slice(0, 10);
-  }, [picks, allPicksQuery]);
+  }, [picks, allPicksQuery, profilesByUid, memberLabelByUid]);
 
 
   function normalizeDraftPos(pos) {
@@ -991,13 +1047,13 @@ useEffect(() => {
     triedAutoRef.current = false;
     const deadlineMs = typeof room?.turnDeadlineAt === "number" ? room.turnDeadlineAt : null;
     const tick = () => {
-      if (!deadlineMs) return setTimeLeft(TURN_SECONDS);
+      if (!deadlineMs) return setTimeLeft(getDraftTurnSeconds(room));
       setTimeLeft(Math.max(0, Math.ceil((deadlineMs - Date.now()) / 1000)));
     };
     tick();
     const id = setInterval(tick, 250);
     return () => clearInterval(id);
-  }, [room?.turnDeadlineAt, room?.turnIndex]);
+  }, [room?.turnDeadlineAt, room?.turnIndex, room?.turnSeconds]);
 
   const autoPickPool = useMemo(() => {
     return ALL_PLAYERS.filter((p) => !pickedIds.has(p.id));
@@ -1044,24 +1100,37 @@ useEffect(() => {
   }, [room?.started, room?.turnDeadlineAt, isDraftComplete, user?.uid, room?.hostUid, roomId, autoPickPool]);
 
 
-  //User Picture 
-  const memberUids = useMemo(() => {
-    return (room?.members || []).map((m) => m.uid).filter(Boolean);
-  }, [room?.members]);
-  const profilesByUid = useUserProfiles(memberUids);
-
-  function profileOf(uid) {
-    return profilesByUid?.[uid] || {};
-  }
-
-  const currentName = displayNameOf(currentPicker, "—");
-  const nextName = displayNameOf(nextPicker, "—");
-  const currentPhoto = currentPicker ? profileOf(currentPicker.uid)?.photoURL : "";
-  const nextPhoto = nextPicker ? profileOf(nextPicker.uid)?.photoURL : "";
+  const currentName = currentPicker ? displayNameForMember(currentPicker, "—") : "—";
+  const nextName = nextPicker ? displayNameForMember(nextPicker, "—") : "—";
+  const currentPhoto = currentPicker ? profileOf(memberUidOf(currentPicker))?.photoURL : "";
+  const nextPhoto = nextPicker ? profileOf(memberUidOf(nextPicker))?.photoURL : "";
 
   //Draft Name 
   const isHost = user?.uid && room?.hostUid === user.uid;
   const poolReady = room?.status === "ready_to_draft" && (poolPlayers?.length || 0) > 0;
+  const canStartDraft = poolReady && canStartByManagerCount;
+  const hostControlsHelpText =
+    managerCount < 2
+      ? "Invite at least 1 more manager before starting."
+      : managerCount % 2 !== 0
+        ? "Head-to-head rooms need an even number of managers."
+        : !poolReady
+          ? "Select + lock a competition and load players first."
+          : "";
+
+  function validateManagerCountForDraftStart() {
+    if (managerCount < 2) {
+      alert("Need at least 2 managers to start a draft.");
+      return false;
+    }
+
+    if (managerCount % 2 !== 0) {
+      alert("Regular Season head-to-head rooms need an even number of managers.");
+      return false;
+    }
+
+    return true;
+  }
 
   const [isEditingDraftName, setIsEditingDraftName] = useState(false);
   const [draftNameInput, setDraftNameInput] = useState("");
@@ -1165,7 +1234,7 @@ useEffect(() => {
                               onClick={() => setIsEditingDraftName(true)}
                               title="Edit draft name"
                             >
-                              Edit
+                              Edit Name
                             </button>
                           )}
                         </>
@@ -1210,7 +1279,7 @@ useEffect(() => {
                 </CardHeader>
                 <CardContent>
                   <h3 className="font-semibold mb-2">
-                    ⚽ Managers in Room ({managerCount}/{MAX_ROOM_MANAGERS})
+                    ⚽ Managers in Room ({managerCount}/{MAX_ROOM_MANAGERS}) Need at least 2 to start
                     {roomIsFull ? <span className="ml-2 text-xs opacity-80">Full</span> : null}
                   </h3>
                   <div className="space-y-2">
@@ -1221,8 +1290,9 @@ useEffect(() => {
                       >
                         <div className="flex items-center gap-3">
                           {(() => {
-                            const p = profileOf(m.uid);
-                            const name = displayNameOf(m);
+                            const uid = memberUidOf(m);
+                            const p = profileOf(uid);
+                            const name = displayNameForMember(m);
                             return (
                               <Avatar className="h-10 w-10 border-2 border-line/60">
                                 <AvatarImage src={p.photoURL || undefined} alt={name} />
@@ -1233,7 +1303,7 @@ useEffect(() => {
                             );
                           })()}
 
-                          <span className="font-medium">{displayNameOf(m)}</span>
+                          <span className="font-medium">{displayNameForMember(m)}</span>
                         </div>
 
                         <div className="flex items-center gap-2">
@@ -1263,7 +1333,7 @@ useEffect(() => {
                   <ol className="text-sm space-y-1 list-decimal list-inside">
                     {roundOrder(room.members || [], 0).map((m, idx) => (
                       <li key={m.uid} className="rounded border border-line/60 bg-pitch/70 px-2 py-1">
-                        #{idx + 1} — {displayNameOf(m)}
+                        #{idx + 1} — {displayNameForMember(m)}
                       </li>
                     ))}
                   </ol>
@@ -1311,6 +1381,7 @@ useEffect(() => {
                 </div>
                   <div className="draftScheduleMeta">
                     <span>{room.startAt ? "Scheduled" : "Not scheduled"}</span>
+                    <span><b>{draftTurnSeconds}</b> secs per turn</span>
                     <span>Draft may take up to: <b>{estimatedDraftDurationLabel}</b></span>
                     <span>{managerCount}/{MAX_ROOM_MANAGERS} managers</span>
                   </div>
@@ -1335,7 +1406,8 @@ useEffect(() => {
                       scheduleStart={scheduleStart}
                       startNow={startNow}
                       seedingPlayers={seedingPlayers || room?.status === "seeding_players"}
-                      canStart={poolReady}
+                      canStart={canStartDraft}
+                      helperText={hostControlsHelpText}
                     />
                   ) : (
                     <p className="text-sm opacity-90">
@@ -1444,7 +1516,7 @@ useEffect(() => {
                   <div className="text-center">
                     <div className="font-semibold">Waiting for pick…</div>
                     <div className="text-sm opacity-70">
-                      {displayNameOf(currentPicker, "Someone")} is on the clock.
+                      {displayNameForMember(currentPicker, "Someone")} is on the clock.
                     </div>
                   </div>
                 </div>
@@ -1462,7 +1534,7 @@ useEffect(() => {
                         className={`border rounded px-2 py-1 ${isCurrent ? "bg-yellow-50 border-yellow-300" : ""}`}
                         title={isCurrent ? "On the clock" : ""}
                       >
-                        #{idx + 1} — {displayNameOf(m)} {isCurrent ? " • on the clock" : ""}
+                        #{idx + 1} — {displayNameForMember(m)} {isCurrent ? " • on the clock" : ""}
                       </li>
                     );
                   })}
@@ -1481,7 +1553,7 @@ useEffect(() => {
                         const isCurrent = currentPicker?.uid === m.uid;
                         return (
                           <li key={m.uid} className={`border rounded px-2 py-1 ${isCurrent ? "bg-green-50 border-green-300" : ""}`}>
-                            #{idx + 1} — {displayNameOf(m)} {isCurrent ? " • on the clock" : ""}
+                            #{idx + 1} — {displayNameForMember(m)} {isCurrent ? " • on the clock" : ""}
                           </li>
                         );
                       })}
@@ -1588,7 +1660,15 @@ useEffect(() => {
 }
 
 // ----- Subcomponents -----
-function HostControls({ startLocalISO, setStartLocalISO, scheduleStart, startNow, seedingPlayers, canStart }) {
+function HostControls({
+  startLocalISO,
+  setStartLocalISO,
+  scheduleStart,
+  startNow,
+  seedingPlayers,
+  canStart,
+  helperText,
+}) {
   return (
     <div className="flex flex-col sm:flex-row sm:items-center gap-2">
       <input
@@ -1597,7 +1677,7 @@ function HostControls({ startLocalISO, setStartLocalISO, scheduleStart, startNow
         value={startLocalISO}
         onChange={(e) => setStartLocalISO(e.target.value)}
       />
-      <button onClick={scheduleStart} disabled={seedingPlayers} className="ff-btn ff-btn--warn">
+      <button onClick={scheduleStart} disabled={seedingPlayers || !canStart} className="ff-btn ff-btn--warn">
         {seedingPlayers ? "Fetching players..." : "Schedule"}
       </button>
 
@@ -1605,14 +1685,14 @@ function HostControls({ startLocalISO, setStartLocalISO, scheduleStart, startNow
         onClick={startNow}
         disabled={seedingPlayers || !canStart}
         className="ff-btn ff-btn--primary"
-        title={!canStart ? "Load players first" : "Start draft"}
+        title={!canStart ? helperText || "Draft is not ready" : "Start draft"}
       >
         {seedingPlayers ? "Fetching players..." : "Start Draft Now"}
       </button>
 
       {!canStart ? (
         <div className="text-xs opacity-80">
-          Select + lock a competition and load players first.
+          {helperText || "Select + lock a competition and load players first."}
         </div>
       ) : null}
     </div>

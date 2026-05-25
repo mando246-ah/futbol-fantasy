@@ -1,6 +1,6 @@
 // src/pages/TournamentPage/WorldCupTournamentPage.jsx
 import { useEffect, useMemo, useState, useRef } from "react";
-import { useParams, Link, useLocation, useNavigate } from "react-router-dom";
+import { useParams, Link } from "react-router-dom";
 import { doc, onSnapshot, collection, query, orderBy, limit, getDocs } from "firebase/firestore";
 
 import { useLineupsForUsers, useTournament } from "../../tournament/hooks/useTournament";
@@ -13,8 +13,6 @@ import "./WorldCupTournamentPage.css";
 import { Avatar, AvatarImage, AvatarFallback } from "../../components/ui/avatar";
 import FlagIcon from "../../components/FlagIcon";
 import FinalResultsCard from "../../components/ui/FinalResultsCard";
-import { getApp } from "firebase/app";
-import { getFunctions, httpsCallable } from "firebase/functions";
 
 const SCORING_DISPLAY = [
   { label: "Appearance", detail: "+1 (any minutes)" },
@@ -47,6 +45,8 @@ const SCORING_DISPLAY = [
 
   { label: "Shots on Target", detail: "+1 each" },
 ];
+
+const WORLD_CUP_UI_RESET_BEFORE_NEXT_DAY_MS = 60 * 60 * 1000;
 
 const WORLD_CUP_FLAG_MARQUEE = [
   "United States",
@@ -378,6 +378,45 @@ function normalizeWorldCupDayResults(days = [], userById = {}) {
     for (const [uid, entries] of Object.entries(day?.breakdownByUserId || {})) {
       const userId = String(uid || "");
       if (!userId) continue;
+
+      if (entries && typeof entries === "object" && !Array.isArray(entries)) {
+        const starters = Array.isArray(entries.starters)
+          ? entries.starters.map((entry) => normalizeWorldCupEntry(entry, true)).filter(Boolean)
+          : Object.values(entries.perPlayer || {})
+              .filter((entry) => entry?.counted !== false)
+              .map((entry) => normalizeWorldCupEntry(entry, true))
+              .filter(Boolean);
+        const bench = Array.isArray(entries.bench)
+          ? entries.bench.map((entry) => normalizeWorldCupEntry(entry, false)).filter(Boolean)
+          : Object.values(entries.perPlayer || {})
+              .filter((entry) => entry?.counted === false)
+              .map((entry) => normalizeWorldCupEntry(entry, false))
+              .filter(Boolean);
+        const perPlayer = {
+          ...entriesToPerPlayer(starters, true),
+          ...entriesToPerPlayer(bench, false),
+        };
+        const total = Number(
+          entries.total ??
+            starters.reduce((sum, entry) => sum + Number(entry?.points || 0), 0)
+        );
+        const benchTotal = Number(
+          entries.benchTotal ??
+            bench.reduce((sum, entry) => sum + Number(entry?.points || 0), 0)
+        );
+
+        breakdownByUserId[userId] = {
+          ...entries,
+          total,
+          benchTotal,
+          perPlayer,
+          starters,
+          bench,
+        };
+        benchByUserId[userId] = bench;
+        continue;
+      }
+
       const perPlayer = entriesToPerPlayer(entries, true);
       const total = Object.values(perPlayer).reduce(
         (sum, entry) => sum + Number(entry?.points || 0),
@@ -453,6 +492,222 @@ function normalizeWorldCupDayResults(days = [], userById = {}) {
   return normalizedAsc.sort(
     (a, b) => Number(b?.dayIndex || 0) - Number(a?.dayIndex || 0)
   );
+}
+
+function dayIndexOf(day = {}) {
+  const direct = Number(day?.dayIndex);
+  if (Number.isFinite(direct) && direct > 0) return direct;
+
+  const fromId = Number(String(day?.id || "").replace(/^day-/, ""));
+  return Number.isFinite(fromId) && fromId > 0 ? fromId : null;
+}
+
+function statusLowerOf(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function getDayStartMs(day = {}, room = {}) {
+  return (
+    Number(day?.firstKickoffMs) ||
+    Number(day?.startAtMs) ||
+    Number(room?.worldCup?.currentDayStartAtMs) ||
+    null
+  );
+}
+
+function getWorldCupDisplayDayContext({
+  days = [],
+  dayResultsByIndex = {},
+  room = {},
+  competitionState = {},
+  nowMs = Date.now(),
+}) {
+  const sortedDays = [...(Array.isArray(days) ? days : [])]
+    .map((day) => ({ ...day, dayIndex: dayIndexOf(day) }))
+    .filter((day) => Number.isFinite(Number(day.dayIndex)))
+    .sort((a, b) => Number(a.dayIndex) - Number(b.dayIndex));
+
+  const resultRows = Object.values(dayResultsByIndex || {})
+    .filter(Boolean)
+    .map((day) => ({ ...day, dayIndex: dayIndexOf(day) }))
+    .filter((day) => Number.isFinite(Number(day.dayIndex)));
+
+  const finalResults = resultRows
+    .filter((day) => statusLowerOf(day.status) === "final")
+    .sort((a, b) => Number(a.dayIndex) - Number(b.dayIndex));
+
+  const latestFinalResult = finalResults[finalResults.length - 1] || null;
+  const latestFinalDayIndex = latestFinalResult ? Number(latestFinalResult.dayIndex) : null;
+  const finalDayIndexes = new Set(finalResults.map((day) => String(day.dayIndex)));
+
+  const nextDay = sortedDays.find((day) => {
+    const idx = String(day.dayIndex);
+    return statusLowerOf(day.status) !== "final" && !finalDayIndexes.has(idx);
+  }) || null;
+  const nextDayIndex = nextDay ? Number(nextDay.dayIndex) : null;
+  const nextDayStartAtMs = nextDay
+    ? getDayStartMs(nextDay, room) || Number(competitionState?.nextKickoffMs) || null
+    : null;
+  const resetAtMs = nextDayStartAtMs
+    ? nextDayStartAtMs - WORLD_CUP_UI_RESET_BEFORE_NEXT_DAY_MS
+    : null;
+
+  if (latestFinalResult && nextDay) {
+    const showingPreviousFinalUntilReset = Boolean(resetAtMs && nowMs < resetAtMs);
+
+    if (showingPreviousFinalUntilReset) {
+      return {
+        displayDayIndex: latestFinalDayIndex,
+        displayDay: sortedDays.find((day) => Number(day.dayIndex) === latestFinalDayIndex) || latestFinalResult,
+        displayDayResult: latestFinalResult,
+        latestFinalDayIndex,
+        nextDayIndex,
+        nextDayStartAtMs,
+        resetAtMs,
+        showingPreviousFinalUntilReset: true,
+        shouldShowZeroCurrentDay: false,
+      };
+    }
+
+    const nextResult = dayResultsByIndex?.[nextDayIndex] || null;
+    const nextStatus = statusLowerOf(nextResult?.status);
+    return {
+      displayDayIndex: nextDayIndex,
+      displayDay: nextDay,
+      displayDayResult: nextResult,
+      latestFinalDayIndex,
+      nextDayIndex,
+      nextDayStartAtMs,
+      resetAtMs,
+      showingPreviousFinalUntilReset: false,
+      shouldShowZeroCurrentDay: !nextResult || nextStatus === "scheduled" || nextStatus === "idle",
+    };
+  }
+
+  if (latestFinalResult && !nextDay) {
+    return {
+      displayDayIndex: latestFinalDayIndex,
+      displayDay: sortedDays.find((day) => Number(day.dayIndex) === latestFinalDayIndex) || latestFinalResult,
+      displayDayResult: latestFinalResult,
+      latestFinalDayIndex,
+      nextDayIndex: null,
+      nextDayStartAtMs: null,
+      resetAtMs: null,
+      showingPreviousFinalUntilReset: false,
+      shouldShowZeroCurrentDay: false,
+    };
+  }
+
+  const currentDayIndex = Number(room?.worldCup?.currentDayIndex);
+  const activeDay =
+    (Number.isFinite(currentDayIndex) &&
+      sortedDays.find((day) => Number(day.dayIndex) === currentDayIndex)) ||
+    nextDay ||
+    sortedDays[0] ||
+    null;
+  const activeDayIndex = activeDay ? Number(activeDay.dayIndex) : null;
+  const activeResult = activeDayIndex ? dayResultsByIndex?.[activeDayIndex] || null : null;
+  const activeStatus = statusLowerOf(activeResult?.status);
+
+  return {
+    displayDayIndex: activeDayIndex,
+    displayDay: activeDay,
+    displayDayResult: activeResult,
+    latestFinalDayIndex: null,
+    nextDayIndex: activeDayIndex,
+    nextDayStartAtMs: activeDay ? getDayStartMs(activeDay, room) : null,
+    resetAtMs: null,
+    showingPreviousFinalUntilReset: false,
+    shouldShowZeroCurrentDay: !activeResult || activeStatus === "scheduled" || activeStatus === "idle",
+  };
+}
+
+function buildEmptyWorldCupDayResult({ day, members = [] }) {
+  const dayIndex = dayIndexOf(day);
+  const teamScoresByUserId = {};
+  const benchScoresByUserId = {};
+  const breakdownByUserId = {};
+  const startersByUserId = {};
+  const benchByUserId = {};
+
+  const zeroPlayer = (player = {}, counted = true) => {
+    const id = String(player?.id || player?.playerId || player?.pid || "").trim();
+    return {
+      ...player,
+      id,
+      playerId: id,
+      points: 0,
+      counted,
+      stats: {},
+      rawStats: {},
+      breakdown: {},
+    };
+  };
+
+  const rows = (Array.isArray(members) ? members : []).map((member, index) => {
+    const uid = String(member?.userId || member?.uid || "").trim();
+    if (!uid) return null;
+
+    const starters = (Array.isArray(member?.starters) ? member.starters : [])
+      .map((player) => zeroPlayer(player, true))
+      .filter((player) => player.id);
+    const bench = (Array.isArray(member?.bench) ? member.bench : [])
+      .map((player) => zeroPlayer(player, false))
+      .filter((player) => player.id);
+
+    const perPlayer = {};
+    for (const player of [...starters, ...bench]) {
+      if (player.id) perPlayer[player.id] = player;
+    }
+
+    teamScoresByUserId[uid] = 0;
+    benchScoresByUserId[uid] = 0;
+    startersByUserId[uid] = starters;
+    benchByUserId[uid] = bench;
+    breakdownByUserId[uid] = {
+      uid,
+      userId: uid,
+      displayName: member?.displayName || member?.name || "Manager",
+      teamName: member?.teamName || "",
+      total: 0,
+      benchTotal: 0,
+      perPlayer,
+      starters,
+      bench,
+    };
+
+    return {
+      rank: index + 1,
+      uid,
+      userId: uid,
+      name: member?.name || member?.displayName || "Manager",
+      displayName: member?.displayName || member?.name || "Manager",
+      teamName: member?.teamName || "",
+      points: 0,
+      roundPoints: 0,
+      totalAfter: 0,
+    };
+  }).filter(Boolean);
+
+  return {
+    id: dayIndex ? `day-${dayIndex}` : "day-current",
+    dayIndex,
+    label: day?.label || (dayIndex ? `Day ${dayIndex}` : "Current Day"),
+    dateLabel: day?.dateLabel || "",
+    startAtMs: day?.startAtMs || null,
+    endAtMs: day?.endAtMs || null,
+    fixtureIds: Array.isArray(day?.fixtureIds) ? day.fixtureIds : [],
+    fixtures: Array.isArray(day?.fixtures) ? day.fixtures : [],
+    status: "scheduled",
+    teamScoresByUserId,
+    benchScoresByUserId,
+    breakdownByUserId,
+    startersByUserId,
+    benchByUserId,
+    dailyLeaderboard: rows,
+    rows,
+    isWorldCupDailyResult: true,
+  };
 }
 
 function firstText(...values) {
@@ -924,10 +1179,9 @@ function inferOwnerUidFromPick(d) {
 
 export default function WorldCupTournamentPage() {
   const { roomId } = useParams();
-  const location = useLocation();
-  const navigate = useNavigate();
   const { loading, error, data } = useTournament(roomId, { loadScope: "core", enableLocalFallback: false });
   const room = data?.room || {};
+  const competitionState = room?.competitionState || {};
   const engineType = String(room?.engineType || room?.worldCup?.engineType || "").trim();
   const competitionType = String(room?.competitionType || "").trim();
   const worldCupPhase = String(room?.worldCupPhase || room?.worldCup?.phase || "").trim();
@@ -984,9 +1238,10 @@ export default function WorldCupTournamentPage() {
   const [roomPickDocs, setRoomPickDocs] = useState([]);
   const [currentDayDoc, setCurrentDayDoc] = useState(null);
   const [currentDayResultDoc, setCurrentDayResultDoc] = useState(null);
+  const [worldCupDayDocs, setWorldCupDayDocs] = useState([]);
+  const [worldCupDisplayDayResultDocs, setWorldCupDisplayDayResultDocs] = useState([]);
   const [selectedHistoryId, setSelectedHistoryId] = useState("");
   const [openHistoryBreakdownKey, setOpenHistoryBreakdownKey] = useState(null);
-  const [devPreviewComplete, setDevPreviewComplete] = useState(false);
   
   // Accordion State
   const [expandedPlayerId, setExpandedPlayerId] = useState(null);
@@ -994,14 +1249,6 @@ export default function WorldCupTournamentPage() {
   const [showScoring, setShowScoring] = useState(false);
   const scoringRef = useRef(null);
 
-  // Dev Tools State
-  const [devBusy, setDevBusy] = useState(false);
-  const [shadowTestBusy, setShadowTestBusy] = useState(false);
-  const [shadowTestResult, setShadowTestResult] = useState(null);
-  const [wcDebugRunning, setWcDebugRunning] = useState(false);
-  const [wcDebugResult, setWcDebugResult] = useState(null);
-  const [wcDebugError, setWcDebugError] = useState("");
-  
 
   useEffect(() => {
     if (!roomId) return;
@@ -1166,6 +1413,48 @@ export default function WorldCupTournamentPage() {
 
   useEffect(() => {
     if (!roomId || !isWorldCupGroupRoom) {
+      setWorldCupDayDocs([]);
+      setWorldCupDisplayDayResultDocs([]);
+      return undefined;
+    }
+
+    const daysQ = query(
+      collection(db, "rooms", roomId, "days"),
+      orderBy("dayIndex", "asc")
+    );
+    const dayResultsQ = query(
+      collection(db, "rooms", roomId, "dayResults"),
+      orderBy("dayIndex", "asc")
+    );
+
+    const unsubDays = onSnapshot(
+      daysQ,
+      (snap) => {
+        setWorldCupDayDocs(
+          snap.docs.map((d) => ({ id: d.id, ...(d.data() || {}) }))
+        );
+      },
+      () => setWorldCupDayDocs([])
+    );
+
+    const unsubResults = onSnapshot(
+      dayResultsQ,
+      (snap) => {
+        setWorldCupDisplayDayResultDocs(
+          snap.docs.map((d) => ({ id: d.id, ...(d.data() || {}) }))
+        );
+      },
+      () => setWorldCupDisplayDayResultDocs([])
+    );
+
+    return () => {
+      unsubDays();
+      unsubResults();
+    };
+  }, [roomId, isWorldCupGroupRoom]);
+
+  useEffect(() => {
+    if (!roomId || !isWorldCupGroupRoom) {
       setCurrentDayDoc(null);
       setCurrentDayResultDoc(null);
       return undefined;
@@ -1277,6 +1566,54 @@ export default function WorldCupTournamentPage() {
     isWorldCupGroupRoom && currentDayResultDoc
       ? normalizeWorldCupDayResults([currentDayResultDoc], userById)[0] || null
       : null;
+  const normalizedWorldCupDisplayDayResults = isWorldCupGroupRoom
+    ? normalizeWorldCupDayResults(
+        [
+          ...worldCupDisplayDayResultDocs,
+          ...(currentDayResultDoc ? [currentDayResultDoc] : []),
+        ],
+        userById
+      )
+    : [];
+  const worldCupDayResultsByIndex = normalizedWorldCupDisplayDayResults.reduce((acc, day) => {
+    const idx = dayIndexOf(day);
+    if (idx) acc[idx] = day;
+    return acc;
+  }, {});
+  const worldCupDaysForDisplay = (() => {
+    if (!isWorldCupGroupRoom) return [];
+
+    const byIndex = new Map();
+    for (const day of [...worldCupDayDocs, ...(currentDayDoc ? [currentDayDoc] : [])]) {
+      const idx = dayIndexOf(day);
+      if (!idx) continue;
+      byIndex.set(idx, { ...day, dayIndex: idx });
+    }
+
+    return Array.from(byIndex.values()).sort(
+      (a, b) => Number(a.dayIndex) - Number(b.dayIndex)
+    );
+  })();
+  const worldCupDisplayContext = isWorldCupGroupRoom
+    ? getWorldCupDisplayDayContext({
+        days: worldCupDaysForDisplay,
+        dayResultsByIndex: worldCupDayResultsByIndex,
+        room,
+        competitionState: room?.competitionState || {},
+        nowMs,
+      })
+    : null;
+  const emptyWorldCupDisplayDayResult =
+    isWorldCupGroupRoom && worldCupDisplayContext?.displayDay
+      ? buildEmptyWorldCupDayResult({
+          day: worldCupDisplayContext.displayDay,
+          members: users,
+        })
+      : null;
+  const worldCupDisplayDayResult =
+    isWorldCupGroupRoom && worldCupDisplayContext?.shouldShowZeroCurrentDay
+      ? emptyWorldCupDisplayDayResult
+      : worldCupDisplayContext?.displayDayResult || normalizedCurrentDayResult || null;
   const displayHistoryRounds = historyEnabled
     ? (isWorldCupGroupRoom
         ? normalizeWorldCupDayResults(dayResults, userById)
@@ -1297,15 +1634,18 @@ export default function WorldCupTournamentPage() {
 
     //Status 
     const latestDayResult = isWorldCupGroupRoom
-      ? normalizedCurrentDayResult || displayHistoryRounds[0] || null
+      ? worldCupDisplayDayResult || normalizedCurrentDayResult || displayHistoryRounds[0] || null
       : null;
     const currentWorldCupDayIndex = Number(room?.worldCup?.currentDayIndex);
     const currentDayResult =
-      isWorldCupGroupRoom && Number.isFinite(currentWorldCupDayIndex)
-        ? normalizedCurrentDayResult ||
-          displayHistoryRounds.find(
-            (day) => Number(day?.dayIndex) === currentWorldCupDayIndex
-          ) || null
+      isWorldCupGroupRoom
+        ? worldCupDisplayDayResult ||
+          (Number.isFinite(currentWorldCupDayIndex)
+            ? normalizedCurrentDayResult ||
+              displayHistoryRounds.find(
+                (day) => Number(day?.dayIndex) === currentWorldCupDayIndex
+              ) || null
+            : null)
         : null;
     const statusRaw =
       isWorldCupGroupRoom
@@ -1357,8 +1697,19 @@ export default function WorldCupTournamentPage() {
     const nextUpdateInSec = lastUpdateMs ? Math.max(0, 60 - (ageSec % 60)) : null;
     const lastUpdateLabel = lastUpdateMs ? fmtDT(lastUpdateMs) : "—";
     const status = String(statusRaw).toUpperCase();
+    const worldCupDisplayDay = worldCupDisplayContext?.displayDay || currentDayDoc || null;
+    const worldCupDisplayNotice =
+      isWorldCupGroupRoom && worldCupDisplayContext?.showingPreviousFinalUntilReset
+        ? `Showing final ${latestDayResult?.label || `Day ${worldCupDisplayContext.latestFinalDayIndex}`} stats until next day reset at ${fmtDT(worldCupDisplayContext.resetAtMs)}.`
+        : isWorldCupGroupRoom && worldCupDisplayContext?.shouldShowZeroCurrentDay
+          ? `${worldCupDisplayDay?.label || `Day ${worldCupDisplayContext?.displayDayIndex || ""}`} stats reset. Live updates start when matches begin.`
+          : "";
     const currentWindowLabel = isWorldCupGroupRoom
-      ? room?.competitionState?.currentLabel || room?.worldCup?.currentDayLabel || currentDayDoc?.label || latestDayResult?.label || "Waiting for next day"
+      ? worldCupDisplayDay?.label ||
+        latestDayResult?.label ||
+        room?.competitionState?.currentLabel ||
+        room?.worldCup?.currentDayLabel ||
+        "Waiting for next day"
       : cupDoc?.currentWindowLabel || "Waiting for next round";
     const isFinal = status === "FINAL" || cupDoc?.completed || (isWorldCupGroupRoom && room?.competitionState?.isDone);
     
@@ -1489,23 +1840,7 @@ export default function WorldCupTournamentPage() {
       })
     );
 
-  const fakePodiumData = {
-    computedAtMs: Date.now(),
-    top3: leaderboard.slice(0, 3).map((u, i) => ({
-      userId: u.userId,
-      uid: u.userId,
-      name: u.name,
-      rank: i + 1,
-      wins: 0,
-      draws: 0,
-      losses: 0,
-      tablePoints: u.totalPoints,
-      totalFantasyPoints: u.totalPoints,
-    })),
-  };
-  const showFinalPodium =
-    devPreviewComplete ||
-    (Boolean(finalResultsDoc) && (isFinal || isWorldCupGroupRoom));
+  const showFinalPodium = Boolean(finalResultsDoc) && (isFinal || isWorldCupGroupRoom);
 
   // Resolve Rosters Helper
   function firstNonEmptyArray(...candidates) {
@@ -1847,10 +2182,11 @@ export default function WorldCupTournamentPage() {
 
   const winStartMs =
     (isWorldCupGroupRoom
-      ? room?.worldCup?.currentDayStartAtMs ||
-        currentDayDoc?.startAtMs ||
+      ? worldCupDisplayDay?.startAtMs ||
         currentDayResult?.startAtMs ||
         latestDayResult?.startAtMs ||
+        room?.worldCup?.currentDayStartAtMs ||
+        currentDayDoc?.startAtMs ||
         room?.worldCup?.firstWindowStartAtMs
       : cupDoc?.currentWindowStartAtMs ??
         cupDoc?.startAtMs ??
@@ -1859,10 +2195,11 @@ export default function WorldCupTournamentPage() {
 
   const winEndMs =
     (isWorldCupGroupRoom
-      ? room?.worldCup?.currentDayEndAtMs ||
-        currentDayDoc?.endAtMs ||
+      ? worldCupDisplayDay?.endAtMs ||
         currentDayResult?.endAtMs ||
         latestDayResult?.endAtMs ||
+        room?.worldCup?.currentDayEndAtMs ||
+        currentDayDoc?.endAtMs ||
         room?.worldCup?.lastWindowEndAtMs
       : cupDoc?.currentWindowEndAtMs ??
         cupDoc?.endAtMs ??
@@ -2170,129 +2507,6 @@ export default function WorldCupTournamentPage() {
   const otherUsers = users.filter(u => u.userId !== myUid);
   const isLineupLoading = (uid) => Boolean(stagedLineups.loadingByUid?.[String(uid || "")]);
 
-
-  //Dev tools
-  async function copyRoomCode() {
-    try {
-      await navigator.clipboard.writeText(String(roomId));
-      alert("Room code copied!");
-    } catch (e) {
-      alert("Could not copy.");
-    }
-  }
-
-  function switchTournamentView(view) {
-    const params = new URLSearchParams(location.search);
-    params.set("view", view);
-    const search = params.toString();
-    navigate(
-      {
-        pathname: location.pathname,
-        search: search ? `?${search}` : "",
-      },
-      { replace: false }
-    );
-  }
-
-  async function forceRunCup() {
-    try {
-      setDevBusy(true);
-
-      const functions = getFunctions(getApp(), "us-west2");
-      const callForceRunCup = httpsCallable(functions, "debugForceRunCup");
-      const res = await callForceRunCup({ roomId });
-
-      console.log("debugForceRunCup:", res.data);
-      alert(res.data?.message || "Cup sync complete.");
-    } catch (e) {
-      console.error("debugForceRunCup failed", e);
-      alert(e?.message || "Cup sync failed.");
-    } finally {
-      setDevBusy(false);
-    }
-  }
-
-  async function debugRunGlobalShadowCupTest() {
-    if (!roomId) return;
-
-    setShadowTestBusy(true);
-
-    try {
-      const functions = getFunctions(getApp(), "us-west2");
-      const fn = httpsCallable(functions, "debugComputeGlobalShadowCupRoom");
-      const res = await fn({ roomId });
-
-      console.log("====================================");
-      console.log("GLOBAL SHADOW CUP TEST RESULT");
-      console.log("Room:", roomId);
-      console.log("Season:", res.data?.seasonKey);
-      console.log("Summary:", res.data);
-      console.table(res.data?.fixtureCoverage || []);
-      console.table(
-        Object.entries(res.data?.diffsByUid || {}).map(([uid, diff]) => ({
-          uid,
-          diff,
-        }))
-      );
-      console.table(res.data?.playerMismatches || []);
-      console.table(res.data?.statMismatches || []);
-      console.log("Max Abs Diff:", res.data?.maxAbsDiff);
-      console.log("Missing Fixtures:", res.data?.missingFixtureCount);
-      console.log("====================================");
-
-      alert(
-        `Shadow Cup test complete: maxAbsDiff=${res.data?.maxAbsDiff ?? 0}, missingFixtures=${res.data?.missingFixtureCount ?? 0}`
-      );
-    } catch (e) {
-      console.error("GLOBAL SHADOW CUP TEST FAILED", e);
-      alert(e?.message || "Global shadow test failed. Check console.");
-    } finally {
-      setShadowTestBusy(false);
-    }
-  }
-
-  async function runWorldCupDebug(nowMs = null, label = "now") {
-    if (!roomId) return;
-
-    setWcDebugRunning(true);
-    setWcDebugError("");
-    setWcDebugResult(null);
-
-    try {
-      const functions = getFunctions(getApp(), "us-west2");
-      const fn = httpsCallable(functions, "debugRunWorldCupGroupEngine");
-      const payload = { roomId };
-      const parsedNowMs = Number(nowMs);
-
-      if (nowMs !== null && nowMs !== undefined && Number.isFinite(parsedNowMs)) {
-        payload.nowMs = parsedNowMs;
-      }
-
-      const res = await fn(payload);
-      const debugData = res?.data || {};
-
-      console.log("[WorldCupTournamentPage] debugRunWorldCupGroupEngine result", {
-        label,
-        payload,
-        data: debugData,
-      });
-
-      if (debugData?.fixtureCoverage) {
-        console.table(debugData.fixtureCoverage);
-      }
-
-      setWcDebugResult({
-        label,
-        ...debugData,
-      });
-    } catch (err) {
-      console.error("[WorldCupTournamentPage] debugRunWorldCupGroupEngine failed", err);
-      setWcDebugError(err?.message || String(err));
-    } finally {
-      setWcDebugRunning(false);
-    }
-  }
-
     const roomNextLabel =
         room?.competitionState?.currentLabel ||
         room?.["competitionState.currentLabel"] ||
@@ -2301,35 +2515,10 @@ export default function WorldCupTournamentPage() {
     const nextGameLabel = roomNextLabel || currentWindowLabel || "—";
 
   const nextLabel =
-    (isWorldCupGroupRoom ? roomNextLabel || currentDayDoc?.label || latestDayResult?.label : cupDoc?.currentWindowLabel) ||
+    (isWorldCupGroupRoom ? worldCupDisplayDay?.label || latestDayResult?.label || roomNextLabel : cupDoc?.currentWindowLabel) ||
     room?.competitionState?.currentLabel ||
     room?.["competitionState.currentLabel"] ||
     "—";
-
-  const debugCurrentDay = currentDayDoc || currentDayResult || latestDayResult || null;
-  const debugCurrentDayFixtures = Array.isArray(debugCurrentDay?.fixtures)
-    ? debugCurrentDay.fixtures
-    : [];
-  const debugLastFixture =
-    debugCurrentDayFixtures.length > 0
-      ? debugCurrentDayFixtures[debugCurrentDayFixtures.length - 1]
-      : null;
-  const currentDayFirstKickoffMs =
-    Number(debugCurrentDay?.firstKickoffMs || debugCurrentDayFixtures[0]?.kickoffMs || 0) || null;
-  const currentDayLastKickoffMs =
-    Number(debugCurrentDay?.lastKickoffMs || debugLastFixture?.kickoffMs || 0) || null;
-  const debugBeforeKickoffMs = currentDayFirstKickoffMs
-    ? currentDayFirstKickoffMs - 30 * 60 * 1000
-    : null;
-  const debugPreLiveMs = currentDayFirstKickoffMs
-    ? currentDayFirstKickoffMs - 10 * 60 * 1000
-    : null;
-  const debugLiveMs = currentDayFirstKickoffMs
-    ? currentDayFirstKickoffMs + 10 * 60 * 1000
-    : null;
-  const debugPostDayMs = currentDayLastKickoffMs
-    ? currentDayLastKickoffMs + 2 * 60 * 60 * 1000 + 5 * 60 * 1000
-    : null;
 
   const winText =
     winStartMs && winEndMs ? `${fmtDT(winStartMs)} → ${fmtDT(winEndMs)}` : "—";
@@ -2362,6 +2551,11 @@ export default function WorldCupTournamentPage() {
                 <div className="tpRoomMeta">
                     {worldCupWindowLabel}: <b>{winText}</b> • {worldCupCurrentLabel}: <b style={{ color: "var(--color-primary)" }}>{nextLabel}</b>
                 </div>
+             {/*} {worldCupDisplayNotice && (
+                <div className="tpRoomMeta worldcup-day-reset-note">
+                  {worldCupDisplayNotice}
+                </div>
+              )} */}
               <div className="tpRoomMeta">Room: <b>{room?.name} - {roomId}</b></div>
               <div className="tpLiveHeaderLine">
                 {isLive ? (
@@ -2391,101 +2585,6 @@ export default function WorldCupTournamentPage() {
                 >
                 Scoring <span className={`tpCaret ${showScoring ? "open" : ""}`}>▾</span>
                 </button>
-
-                {isHost && (
-                <details className="tpTools">
-                    <summary className="tpPointsBtn tpToolsBtn">
-                    Tools <span className="tpCaret">▾</span>
-                    </summary>
-                    <div className="tpToolsMenu">
-                    <button
-                      type="button"
-                      className="tpToolsItem"
-                      onClick={() => switchTournamentView("cup")}
-                    >
-                      View Cup UI
-                    </button>
-
-                    <button className="tpToolsItem" onClick={() => setDevPreviewComplete(!devPreviewComplete)}>
-                        {devPreviewComplete ? "Hide Podium" : "DEV: Preview Final Podium"}
-                    </button>
-
-                    {isWorldCupGroupRoom && (
-                      <div className="wcDebugTools">
-                        <div className="wcDebugWarning">
-                          Debug engine writes day results, standings, and room state.
-                        </div>
-                        <button
-                          type="button"
-                          className="tpToolsItem"
-                          onClick={() => runWorldCupDebug(null, "now")}
-                          disabled={wcDebugRunning}
-                        >
-                          {wcDebugRunning ? "Running WC Engine..." : "Debug WC Engine: Now"}
-                        </button>
-                        <button
-                          type="button"
-                          className="tpToolsItem"
-                          onClick={() => runWorldCupDebug(debugBeforeKickoffMs, "30m-before-kickoff")}
-                          disabled={wcDebugRunning || !debugBeforeKickoffMs}
-                        >
-                          Debug: 30m Before Kickoff
-                        </button>
-                        <button
-                          type="button"
-                          className="tpToolsItem"
-                          onClick={() => runWorldCupDebug(debugPreLiveMs, "10m-before-kickoff")}
-                          disabled={wcDebugRunning || !debugPreLiveMs}
-                        >
-                          Debug: 10m Before Kickoff
-                        </button>
-                        <button
-                          type="button"
-                          className="tpToolsItem"
-                          onClick={() => runWorldCupDebug(debugLiveMs, "10m-after-kickoff")}
-                          disabled={wcDebugRunning || !debugLiveMs}
-                        >
-                          Debug: 10m After Kickoff
-                        </button>
-                        <button
-                          type="button"
-                          className="tpToolsItem"
-                          onClick={() => runWorldCupDebug(debugPostDayMs, "after-day-window")}
-                          disabled={wcDebugRunning || !debugPostDayMs}
-                        >
-                          Debug: After Day Window
-                        </button>
-                      </div>
-                    )}
-
-                    {!isWorldCupGroupRoom && (
-                      <>
-                        <button
-                          type="button"
-                          className="tpToolMenuItem"
-                          onClick={debugRunGlobalShadowCupTest}
-                          disabled={shadowTestBusy}
-                        >
-                          {shadowTestBusy ? "Running Shadow Test..." : "DEV: Test Global Shadow"}
-                        </button>
-
-                        <button
-                          type="button"
-                          className="tpToolsItem"
-                          onClick={forceRunCup}
-                          disabled={devBusy}
-                        >
-                          {devBusy ? "Running Cup Sync..." : "DEV: Fix Cup Fixtures / Points"}
-                        </button>
-                      </>
-                    )}
-
-                    <button type="button" className="tpToolsItem" onClick={copyRoomCode}>
-                        Copy Room Code
-                    </button>
-                    </div>
-                </details>
-                )}
             </div>
 
             {showScoring && (
@@ -2502,23 +2601,6 @@ export default function WorldCupTournamentPage() {
                 </div>
             )}
 
-            {wcDebugResult && (
-              <div className="wcDebugResult">
-                <strong>Debug result:</strong>
-                <span>Label: {wcDebugResult.label || "now"}</span>
-                <span>Status: {wcDebugResult.status || "—"}</span>
-                <span>Week Status: {wcDebugResult.weekStatus || "—"}</span>
-                <span>Day: {wcDebugResult.currentDayIndex || wcDebugResult.dayIndex || "—"}</span>
-                <span>Source: {wcDebugResult.result?.source || wcDebugResult.source || "—"}</span>
-                <span>Next poll: {wcDebugResult.nextPollAtMs || "—"}</span>
-              </div>
-            )}
-
-            {wcDebugError && (
-              <div className="wcDebugError">
-                Debug failed: {wcDebugError}
-              </div>
-            )}
             </div>
         </div>
 
@@ -2527,7 +2609,7 @@ export default function WorldCupTournamentPage() {
           {showFinalPodium && (
             <div className="tpCard tpFull">
               <FinalResultsCard
-                finalResults={devPreviewComplete ? fakePodiumData : finalResultsDoc}
+                finalResults={finalResultsDoc}
                 title={isWorldCupGroupRoom ? "World Cup Group Stage Top 3" : "World Cup Knockout Champion"}
                 subtitle="Top 3 Managers"
                 badge="🏆"

@@ -422,10 +422,6 @@ export default function TournamentPage() {
   const [bootAttempted, setBootAttempted] = useState(false);
   const [expandedPlayerId, setExpandedPlayerId] = useState(null);
   const [showScoring, setShowScoring] = useState(false);
-  const [forcingUpdate, setForcingUpdate] = useState(false);
-  const [creatingNextWeek, setCreatingNextWeek] = useState(false);
-  const [shadowTestBusy, setShadowTestBusy] = useState(false);
-  const [globalApplyBusy, setGlobalApplyBusy] = useState(false);
   // Week history (previous weeks dropdown)
   const [historyEnabled, setHistoryEnabled] = useState(false);
   const [weekHistory, setWeekHistory] = useState([]);
@@ -435,28 +431,9 @@ export default function TournamentPage() {
   const [openBreakdownKey, setOpenBreakdownKey] = useState(null);
   //Ending Draft
   const [finalResultsDoc, setFinalResultsDoc] = useState(null);
-  const [syncingRounds, setSyncingRounds] = useState(false);
-  const [forcingFinalize, setForcingFinalize] = useState(false);
-  const [clearingFinalize, setClearingFinalize] = useState(false);
   const [totalRounds, setTotalRounds] = useState(null);
 
-  //Test
-  
-  // 1. Add the fake toggle and mock podium data
-  const [devPreviewComplete, setDevPreviewComplete] = useState(false);
-
-  const fakePodiumData = {
-    computedAtMs: Date.now(),
-    top3: [
-      // Use myUid instead of me! The UI will automatically grab your real name/avatar.
-      { userId: myUid || "1", name: "You (Champion)", wins: 15, tablePoints: 45, totalFantasyPoints: 1200 },
-      { userId: "2", name: "Silver Manager", wins: 12, tablePoints: 36, totalFantasyPoints: 1050 },
-      { userId: "3", name: "Bronze Manager", wins: 10, tablePoints: 30, totalFantasyPoints: 980 }
-    ]
-  };
-
-  // 2. Update this line so it listens to the toggle OR the database
-  const showFinalPodium = devPreviewComplete || Boolean(finalResultsDoc);
+  const showFinalPodium = Boolean(finalResultsDoc);
 
   // Other Matchups expand/collapse (separate from main matchup player expand)
   const [expandedOtherMatchupKey, setExpandedOtherMatchupKey] = useState(null);
@@ -481,15 +458,7 @@ export default function TournamentPage() {
   };
 
   const createNextWeekFn = httpsCallable(functions, "createNextWeek");
-  const syncTotalRoundsFn = httpsCallable(functions, "debugSyncTotalRounds");
-  const forceFinalizeSeasonFn = httpsCallable(functions, "debugForceFinalizeSeason");
-  const clearFinalResultsFn = httpsCallable(functions, "debugClearFinalResults");
   const scoringRef = useRef(null);
-
-  const recomputeStandingsFn = httpsCallable(
-    functions,
-    "debugRecomputeRegularSeasonStandings"
-  );
 
   const totalRoundsDisplay =
     totalRounds ??
@@ -518,199 +487,6 @@ export default function TournamentPage() {
     .join(" ");
 
   
-
-  //Add previous weeeks 
-  const [repairing, setRepairing] = useState(false);
-  const [recomputingStandings, setRecomputingStandings] = useState(false);
-
-    async function repairThisWeek() {
-      if (!isHost) return;
-      if (currentWeekIndex == null) return alert("No current weekIndex yet.");
-
-      try {
-        setRepairing(true);
-        const fn = httpsCallable(functions, "repairWeekFixtures");
-
-        // Use the current week shown on the page:
-        await fn({ roomId, weekIndex: currentWeekIndex });
-
-        alert("Week fixtures repaired. Give it ~1 minute then refresh.");
-      } catch (e) {
-        console.error(e);
-        alert(e?.message || "Repair failed.");
-      } finally {
-        setRepairing(false);
-      }
-    }
-
-  async function debugRunGlobalShadowRegularTest() {
-    if (!isHost) return;
-    if (!roomId) return;
-    if (currentWeekIndex == null) return alert("No current weekIndex yet.");
-
-    try {
-      setShadowTestBusy(true);
-
-      const fn = httpsCallable(functions, "debugComputeGlobalShadowRegularRoom");
-      const res = await fn({ roomId, weekIndex: currentWeekIndex });
-
-      console.log("====================================");
-      console.log("GLOBAL SHADOW REGULAR TEST RESULT");
-      console.log("Room:", roomId);
-      console.log("Week:", currentWeekIndex);
-      console.log("Season:", res.data?.seasonKey);
-      console.log("Summary:", res.data);
-      console.table(res.data?.fixtureCoverage || []);
-      console.table(
-        Object.entries(res.data?.diffsByUid || {}).map(([uid, diff]) => ({
-          uid,
-          diff,
-        }))
-      );
-      console.table(res.data?.playerMismatches || []);
-      console.log("Max Abs Diff:", res.data?.maxAbsDiff);
-      console.log("Missing Fixtures:", res.data?.missingFixtureCount);
-      console.log("====================================");
-
-      alert(
-        `Shadow test complete: maxAbsDiff=${res.data?.maxAbsDiff ?? 0}, missingFixtures=${res.data?.missingFixtureCount ?? 0}`
-      );
-    } catch (e) {
-      console.error("GLOBAL SHADOW REGULAR TEST FAILED", e);
-      alert(e?.message || "Global regular shadow test failed. Check console.");
-    } finally {
-      setShadowTestBusy(false);
-    }
-  }
-
-  async function debugApplyRegularGlobalAggregatorOnce() {
-    if (!isHost) return;
-    if (!roomId) return;
-    if (currentWeekIndex == null) return alert("No current weekIndex yet.");
-
-    try {
-      setGlobalApplyBusy(true);
-
-      const fn = httpsCallable(functions, "debugApplyRegularGlobalAggregatorOnce");
-      const res = await fn({ roomId, weekIndex: currentWeekIndex });
-
-      console.log("====================================");
-      console.log("GLOBAL REGULAR AGGREGATOR APPLY RESULT");
-      console.log("Summary:", res.data);
-      console.table(
-        Object.entries(res.data?.diffsByUid || {}).map(([uid, diff]) => ({
-          uid,
-          diff,
-        }))
-      );
-      console.table(res.data?.matchups || []);
-      console.table(res.data?.weekLeaderboard || []);
-      console.log("====================================");
-
-      alert(
-        `Global aggregator applied: maxAbsDiff=${res.data?.maxAbsDiff ?? 0}, missingFixtures=${res.data?.missingFixtureCount ?? 0}`
-      );
-    } catch (e) {
-      console.error("GLOBAL REGULAR AGGREGATOR APPLY FAILED", e);
-      alert(e?.message || "Global regular aggregator apply failed. Check console.");
-    } finally {
-      setGlobalApplyBusy(false);
-    }
-  }
-
-  async function forceUpdateThisWeek() {
-    if (!isHost) return;
-    if (currentWeekIndex == null) return alert("No current weekIndex yet.");
-
-    try {
-      setForcingUpdate(true);
-      const fn = httpsCallable(functions, "debugForceUpdateWeek");
-      const res = await fn({ roomId, weekIndex: currentWeekIndex });        //does current week buttom one for specific weeks
-      //const res = await fn({ roomId, weekIndex: 1});
-      console.log("debugForceUpdateWeek:", res?.data);
-      alert("Success! Stats updated and saved.");
-    } catch (e) {
-      console.error(e);
-      alert("Error: " + (e?.message || "Unknown error"));
-    } finally {
-      setForcingUpdate(false);
-    }
-  }
-
-  async function recomputeRegularStandingsNow() {
-    if (!isHost) return;
-
-    try {
-      setRecomputingStandings(true);
-
-      const res = await recomputeStandingsFn({ roomId });
-
-      console.log("debugRecomputeRegularSeasonStandings:", res?.data);
-
-      const count = res?.data?.standingsCount ?? 0;
-      const finalWeekCount = res?.data?.standingsDoc?.finalWeekCount ?? "?";
-
-      alert(
-        `Leaderboard rebuilt. Rows: ${count}. Final weeks counted: ${finalWeekCount}.`
-      );
-    } catch (e) {
-      console.error("debugRecomputeRegularSeasonStandings failed", e);
-      alert("Error: " + (e?.message || "Unknown error"));
-    } finally {
-      setRecomputingStandings(false);
-    }
-  }
-
-  async function syncTotalRounds() {
-    if (!isHost) return;
-    try {
-      setSyncingRounds(true);
-      const res = await syncTotalRoundsFn({ roomId });
-      const total = res?.data?.totalRounds;
-      setTotalRounds(Number(total) > 0 ? Number(total) : null);
-      alert(`Saved total rounds: ${total ?? "OK"}`);
-    } catch (e) {
-      console.error(e);
-      alert("Error: " + (e?.message || "Unknown error"));
-    } finally {
-      setSyncingRounds(false);
-    }
-  }
-
- function forceFinalizeSeason() {
-    // Just toggle the UI, don't touch the database!
-    setDevPreviewComplete(true);
-  }
-
-  function clearFinalResults() {
-    // Revert the UI back to normal
-    setDevPreviewComplete(false);
-  }
-
-  async function createNextWeekNow() {
-    if (!isHost) return;
-    try {
-      setCreatingNextWeek(true);
-      const res = await createNextWeekFn({ roomId });
-      console.log("createNextWeek:", res?.data);
-      alert("Next week created (or already exists).");
-    } catch (e) {
-      console.error(e);
-      alert("Error: " + (e?.message || "Unknown error"));
-    } finally {
-      setCreatingNextWeek(false);
-    }
-  }
-
-  async function copyRoomCode() {
-    try {
-      await navigator.clipboard.writeText(String(roomId));
-      alert("Room code copied!");
-    } catch (e) {
-      console.error(e);
-      alert("Could not copy. Room code: " + String(roomId));
-    }
-  }
 
   //FInal results
   useEffect(() => {
@@ -1049,9 +825,7 @@ export default function TournamentPage() {
   const nextUpdateInSec = lastUpdateMs ? Math.max(0, 60 - (ageSec % 60)) : null;
   const lastUpdateLabel = lastUpdateMs ? fmtDT(lastUpdateMs) : "—";
 
-  // Add this variable right above the if statement
-  // Update to listen to devPreviewComplete
-  const isSeasonComplete = devPreviewComplete || Boolean(finalResultsDoc) || data?.room?.seasonPhase === "COMPLETE";
+  const isSeasonComplete = Boolean(finalResultsDoc) || data?.room?.seasonPhase === "COMPLETE";
 
   // Update the if statement to ONLY catch brand new drafts, not finished ones
   if (!isSeasonComplete && !activeResults) {
@@ -1128,7 +902,7 @@ export default function TournamentPage() {
             {showFinalPodium && (
               <div className="tpCard tpFull">
                 <FinalResultsCard
-                  finalResults={devPreviewComplete ? fakePodiumData : finalResultsDoc}
+                  finalResults={finalResultsDoc}
                   title="Season Complete"
                   subtitle="Top 3"
                   badge="🏆"
@@ -1408,106 +1182,6 @@ export default function TournamentPage() {
             >
               Scoring <span className={`tpCaret ${showScoring ? "open" : ""}`}>▾</span>
             </button>
-
-            {isHost && (
-              <details className="tpTools">
-                <summary className="tpPointsBtn tpToolsBtn" aria-label="Host tools">
-                  Tools <span className="tpCaret">▾</span>
-                </summary>
-                <div className="tpToolsMenu">
-                  <button
-                    type="button"
-                    className="tpToolsItem"
-                    onClick={debugRunGlobalShadowRegularTest}
-                    disabled={
-                      shadowTestBusy ||
-                      globalApplyBusy ||
-                      forcingUpdate ||
-                      creatingNextWeek ||
-                      repairing ||
-                      recomputingStandings
-                    }
-                  >
-                    {shadowTestBusy ? "Running Shadow Test..." : "DEV: Test Global Shadow"}
-                  </button>
-
-                  <button
-                    type="button"
-                    className="tpToolsItem"
-                    onClick={debugApplyRegularGlobalAggregatorOnce}
-                    disabled={
-                      globalApplyBusy ||
-                      shadowTestBusy ||
-                      forcingUpdate ||
-                      creatingNextWeek ||
-                      repairing ||
-                      recomputingStandings
-                    }
-                  >
-                    {globalApplyBusy ? "Applying Global..." : "DEV: Apply Global Aggregator Once"}
-                  </button>
-
-                  <button
-                    type="button"
-                    className="tpToolsItem"
-                    onClick={forceUpdateThisWeek}
-                    disabled={forcingUpdate || creatingNextWeek || repairing}
-                  >
-                    {forcingUpdate ? "Updating..." : "Refresh Stats"}
-                  </button>
-
-                  <button
-                    type="button"
-                    className="tpToolsItem"
-                    onClick={syncTotalRounds}
-                    disabled={syncingRounds || forcingUpdate || creatingNextWeek || repairing}
-                  >
-                    {syncingRounds ? "Syncing..." : "Sync Total Rounds"}
-                  </button>
-
-                  <button
-                    type="button"
-                    className="tpToolsItem"
-                    onClick={recomputeRegularStandingsNow}
-                    disabled={recomputingStandings || forcingUpdate || creatingNextWeek || repairing}
-                  >
-                    {recomputingStandings ? "Rebuilding..." : "DEV: Rebuild Leaderboard"}
-                  </button>
-
-                  <button className="tpToolsItem" onClick={forceFinalizeSeason} disabled={forcingFinalize}>
-                    {forcingFinalize ? "Finalizing..." : "DEV: Force Final Podium"}
-                  </button>
-
-                  <button className="tpToolsItem" onClick={clearFinalResults} disabled={clearingFinalize}>
-                    {clearingFinalize ? "Clearing..." : "DEV: Clear Final Podium"}
-                  </button>
-
-                  <button
-                    type="button"
-                    className="tpToolsItem"
-                    onClick={createNextWeekNow}
-                    disabled={creatingNextWeek || forcingUpdate || repairing}
-                  >
-                    {creatingNextWeek ? "Creating..." : "Next Week"}
-                  </button>
-
-
-                  <button
-                    type="button"
-                    className="tpToolsItem"
-                    onClick={repairThisWeek}
-                    disabled={repairing || forcingUpdate || creatingNextWeek}
-                  >
-                    {repairing ? "Repairing..." : "Repair Fixtures"}
-                  </button>
-
-
-                  <button type="button" className="tpToolsItem" onClick={copyRoomCode}>
-                    Copy Room Code
-                  </button>
-                </div>
-              </details>
-            )}
           </div>
 
           {showScoring && (
@@ -1532,7 +1206,7 @@ export default function TournamentPage() {
    {showFinalPodium && (
       <div className="tpCard tpFull">
         <FinalResultsCard
-          finalResults={devPreviewComplete ? fakePodiumData : finalResultsDoc}
+          finalResults={finalResultsDoc}
           title="Season Complete"
           subtitle="Top 3"
           badge="🏆"

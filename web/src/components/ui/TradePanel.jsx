@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { auth, db } from "../../firebase";
 import { createTradeOffer, respondToTradeOffer, applyAcceptedTrade } from "../../firebase";
 import { collection, onSnapshot, orderBy, query } from "firebase/firestore";
+import useUserProfiles from "../../lib/useUserProfiles";
 import "./TradePanel.css";
 
 function statusLabel(s) {
@@ -20,6 +21,14 @@ function statusClass(s) {
 function fmtSide(arr) {
   if (!arr?.length) return "—";
   return arr.map(p => `${p.playerName} (${p.position || "SUB"})`).join(", ");
+}
+
+function memberUidOf(member) {
+  return String(
+    typeof member === "string"
+      ? member
+      : member?.uid ?? member?.userId ?? member?.id ?? ""
+  ).trim();
 }
 
 export default function TradePanel({ roomId, tradeRoomPath, room, picks }) {
@@ -61,11 +70,39 @@ export default function TradePanel({ roomId, tradeRoomPath, room, picks }) {
 
   // Members + names
   const members = Array.isArray(room?.members) ? room.members : [];
+  const managerUids = useMemo(() => {
+    const ids = new Set();
+
+    for (const member of members) {
+      const uid = memberUidOf(member);
+      if (uid) ids.add(uid);
+    }
+
+    for (const pick of Array.isArray(picks) ? picks : []) {
+      const uid = String(pick?.uid || pick?.ownerUid || "").trim();
+      if (uid) ids.add(uid);
+    }
+
+    for (const trade of trades) {
+      if (trade?.fromUid) ids.add(String(trade.fromUid));
+      if (trade?.toUid) ids.add(String(trade.toUid));
+    }
+
+    return Array.from(ids);
+  }, [members, picks, trades]);
+  const profilesByUid = useUserProfiles(managerUids);
+  const managerName = (uid, fallback = "Manager") => {
+    const profile = profilesByUid?.[String(uid || "")] || {};
+    return profile?.displayName || profile?.name || fallback || "Manager";
+  };
   const nameByUid = useMemo(() => {
     const m = new Map();
-    for (const mem of members) m.set(mem.uid, mem.displayName);
+    for (const mem of members) {
+      const uid = memberUidOf(mem);
+      if (uid) m.set(uid, managerName(uid, mem?.displayName || uid));
+    }
     return m;
-  }, [members]);
+  }, [members, profilesByUid]);
 
   // Group picks by uid
   const picksByUid = useMemo(() => {
@@ -86,9 +123,10 @@ export default function TradePanel({ roomId, tradeRoomPath, room, picks }) {
 
   const partnerOptions = useMemo(() => {
     return members
-      .filter(m => m.uid && m.uid !== myUid)
-      .map(m => ({ uid: m.uid, name: m.displayName || m.uid }));
-  }, [members, myUid]);
+      .map((m) => ({ uid: memberUidOf(m), member: m }))
+      .filter(({ uid }) => uid && uid !== myUid)
+      .map(({ uid, member }) => ({ uid, name: managerName(uid, member?.displayName || uid) }));
+  }, [members, myUid, profilesByUid]);
 
   function pickById(pickId) {
     return (picks || []).find(p => p.id === pickId) || null;
@@ -258,7 +296,7 @@ export default function TradePanel({ roomId, tradeRoomPath, room, picks }) {
             <div key={t.id} className="tradeItem">
               <div className="tradeItemTop">
                 <div className="tradeItemFrom">
-                  From: <b>{t.fromName || nameByUid.get(t.fromUid) || t.fromUid}</b>
+                  From: <b>{managerName(t.fromUid, t.fromName || nameByUid.get(t.fromUid) || t.fromUid)}</b>
                 </div>
                 <div className={statusClass(t.status)}>{statusLabel(t.status)}</div>
               </div>
@@ -286,7 +324,7 @@ export default function TradePanel({ roomId, tradeRoomPath, room, picks }) {
             <div key={t.id} className="tradeItem">
               <div className="tradeItemTop">
                 <div className="tradeItemFrom">
-                  To: <b>{t.toName || nameByUid.get(t.toUid) || t.toUid}</b>
+                  To: <b>{managerName(t.toUid, t.toName || nameByUid.get(t.toUid) || t.toUid)}</b>
                 </div>
                 <div className={statusClass(t.status)}>{statusLabel(t.status)}</div>
               </div>
@@ -313,8 +351,8 @@ export default function TradePanel({ roomId, tradeRoomPath, room, picks }) {
             <div key={t.id} className="tradeItem tradeItem--compact">
               <div className="tradeItemTop">
                 <div className="tradeItemFrom">
-                  <b>{t.fromName || nameByUid.get(t.fromUid) || t.fromUid}</b> ↔{" "}
-                  <b>{t.toName || nameByUid.get(t.toUid) || t.toUid}</b>
+                  <b>{managerName(t.fromUid, t.fromName || nameByUid.get(t.fromUid) || t.fromUid)}</b> ↔{" "}
+                  <b>{managerName(t.toUid, t.toName || nameByUid.get(t.toUid) || t.toUid)}</b>
                 </div>
                 <div className={statusClass(t.status)}>{statusLabel(t.status)}</div>
               </div>

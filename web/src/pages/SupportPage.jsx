@@ -1,13 +1,16 @@
 import React, { useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import {
   Heart,
   CreditCard,
   MessageSquare,
-  Bug,
-  Lightbulb,
   Send,
   CheckCircle2,
   AlertTriangle,
+  FileText,
+  ShieldCheck,
+  Copyright,
+  Trash2,
 } from "lucide-react";
 import { getFunctions, httpsCallable } from "firebase/functions";
 import { getAuth } from "firebase/auth";
@@ -20,6 +23,33 @@ const MESSAGE_TYPES = [
   { value: "suggestion", label: "Suggestion" },
   { value: "question", label: "Question" },
   { value: "other", label: "Other" },
+];
+
+const LEGAL_LINKS = [
+  {
+    to: "/terms",
+    title: "Terms of Service",
+    text: "Review the terms of service",
+    icon: FileText,
+  },
+  {
+    to: "/privacy",
+    title: "Privacy Policy",
+    text: "Review the privacy policy",
+    icon: ShieldCheck,
+  },
+  {
+    to: "/copyright",
+    title: "Copyright Policy",
+    text: "Review the copyright policy",
+    icon: Copyright,
+  },
+  {
+    to: "/data-deletion",
+    title: "Data Deletion Request",
+    text: "Review the data deletion request.",
+    icon: Trash2,
+  },
 ];
 
 export default function SupportPage() {
@@ -157,7 +187,7 @@ export default function SupportPage() {
           )}
 
           <p className="support-small-text">
-            Payments are processed securely through Stripe. We never see your card details.
+            Donations are optional and processed securely through Stripe.
           </p>
         </article>
 
@@ -247,6 +277,31 @@ export default function SupportPage() {
             </button>
           </form>
         </article>
+      </section>
+
+      <section className="support-legal-section" aria-labelledby="legal-policies-title">
+        <div className="support-legal-header">
+          <h2 id="legal-policies-title">Legal &amp; Policies</h2>
+          <p>Quick links for account, privacy, copyright, and policy information or contact <b>support.futbolfantasy@gmail.com</b></p>
+        </div>
+
+        <div className="support-legal-grid">
+          {LEGAL_LINKS.map((item) => {
+            const Icon = item.icon;
+
+            return (
+              <Link className="support-legal-card" to={item.to} key={item.to}>
+                <span className="support-legal-icon">
+                  <Icon size={22} />
+                </span>
+                <span>
+                  <strong>{item.title}</strong>
+                  <small>{item.text}</small>
+                </span>
+              </Link>
+            );
+          })}
+        </div>
       </section>
     </main>
   );

@@ -210,7 +210,14 @@ async function getEmailsForUids(uids) {
 }
 
 const DEFAULT_TZ = "America/Los_Angeles";
-const ADMIN_UIDS = new Set(["PASTE_MY_UID_HERE"]);
+const ADMIN_UIDS = new Set(["WspA06q2KlQr7KUq2PP58FMyIJk2"]);
+
+// Owner-only tools. Never expose to regular users.
+function requireAdminUid(uid) {
+  if (!uid || !ADMIN_UIDS.has(String(uid))) {
+    throw new HttpsError("permission-denied", "Owner only.");
+  }
+}
 
 function getRoomTimeZone(room) {
   return (
@@ -286,6 +293,26 @@ async function getRoomMemberUids(roomRef, room) {
   } catch (_) {}
 
   return Array.from(new Set([...fromArray, ...fromSub]));
+}
+
+function requireDraftManagerCount(memberUids = []) {
+  const managerCount = Array.from(new Set((memberUids || []).map(String).filter(Boolean))).length;
+
+  if (managerCount < 2) {
+    throw new HttpsError(
+      "failed-precondition",
+      "Need at least 2 managers to start the draft."
+    );
+  }
+
+  if (managerCount % 2 !== 0) {
+    throw new HttpsError(
+      "failed-precondition",
+      "Regular Season head-to-head rooms need an even number of managers."
+    );
+  }
+
+  return managerCount;
 }
 
 
@@ -7500,14 +7527,656 @@ exports.debugComputeGlobalShadowCupRoom = onCall(
   }
 );
 
+function requireOwnerActionUid(request) {
+  const uid = request.auth?.uid;
+  if (!uid) throw new HttpsError("unauthenticated", "Sign in required.");
+  requireAdminUid(uid);
+  return String(uid);
+}
+
+function getOwnerActionRoomId(request) {
+  const roomId = String(request.data?.roomId || "").trim();
+  if (!roomId) throw new HttpsError("invalid-argument", "roomId is required.");
+  return roomId;
+}
+
+async function loadOwnerActionRoom(roomId) {
+  const roomRef = db.doc(`rooms/${roomId}`);
+  const roomSnap = await roomRef.get();
+  if (!roomSnap.exists) throw new HttpsError("not-found", "Room not found.");
+  return { roomRef, room: roomSnap.data() || {} };
+}
+
+function isOwnerWorldCupGroupRoom(room) {
+  const competitionState = getCompetitionState(room);
+  return (
+    room?.engineType === "worldCupDaily" ||
+    room?.worldCup?.engineType === "worldCupDaily" ||
+    room?.competitionState?.phaseLabel === "WorldCupGroup" ||
+    competitionState?.phaseLabel === "WorldCupGroup"
+  );
+}
+
+function assertOwnerRegularRoom(room) {
+  const phase = getRoomPhaseLabel(room);
+  if (phase === "Cup" || isOwnerWorldCupGroupRoom(room)) {
+    throw new HttpsError(
+      "failed-precondition",
+      "This owner action is only for regular season rooms."
+    );
+  }
+}
+
+function assertOwnerCupRoom(room) {
+  const phase = getRoomPhaseLabel(room);
+  if (phase !== "Cup") {
+    throw new HttpsError("failed-precondition", "Room is not in Cup phase.");
+  }
+}
+
+function resolveOwnerWeekIndex(room, weekIndexRaw) {
+  const resolved = Number(
+    Number.isFinite(Number(weekIndexRaw)) && Number(weekIndexRaw) > 0
+      ? weekIndexRaw
+      : room?.currentWeekIndex
+  );
+
+  if (!Number.isFinite(resolved) || resolved <= 0) {
+    throw new HttpsError("failed-precondition", "Room does not have a valid currentWeekIndex.");
+  }
+
+  return resolved;
+}
+
+function logOwnerAction(functionName, data = {}) {
+  console.log(`[${functionName}] owner action`, data);
+}
+
+function handleOwnerActionError(functionName, err) {
+  console.error(`[${functionName}] failed`, {
+    code: err?.code,
+    message: err?.message,
+    stack: err?.stack,
+  });
+
+  if (err instanceof HttpsError) throw err;
+  throw new HttpsError("internal", err?.message || `${functionName} failed.`);
+}
+
+function summarizeRegularGlobalResult(result, extras = {}) {
+  return {
+    ok: true,
+    ...extras,
+    roomId: result.roomId,
+    weekIndex: result.weekIndex,
+    seasonKey: result.seasonKey,
+    fixtureCount: Number(result.fixtureCount || 0),
+    missingFixtureCount: Number(result.missingFixtureCount || 0),
+    userCount: Number(result.userCount || 0),
+    maxAbsDiff: Number(result.maxAbsDiff || 0),
+    diffsByUid: result.diffsByUid || {},
+    matchups: result.matchups || [],
+    weekLeaderboard: result.weekLeaderboard || [],
+    weekStatus: result.weekStatus || null,
+    source: result.source || "global-live-fixtures",
+  };
+}
+
+async function buildRegularStandingsUsersForRoom({ roomId, roomRef, room }) {
+  const memberUids = await getRoomMemberUids(roomRef, room);
+  const users = [];
+
+  for (const mUid of memberUids.sort()) {
+    const [userSnap, memberSnap, teamNameSnap] = await Promise.all([
+      db.doc(`users/${mUid}`).get(),
+      db.doc(`rooms/${roomId}/members/${mUid}`).get(),
+      db.doc(`rooms/${roomId}/teamNames/${mUid}`).get(),
+    ]);
+
+    const profile = userSnap.exists ? userSnap.data() || {} : {};
+    const member = memberSnap.exists ? memberSnap.data() || {} : {};
+    const teamNameDoc = teamNameSnap.exists ? teamNameSnap.data() || {} : {};
+
+    const displayName = String(
+      profile.displayName ||
+        profile.name ||
+        member.displayName ||
+        member.name ||
+        mUid
+    ).trim();
+
+    const teamName = String(teamNameDoc.teamName || member.teamName || "").trim();
+
+    users.push({
+      userId: String(mUid),
+      uid: String(mUid),
+      displayName,
+      name: teamName ? `${displayName} - ${teamName}` : displayName,
+    });
+  }
+
+  return users;
+}
+
+exports.ownerForceRegularWeekUpdate = onCall(
+  { region: "us-west2", secrets: [APIFOOTBALL_KEY], timeoutSeconds: 540, memory: "1GiB" },
+  async (request) => {
+    const functionName = "ownerForceRegularWeekUpdate";
+    const nowMs = Date.now();
+
+    try {
+      const uid = requireOwnerActionUid(request);
+      const roomId = getOwnerActionRoomId(request);
+      const { roomRef, room } = await loadOwnerActionRoom(roomId);
+      assertOwnerRegularRoom(room);
+
+      const weekIndex = resolveOwnerWeekIndex(room, request.data?.weekIndex);
+      logOwnerAction(functionName, { functionName, uid, roomId, weekIndex, nowMs });
+
+      const weekSnap = await roomRef.collection("weeks").doc(String(weekIndex)).get();
+      if (!weekSnap.exists) {
+        throw new HttpsError("failed-precondition", `Week ${weekIndex} not found.`);
+      }
+
+      await db.doc(`rooms/${roomId}/weekResults/${String(weekIndex)}`).set(
+        { forceRecompute: true },
+        { merge: true }
+      );
+
+      await computeAndWriteLiveWeek({
+        roomId,
+        weekIndex,
+        apiKey: APIFOOTBALL_KEY.value(),
+      });
+
+      await db.doc(`rooms/${roomId}/weekResults/${String(weekIndex)}`).set(
+        { forceRecompute: FieldValue.delete() },
+        { merge: true }
+      );
+
+      await roomRef.collection("weeks").doc(String(weekIndex)).set(
+        { forceRecompute: FieldValue.delete() },
+        { merge: true }
+      );
+
+      const [resultSnap, freshRoomSnap] = await Promise.all([
+        db.doc(`rooms/${roomId}/weekResults/${String(weekIndex)}`).get(),
+        roomRef.get(),
+      ]);
+      const weekResult = resultSnap.exists ? resultSnap.data() || {} : null;
+      const freshRoom = freshRoomSnap.exists ? freshRoomSnap.data() || {} : {};
+
+      return {
+        ok: true,
+        roomId,
+        weekIndex,
+        message: "Owner force week update complete.",
+        weekResult,
+        status: weekResult?.status || null,
+        weekStatus: weekResult?.status || null,
+        competitionState: getCompetitionState(freshRoom),
+      };
+    } catch (err) {
+      handleOwnerActionError(functionName, err);
+    }
+  }
+);
+
+exports.ownerRepairRegularWeekFixtures = onCall(
+  { region: "us-west2", secrets: [APIFOOTBALL_KEY], timeoutSeconds: 540, memory: "1GiB" },
+  async (request) => {
+    const functionName = "ownerRepairRegularWeekFixtures";
+    const nowMs = Date.now();
+
+    try {
+      const uid = requireOwnerActionUid(request);
+      const roomId = getOwnerActionRoomId(request);
+      const { room, roomRef } = await loadOwnerActionRoom(roomId);
+      assertOwnerRegularRoom(room);
+
+      const weekIndex = resolveOwnerWeekIndex(room, request.data?.weekIndex);
+      logOwnerAction(functionName, { functionName, uid, roomId, weekIndex, nowMs });
+
+      const weekRef = roomRef.collection("weeks").doc(String(weekIndex));
+      const weekSnap = await weekRef.get();
+      if (!weekSnap.exists) {
+        throw new HttpsError("failed-precondition", `Week ${weekIndex} not found.`);
+      }
+
+      const week = weekSnap.data() || {};
+      const competition = week.competition || room.competition || {};
+      const league = Number(competition.league);
+      const season = Number(competition.season);
+      if (!Number.isFinite(league) || !Number.isFinite(season)) {
+        throw new HttpsError("failed-precondition", "Week is missing competition league/season.");
+      }
+
+      const startAtMs = Number(week.startAtMs || 0);
+      const endAtMs = Number(week.endAtMs || 0);
+      if (!Number.isFinite(startAtMs) || !Number.isFinite(endAtMs) || startAtMs <= 0 || endAtMs <= 0) {
+        throw new HttpsError("failed-precondition", "Week is missing a valid fixture window.");
+      }
+
+      const fromStr = new Date(startAtMs - 86400000).toISOString().split("T")[0];
+      const toStr = new Date(endAtMs + 86400000).toISOString().split("T")[0];
+      const timezone = competition.timezone || room?.competition?.timezone || "America/Los_Angeles";
+
+      const res = await apiFootballGet("fixtures", {
+        league,
+        season,
+        from: fromStr,
+        to: toStr,
+        timezone,
+      }, APIFOOTBALL_KEY.value());
+
+      const games = Array.isArray(res?.response) ? res.response : [];
+      if (!games.length) {
+        return {
+          ok: false,
+          roomId,
+          weekIndex,
+          fixtureCount: 0,
+          fixtureIds: [],
+          roundLabel: week.roundLabel || null,
+          nextPollAtMs: null,
+          nextKickoffMs: null,
+          message: "No games found in API for this week window.",
+        };
+      }
+
+      const fixtures = games
+        .map((m) => {
+          const id = m?.fixture?.id;
+          const kickoffMs =
+            m?.fixture?.timestamp ? Number(m.fixture.timestamp) * 1000 : Date.parse(m?.fixture?.date);
+          return {
+            id: id ? String(id) : null,
+            fixtureId: id ? String(id) : null,
+            kickoffMs,
+            round: m?.league?.round || null,
+            roundLabel: m?.league?.round || null,
+            homeTeamId: m?.teams?.home?.id != null ? String(m.teams.home.id) : "",
+            homeTeamName: m?.teams?.home?.name || "",
+            homeTeamLogo: m?.teams?.home?.logo || "",
+            awayTeamId: m?.teams?.away?.id != null ? String(m.teams.away.id) : "",
+            awayTeamName: m?.teams?.away?.name || "",
+            awayTeamLogo: m?.teams?.away?.logo || "",
+          };
+        })
+        .filter((fixture) => fixture.id && Number.isFinite(fixture.kickoffMs))
+        .sort((a, b) => a.kickoffMs - b.kickoffMs);
+
+      const fixtureIds = fixtures.map((fixture) => String(fixture.id));
+      const roundLabel = fixtures.find((fixture) => fixture.roundLabel)?.roundLabel || week.roundLabel || null;
+      const sleepInfo = getNextPollAtMsFromFixtures(fixtures, nowMs);
+
+      await weekRef.set(
+        {
+          fixtures,
+          fixtureIds,
+          fixturesRaw: games,
+          roundLabel,
+        },
+        { merge: true }
+      );
+
+      await setCompetitionState(
+        roomRef,
+        {
+          weekStatus: "scheduled",
+          nextPollAtMs: sleepInfo.nextPollAtMs ?? null,
+          nextKickoffMs: sleepInfo.nextKickoffMs ?? null,
+        },
+        {
+          roomData: room,
+          nowMs,
+        }
+      );
+
+      if (sleepInfo.nextPollAtMs) {
+        await upsertTournamentPollTask({
+          roomId,
+          phase: "RegularSeason",
+          nextPollAtMs: sleepInfo.nextPollAtMs,
+          reason: "owner-repair-week-fixtures",
+          nowMs,
+        });
+      }
+
+      return {
+        ok: true,
+        roomId,
+        weekIndex,
+        fixtureCount: fixtures.length,
+        fixtureIds,
+        roundLabel,
+        queueRepaired: Boolean(sleepInfo.nextPollAtMs),
+        nextPollAtMs: sleepInfo.nextPollAtMs ?? null,
+        nextKickoffMs: sleepInfo.nextKickoffMs ?? null,
+        message: `Updated Week ${weekIndex} with ${fixtures.length} fixtures.`,
+      };
+    } catch (err) {
+      handleOwnerActionError(functionName, err);
+    }
+  }
+);
+
+exports.ownerRebuildRegularStandings = onCall(
+  { region: "us-west2" },
+  async (request) => {
+    const functionName = "ownerRebuildRegularStandings";
+    const nowMs = Date.now();
+
+    try {
+      const uid = requireOwnerActionUid(request);
+      const roomId = getOwnerActionRoomId(request);
+      const { roomRef, room } = await loadOwnerActionRoom(roomId);
+      assertOwnerRegularRoom(room);
+      logOwnerAction(functionName, { functionName, uid, roomId, nowMs });
+
+      const users = await buildRegularStandingsUsersForRoom({ roomId, roomRef, room });
+      const standings = await recomputeRegularSeasonStandings({ roomId, users });
+      const standingsSnap = await db.doc(`rooms/${roomId}/standings/current`).get();
+
+      return {
+        ok: true,
+        roomId,
+        userCount: users.length,
+        standingsCount: standings.length,
+        standingsDoc: standingsSnap.exists ? standingsSnap.data() || null : null,
+        standings,
+      };
+    } catch (err) {
+      handleOwnerActionError(functionName, err);
+    }
+  }
+);
+
+exports.ownerRunCupEngineNow = onCall(
+  { region: "us-west2", secrets: [APIFOOTBALL_KEY], timeoutSeconds: 540, memory: "1GiB" },
+  async (request) => {
+    const functionName = "ownerRunCupEngineNow";
+    const nowMs = Date.now();
+
+    try {
+      const uid = requireOwnerActionUid(request);
+      const roomId = getOwnerActionRoomId(request);
+      const { roomRef, room } = await loadOwnerActionRoom(roomId);
+      assertOwnerCupRoom(room);
+      logOwnerAction(functionName, { functionName, uid, roomId, nowMs });
+
+      await setCompetitionState(
+        roomRef,
+        {
+          weekStatus: "scheduled",
+          isDone: false,
+          nextPollAtMs: null,
+          nextCupPollAtMs: null,
+        },
+        {
+          roomData: room,
+          nowMs,
+        }
+      );
+
+      await db.doc(`rooms/${roomId}/finalResults/current`).delete().catch(() => {});
+
+      await db.doc(`rooms/${roomId}/cup/current`).set(
+        {
+          status: "scheduled",
+          completed: false,
+          completedAtMs: FieldValue.delete(),
+          updatedAtMs: nowMs,
+          lastManualDebugAtMs: nowMs,
+          lastError: FieldValue.delete(),
+          lastErrorAtMs: FieldValue.delete(),
+
+          currentWindowId: null,
+          currentWindowLabel: null,
+          currentWindowFixtureIds: [],
+          currentWindowFixtures: [],
+          currentWindowStartAtMs: null,
+          currentWindowEndAtMs: null,
+
+          windowPointsByUid: {},
+          creditedFixtures: {},
+          breakdownByUserId: {},
+          livePointsByUid: {},
+          liveBreakdownByUserId: {},
+          projectedTotalsByUid: {},
+          projectedIncludesLivePoints: false,
+        },
+        { merge: true }
+      );
+
+      await runCupEngine({
+        db,
+        roomId,
+        room: {
+          ...room,
+          competitionState: {
+            ...(getCompetitionState(room) || {}),
+            weekStatus: "scheduled",
+            isDone: false,
+          },
+        },
+        nowMs,
+        forceRun: true,
+        apiKey: APIFOOTBALL_KEY.value(),
+        apiFootballGet,
+        getFixtureStatusMap,
+        getFixturePlayersStatsMapCached,
+      });
+
+      const [cupSnap, freshRoomSnap] = await Promise.all([
+        db.doc(`rooms/${roomId}/cup/current`).get(),
+        roomRef.get(),
+      ]);
+
+      return {
+        ok: true,
+        roomId,
+        message: "Owner Cup engine run complete.",
+        cup: cupSnap.exists ? cupSnap.data() : null,
+        competitionState: freshRoomSnap.exists
+          ? getCompetitionState(freshRoomSnap.data() || {})
+          : null,
+      };
+    } catch (err) {
+      handleOwnerActionError(functionName, err);
+    }
+  }
+);
+
+exports.ownerRunCupShadowTest = onCall(
+  { region: "us-west2", timeoutSeconds: 540, memory: "1GiB" },
+  async (request) => {
+    const functionName = "ownerRunCupShadowTest";
+    const nowMs = Date.now();
+
+    try {
+      const uid = requireOwnerActionUid(request);
+      const roomId = getOwnerActionRoomId(request);
+      const { room } = await loadOwnerActionRoom(roomId);
+      assertOwnerCupRoom(room);
+      logOwnerAction(functionName, { functionName, uid, roomId, nowMs });
+
+      const result = await computeGlobalCupShadowResults({ db, roomId, nowMs });
+
+      return {
+        ok: true,
+        roomId,
+        seasonKey: result.seasonKey,
+        fixtureCount: Number(result.fixtureCount || 0),
+        missingFixtureCount: Number(result.missingFixtureCount || 0),
+        userCount: Number(result.userCount || 0),
+        maxAbsDiff: Number(result.maxAbsDiff || 0),
+        diffsByUid: result.diffsByUid || {},
+        fixtureCoverage: result.fixtureCoverage || [],
+        playerMismatches: result.playerMismatches || [],
+        statMismatches: result.statMismatches || [],
+        compareScope: "current-cup-window",
+        source: "global-live-fixtures",
+      };
+    } catch (err) {
+      handleOwnerActionError(functionName, err);
+    }
+  }
+);
+
+exports.ownerRunRegularShadowTest = onCall(
+  { region: "us-west2", timeoutSeconds: 540, memory: "1GiB" },
+  async (request) => {
+    const functionName = "ownerRunRegularShadowTest";
+    const nowMs = Date.now();
+
+    try {
+      const uid = requireOwnerActionUid(request);
+      const roomId = getOwnerActionRoomId(request);
+      const { room } = await loadOwnerActionRoom(roomId);
+      assertOwnerRegularRoom(room);
+      const weekIndex = resolveOwnerWeekIndex(room, request.data?.weekIndex);
+      logOwnerAction(functionName, { functionName, uid, roomId, weekIndex, nowMs });
+
+      const result = await computeRegularWeekFromGlobalCache({
+        db,
+        roomId,
+        weekIndex,
+        nowMs,
+        writeMode: "shadow",
+        dryRun: true,
+      });
+
+      return {
+        ...summarizeRegularGlobalResult(result, {
+          compareScope: "current-regular-week",
+        }),
+        globalTotalsByUid: result.globalTotalsByUid || {},
+        legacyTotalsByUid: result.legacyTotalsByUid || {},
+        fixtureCoverage: result.fixtureCoverage || [],
+        playerMismatches: result.playerMismatches || [],
+        statMismatches: result.statMismatches || [],
+      };
+    } catch (err) {
+      handleOwnerActionError(functionName, err);
+    }
+  }
+);
+
+exports.ownerApplyRegularGlobalAggregatorOnce = onCall(
+  { region: "us-west2", timeoutSeconds: 540, memory: "1GiB" },
+  async (request) => {
+    const functionName = "ownerApplyRegularGlobalAggregatorOnce";
+    const nowMs = Date.now();
+
+    try {
+      const uid = requireOwnerActionUid(request);
+      const roomId = getOwnerActionRoomId(request);
+      const { room } = await loadOwnerActionRoom(roomId);
+      assertOwnerRegularRoom(room);
+      const weekIndex = resolveOwnerWeekIndex(room, request.data?.weekIndex);
+
+      const pipelineMode = getGlobalPipelineMode(room);
+      if (pipelineMode !== "global" || !isGlobalRoomAggregatorEnabled(room)) {
+        throw new HttpsError(
+          "failed-precondition",
+          "Regular global aggregator is disabled. Set globalPipeline.mode='global' and globalPipeline.roomAggregator=true first."
+        );
+      }
+
+      logOwnerAction(functionName, { functionName, uid, roomId, weekIndex, nowMs });
+
+      const result = await computeRegularWeekFromGlobalCache({
+        db,
+        roomId,
+        weekIndex,
+        nowMs,
+        writeMode: "global",
+        dryRun: false,
+      });
+
+      return summarizeRegularGlobalResult(result, {
+        realWriteApplied: Boolean(result.realWriteApplied),
+      });
+    } catch (err) {
+      handleOwnerActionError(functionName, err);
+    }
+  }
+);
+
+exports.ownerRunWorldCupGroupEngineNow = onCall(
+  { region: "us-west2", secrets: [APIFOOTBALL_KEY], timeoutSeconds: 540, memory: "1GiB" },
+  async (request) => {
+    const functionName = "ownerRunWorldCupGroupEngineNow";
+    const nowMs = Date.now();
+
+    try {
+      const uid = requireOwnerActionUid(request);
+      const roomId = getOwnerActionRoomId(request);
+      const { room } = await loadOwnerActionRoom(roomId);
+
+      if (!isOwnerWorldCupGroupRoom(room)) {
+        throw new HttpsError("failed-precondition", "Room is not a World Cup group room.");
+      }
+
+      const requestedNowMs = Number(request.data?.nowMs || nowMs);
+      const debugNowMs = Number.isFinite(requestedNowMs) ? requestedNowMs : nowMs;
+      const engineType = room.engineType || room.worldCup?.engineType || "";
+      const worldCupPhase = room.worldCupPhase || room.worldCup?.phase || "";
+      const dayIndex = room?.worldCup?.currentDayIndex ?? room?.currentDayIndex ?? null;
+
+      logOwnerAction(functionName, {
+        functionName,
+        uid,
+        roomId,
+        dayIndex,
+        nowMs: debugNowMs,
+        engineType,
+        worldCupPhase,
+      });
+
+      const result = await runWorldCupGroupEngine({
+        db,
+        roomId,
+        room,
+        apiKey: APIFOOTBALL_KEY.value(),
+        nowMs: debugNowMs,
+        getFixtureStatusMap,
+        getFixturePlayersStatsMapCached,
+        setCompetitionState,
+        ensureDefaultLineupsForRoom,
+      });
+
+      return {
+        ok: true,
+        roomId,
+        nowMs: debugNowMs,
+        engineType,
+        worldCupPhase,
+        result,
+        currentDayIndex: result?.dayIndex ?? result?.currentDayIndex ?? null,
+        status: result?.status ?? null,
+        weekStatus: result?.weekStatus ?? null,
+        isDone: Boolean(result?.isDone),
+        nextPollAtMs: result?.nextPollAtMs ?? null,
+        nextKickoffMs: result?.nextKickoffMs ?? null,
+        fixtureCoverage: result?.fixtureCoverage || [],
+        teamScoresByUserId: result?.teamScoresByUserId || {},
+        dailyLeaderboard: result?.dailyLeaderboard || [],
+        standingsPreview: result?.standingsPreview || result?.leaderboard || [],
+      };
+    } catch (err) {
+      handleOwnerActionError(functionName, err);
+    }
+  }
+);
+
 exports.repairCompetitionStateFields = onCall(
   { region: "us-west2" },
   async (request) => {
     const uid = request.auth?.uid;
     if (!uid) throw new HttpsError("unauthenticated", "Sign in required.");
-    if (!ADMIN_UIDS.has(uid)) {
-      throw new HttpsError("permission-denied", "Admin only.");
-    }
+    requireAdminUid(uid);
 
     const nowMs = Date.now();
     const roomsSnap = await db.collection("rooms").get();
@@ -7550,6 +8219,672 @@ exports.repairCompetitionStateFields = onCall(
       repaired,
       deletedFlatFields,
     };
+  }
+);
+
+function ownerStatusMs(value) {
+  if (value == null) return null;
+  if (typeof value === "number") {
+    return Number.isFinite(value) && value > 0 ? value : null;
+  }
+  if (typeof value === "string") {
+    const n = Number(value);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  }
+  if (typeof value?.toMillis === "function") {
+    const n = Number(value.toMillis());
+    return Number.isFinite(n) && n > 0 ? n : null;
+  }
+  if (typeof value?.toDate === "function") {
+    const n = Number(value.toDate().getTime());
+    return Number.isFinite(n) && n > 0 ? n : null;
+  }
+  if (value instanceof Date) {
+    const n = Number(value.getTime());
+    return Number.isFinite(n) && n > 0 ? n : null;
+  }
+  if (Number.isFinite(Number(value?.seconds))) {
+    const n = Number(value.seconds) * 1000;
+    return Number.isFinite(n) && n > 0 ? n : null;
+  }
+  return null;
+}
+
+function ownerCountBy(map, key) {
+  const k = String(key || "unknown");
+  map[k] = Number(map[k] || 0) + 1;
+}
+
+function ownerMemberUid(member) {
+  return String(
+    typeof member === "string"
+      ? member
+      : member?.uid ?? member?.userId ?? member?.id ?? ""
+  ).trim();
+}
+
+function getOwnerRoomManagerCount(room = {}) {
+  const members = Array.isArray(room?.members) ? room.members : [];
+  const ids = new Set(members.map(ownerMemberUid).filter(Boolean));
+  const count =
+    ids.size ||
+    members.length ||
+    Number(room?.managerCount || room?.memberCount || 0) ||
+    0;
+
+  return Number.isFinite(count) ? count : 0;
+}
+
+function ownerMinMs(current, next) {
+  const n = ownerStatusMs(next);
+  if (!n) return current || null;
+  return current ? Math.min(current, n) : n;
+}
+
+function ownerMaxMs(current, next) {
+  const n = ownerStatusMs(next);
+  if (!n) return current || null;
+  return current ? Math.max(current, n) : n;
+}
+
+function getOwnerCompetitionLabel({ competitionMeta = {}, competition = {}, competitionKey = "" } = {}) {
+  const league = competition?.league || "unknown";
+  const season = competition?.season || "unknown";
+  return (
+    competitionMeta?.name ||
+    competition?.name ||
+    competitionKey ||
+    `League ${league} ${season}`
+  );
+}
+
+function ownerNormalizeKey(value) {
+  return (
+    String(value || "")
+      .trim()
+      .toLowerCase()
+      .replace(/[''`]/g, "")
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "") || "unknown"
+  );
+}
+
+function ownerHasValue(value) {
+  const str = String(value ?? "").trim().toLowerCase();
+  return Boolean(str && str !== "unknown" && str !== "null" && str !== "undefined");
+}
+
+function getOwnerCompetitionGroupKey(roomStatus) {
+  if (ownerHasValue(roomStatus.seasonKey)) {
+    return ownerNormalizeKey(roomStatus.seasonKey);
+  }
+  if (ownerHasValue(roomStatus.league) && ownerHasValue(roomStatus.season)) {
+    return `league_${ownerNormalizeKey(roomStatus.league)}_season_${ownerNormalizeKey(roomStatus.season)}`;
+  }
+  if (ownerHasValue(roomStatus.competitionKey)) {
+    return ownerNormalizeKey(roomStatus.competitionKey);
+  }
+  return ownerNormalizeKey(roomStatus.competitionLabel);
+}
+
+function ownerIsWorldCupRoom(roomStatus = {}) {
+  return (
+    String(roomStatus.competitionLabel || "").toLowerCase().includes("world cup") ||
+    String(roomStatus.seasonKey || "").toLowerCase().includes("worldcup") ||
+    String(roomStatus.seasonKey || "").toLowerCase().includes("world-cup") ||
+    String(roomStatus.engineType || "") === "worldCupDaily" ||
+    String(roomStatus.phaseLabel || "") === "WorldCupGroup"
+  );
+}
+
+function ownerHasRealCompetition(roomStatus = {}) {
+  return (
+    ownerHasValue(roomStatus.phaseLabel) ||
+    ownerHasValue(roomStatus.competitionKey) ||
+    ownerHasValue(roomStatus.seasonKey) ||
+    ownerHasValue(roomStatus.competitionType) ||
+    (ownerHasValue(roomStatus.league) && ownerHasValue(roomStatus.season))
+  );
+}
+
+function ownerIsComplete(roomStatus = {}) {
+  const weekStatus = String(roomStatus.weekStatus || "").toLowerCase();
+  return (
+    Boolean(roomStatus.isDone) ||
+    weekStatus === "complete" ||
+    weekStatus === "final" ||
+    String(roomStatus.seasonPhase || "").toUpperCase() === "COMPLETE"
+  );
+}
+
+function ownerIsActionableQueueMissing(roomStatus = {}) {
+  const weekStatus = String(roomStatus.weekStatus || "").toLowerCase();
+  const status = String(roomStatus.status || "").toLowerCase();
+  const isRunnableStatus = ["scheduled", "live", "resolving"].includes(weekStatus);
+  const isActiveRoom =
+    Boolean(roomStatus.competitionLocked) ||
+    status === "ready_to_draft" ||
+    Boolean(roomStatus.started);
+
+  return (
+    !roomStatus.queue &&
+    !ownerIsComplete(roomStatus) &&
+    isActiveRoom &&
+    isRunnableStatus &&
+    (Boolean(roomStatus.nextPollAtMs) || ownerHasValue(roomStatus.phaseLabel)) &&
+    ownerHasRealCompetition(roomStatus)
+  );
+}
+
+function ownerIsIgnoredMissingQueue(roomStatus = {}) {
+  if (roomStatus.queue || ownerIsComplete(roomStatus) || ownerIsActionableQueueMissing(roomStatus)) {
+    return false;
+  }
+
+  return (
+    !ownerHasRealCompetition(roomStatus) ||
+    !ownerHasValue(roomStatus.phaseLabel) ||
+    !["scheduled", "live", "resolving"].includes(String(roomStatus.weekStatus || "").toLowerCase()) ||
+    (!roomStatus.competitionLocked && !roomStatus.started && String(roomStatus.status || "").toLowerCase() !== "ready_to_draft")
+  );
+}
+
+function getOwnerQueueState(roomStatus = {}, nowMs) {
+  const nextPollAtMs = ownerStatusMs(roomStatus.queue?.nextPollAtMs || roomStatus.nextPollAtMs);
+  if (roomStatus.queue?.dueNow || (nextPollAtMs && nextPollAtMs <= nowMs)) return "due";
+  if (nextPollAtMs && nextPollAtMs > nowMs) return "future";
+  if (roomStatus.actionableMissingQueue) return "missing";
+  if (roomStatus.ignoredMissingQueue) return "ignored missing";
+  return "none";
+}
+
+function buildOwnerDisplayStatus(roomStatus = {}, nowMs) {
+  const raw = String(roomStatus.weekStatus || "").toLowerCase();
+  const isDone =
+    Boolean(roomStatus.isDone) ||
+    raw === "complete" ||
+    raw === "final" ||
+    String(roomStatus.seasonPhase || "").toUpperCase() === "COMPLETE";
+  const nextPollAtMs = ownerStatusMs(roomStatus.queue?.nextPollAtMs || roomStatus.nextPollAtMs);
+  const updatedAtMs = ownerStatusMs(roomStatus.updatedAtMs || roomStatus.lastUpdateAtMs);
+  const isDueNow = Boolean(nextPollAtMs && nextPollAtMs <= nowMs);
+  const staleLive =
+    (raw === "live" || raw === "resolving") &&
+    updatedAtMs &&
+    nowMs - updatedAtMs > 5 * 60 * 1000;
+
+  if (isDone) {
+    return { key: "complete", label: "COMPLETE", className: "complete", priority: 20 };
+  }
+  if (staleLive) {
+    return { key: "stale", label: "STALE LIVE", className: "problem", priority: 80 };
+  }
+  if (raw === "live") {
+    return { key: "live", label: "LIVE UPDATING", className: "live", priority: 70 };
+  }
+  if (raw === "resolving") {
+    return { key: "resolving", label: "RESOLVING", className: "resolving", priority: 60 };
+  }
+  if (isDueNow && ["scheduled", "live", "resolving"].includes(raw)) {
+    return { key: "due", label: "DUE NOW", className: "due", priority: 55 };
+  }
+  // Match tournament pages: scheduled/sleeping rooms display as IDLE.
+  if (raw === "scheduled" || raw === "idle") {
+    return { key: "idle", label: "IDLE", className: "idle", priority: 40 };
+  }
+  if (roomStatus.isIgnoredRoom) {
+    return { key: "ignored", label: "IGNORED", className: "ignored", priority: 0 };
+  }
+  if (roomStatus.actionableMissingQueue) {
+    return { key: "missing", label: "MISSING POLL", className: "problem", priority: 75 };
+  }
+  return { key: "unknown", label: "UNKNOWN", className: "idle", priority: 5 };
+}
+
+function buildOwnerRoomStatusPill(roomStatus = {}, nowMs) {
+  return buildOwnerDisplayStatus(roomStatus, nowMs);
+}
+
+function buildOwnerRoomHealth(roomStatus = {}, nowMs) {
+  if (roomStatus.isIgnoredRoom) {
+    return { key: "ignored", label: "Ignored", priority: 0 };
+  }
+
+  const weekStatus = String(roomStatus.weekStatus || "").toLowerCase();
+  const nextPollAtMs = ownerStatusMs(roomStatus.queue?.nextPollAtMs || roomStatus.nextPollAtMs);
+  const updatedAtMs = ownerStatusMs(roomStatus.updatedAtMs);
+  const staleMs = updatedAtMs ? nowMs - updatedAtMs : Infinity;
+  const dueMs = nextPollAtMs && nextPollAtMs <= nowMs ? nowMs - nextPollAtMs : 0;
+  const isLiveLike = weekStatus === "live" || weekStatus === "resolving";
+  const worldCupPoolProblem =
+    ownerIsWorldCupRoom(roomStatus) &&
+    (Boolean(roomStatus.worldCupPlayerPoolIncomplete) ||
+      Boolean(roomStatus.worldCupHitGlobalCap) ||
+      roomStatus.worldCupAllTeamsProcessed === false);
+
+  if (worldCupPoolProblem || (isLiveLike && staleMs > 15 * 60 * 1000) || dueMs > 15 * 60 * 1000) {
+    return { key: "problem", label: "Problem", priority: 30 };
+  }
+  if (
+    roomStatus.actionableMissingQueue ||
+    dueMs > 0 ||
+    (isLiveLike && staleMs > 5 * 60 * 1000) ||
+    !["idle", "scheduled", "live", "resolving", "complete", "final"].includes(weekStatus)
+  ) {
+    return { key: "warning", label: "Warning", priority: 20 };
+  }
+  return { key: "ok", label: "OK", priority: 10 };
+}
+
+function buildOwnerRoomStatus({ roomDoc, queueTask, nowMs }) {
+  const room = roomDoc.data() || {};
+  const competition = room.competition || {};
+  const competitionMeta = room.competitionMeta || {};
+  const competitionState = getCompetitionState(room) || {};
+  const league = competition?.league ?? competitionMeta?.league ?? "";
+  const season = competition?.season ?? competitionMeta?.season ?? "";
+  const seasonKey = room.seasonKey || room.worldCup?.seasonKey || "";
+  const competitionKey = room.competitionKey || "";
+  const competitionType = room.competitionType || competitionMeta?.type || "";
+  const competitionLabel = getOwnerCompetitionLabel({ competitionMeta, competition, competitionKey });
+  const phaseLabel = competitionState?.phaseLabel || "";
+  const weekStatus = competitionState?.weekStatus || "";
+  const isDone = Boolean(competitionState?.isDone);
+  const nextPollAtMs = ownerStatusMs(competitionState?.nextPollAtMs);
+  const nextKickoffMs = ownerStatusMs(competitionState?.nextKickoffMs);
+  const queueNextPollAtMs = ownerStatusMs(queueTask?.nextPollAtMs);
+  const queueUpdatedAtMs = ownerStatusMs(queueTask?.updatedAtMs) || ownerStatusMs(queueTask?.updatedAt);
+  const roomUpdatedAtMs = ownerStatusMs(room.updatedAtMs);
+  const roomUpdatedAt = ownerStatusMs(room.updatedAt);
+  const competitionStateUpdatedAtMs = ownerStatusMs(competitionState?.updatedAtMs);
+  const managerCount = getOwnerRoomManagerCount(room);
+  const managerLimit = 10;
+  let managerCountWarning = "";
+  if (managerCount < 2 && !room.started) {
+    managerCountWarning = "Need at least 2 managers before draft start.";
+  } else if (managerCount % 2 !== 0 && !room.started) {
+    managerCountWarning = "Head-to-head rooms need an even number of managers.";
+  }
+  const lastUpdateAtMs =
+    roomUpdatedAtMs ||
+    roomUpdatedAt ||
+    competitionStateUpdatedAtMs ||
+    queueUpdatedAtMs ||
+    null;
+  const lastUpdateSource =
+    roomUpdatedAtMs
+      ? "room.updatedAtMs"
+      : roomUpdatedAt
+        ? "room.updatedAt"
+        : competitionStateUpdatedAtMs
+          ? "competitionState.updatedAtMs"
+          : queueUpdatedAtMs
+            ? "queue.updatedAtMs"
+            : "none";
+  const baseStatus = {
+    roomId: roomDoc.id,
+    name: room.name || room.roomName || "Untitled room",
+    code: room.code || room.roomCode || roomDoc.id,
+    league,
+    season,
+    timezone: competition?.timezone || competitionState?.timezone || room.timezone || DEFAULT_TZ,
+    competition: {
+      league,
+      season,
+      timezone: competition?.timezone || "",
+      name: competition?.name || "",
+    },
+    competitionMeta: {
+      name: competitionMeta?.name || "",
+      type: competitionMeta?.type || "",
+      country: competitionMeta?.country || "",
+      logo: competitionMeta?.logo || competitionMeta?.leagueLogo || "",
+    },
+    seasonKey,
+    competitionKey,
+    competitionType,
+    competitionLabel,
+    engineType: room.engineType || room.worldCup?.engineType || "",
+    worldCupPhase: room.worldCupPhase || room.worldCup?.phase || "",
+    pipelineMode: room.globalPipeline?.mode || "",
+    phaseLabel,
+    weekStatus,
+    isDone,
+    nextPollAtMs,
+    nextKickoffMs,
+    status: room.status || "",
+    seasonPhase: room.seasonPhase || "",
+    currentWeekIndex: room.currentWeekIndex ?? null,
+    competitionLocked: Boolean(room.competitionLocked),
+    started: Boolean(room.started),
+    managerCount,
+    managerLimit,
+    managerCountLabel: `${managerCount}/${managerLimit}`,
+    managerCountWarning,
+    playerCount: Number(room.playerCount || 0),
+    playersFrom: room.playersFrom || "",
+    usedGlobalSeasonPlayers: Boolean(room.usedGlobalSeasonPlayers),
+    worldCupPlayerPoolIncomplete: Boolean(room.worldCupPlayerPoolIncomplete),
+    worldCupAllTeamsProcessed:
+      typeof room.worldCupAllTeamsProcessed === "boolean" ? room.worldCupAllTeamsProcessed : null,
+    worldCupHitGlobalCap: Boolean(room.worldCupHitGlobalCap),
+    updatedAtMs: lastUpdateAtMs,
+    lastUpdateAtMs,
+    lastUpdateSource,
+    queue: queueTask
+      ? {
+          phase: queueTask.phase || "",
+          reason: queueTask.reason || "",
+          nextPollAtMs: queueNextPollAtMs,
+          updatedAtMs: queueUpdatedAtMs,
+          dueNow: Boolean(queueNextPollAtMs && queueNextPollAtMs <= nowMs),
+        }
+      : null,
+  };
+
+  const actionableMissingQueue = ownerIsActionableQueueMissing(baseStatus);
+  const ignoredMissingQueue = ownerIsIgnoredMissingQueue(baseStatus);
+  const isIgnoredRoom = ignoredMissingQueue || (!ownerHasRealCompetition(baseStatus) && !baseStatus.queue);
+  const enrichedStatus = {
+    ...baseStatus,
+    actionableMissingQueue,
+    ignoredMissingQueue,
+    queueMissing: actionableMissingQueue,
+    isIgnoredRoom,
+  };
+  const queueState = getOwnerQueueState(enrichedStatus, nowMs);
+  const displayStatus = buildOwnerDisplayStatus({ ...enrichedStatus, queueState }, nowMs);
+  const roomStatusPill = displayStatus;
+  const roomHealth = buildOwnerRoomHealth({ ...enrichedStatus, queueState, roomStatusPill, displayStatus }, nowMs);
+
+  return {
+    ...enrichedStatus,
+    queueState,
+    displayStatus,
+    displayStatusLabel: displayStatus.label,
+    displayStatusClass: displayStatus.className,
+    roomStatusPill,
+    roomHealth,
+    isWorldCupRoom: ownerIsWorldCupRoom(enrichedStatus),
+  };
+}
+
+function createOwnerCompetitionGroup(roomStatus) {
+  const groupKey = getOwnerCompetitionGroupKey(roomStatus);
+  const label = getOwnerCompetitionLabel({
+    competitionMeta: roomStatus.competitionMeta,
+    competition: roomStatus.competition,
+    competitionKey: roomStatus.competitionKey,
+  });
+
+  return {
+    groupKey,
+    label,
+    league: roomStatus.league,
+    season: roomStatus.season,
+    country: roomStatus.competitionMeta?.country || "",
+    type: roomStatus.competitionMeta?.type || roomStatus.competitionType || "",
+    logo: roomStatus.competitionMeta?.logo || "",
+    seasonKey: roomStatus.seasonKey,
+    competitionKey: roomStatus.competitionKey,
+    competitionType: roomStatus.competitionType,
+    roomCount: 0,
+    countsByPhaseLabel: {},
+    countsByWeekStatus: {},
+    countsByEngineType: {},
+    countsByWorldCupPhase: {},
+    countsByPipelineMode: {},
+    scheduledCount: 0,
+    liveCount: 0,
+    resolvingCount: 0,
+    completeCount: 0,
+    doneCount: 0,
+    dueNowCount: 0,
+    futureQueueCount: 0,
+    missingQueueCount: 0,
+    actionableMissingQueueCount: 0,
+    ignoredMissingQueueCount: 0,
+    soonestNextPollAtMs: null,
+    soonestNextKickoffMs: null,
+    latestUpdatedAtMs: null,
+    groupStatusPill: { key: "unknown", label: "UNKNOWN", priority: 0 },
+    groupHealth: { key: "ok", label: "OK", priority: 10 },
+    isWorldCupGroup: ownerIsWorldCupRoom(roomStatus),
+    rooms: [],
+  };
+}
+
+function selectOwnerGroupDisplayStatus(rooms = []) {
+  const activeRooms = rooms.filter((room) => !room.isIgnoredRoom);
+  const knownStatuses = new Set(["scheduled", "idle", "live", "resolving", "complete", "final"]);
+  const actionableRooms = activeRooms.filter((room) =>
+    knownStatuses.has(String(room.weekStatus || "").toLowerCase())
+  );
+  const candidates = actionableRooms.length ? actionableRooms : activeRooms.length ? activeRooms : rooms;
+
+  if (!candidates.length) {
+    return { key: "unknown", label: "UNKNOWN", className: "idle", priority: 5 };
+  }
+
+  const byKey = (keys) =>
+    candidates
+      .filter((room) => keys.includes(String(room.displayStatus?.key || room.roomStatusPill?.key || "")))
+      .sort((a, b) => Number(b.displayStatus?.priority || b.roomStatusPill?.priority || 0) - Number(a.displayStatus?.priority || a.roomStatusPill?.priority || 0))[0];
+
+  const problem =
+    byKey(["stale", "missing", "problem"]) ||
+    candidates.find((room) => String(room.displayStatus?.className || room.roomStatusPill?.className || "") === "problem");
+  if (problem) return problem.displayStatus || problem.roomStatusPill;
+
+  const live = byKey(["live"]);
+  if (live) return live.displayStatus || live.roomStatusPill;
+
+  const resolving = byKey(["resolving"]);
+  if (resolving) return resolving.displayStatus || resolving.roomStatusPill;
+
+  const due = byKey(["due"]);
+  if (due) return due.displayStatus || due.roomStatusPill;
+
+  const idle = byKey(["idle"]);
+  if (idle) return idle.displayStatus || idle.roomStatusPill;
+
+  const complete = byKey(["complete"]);
+  if (complete) return complete.displayStatus || complete.roomStatusPill;
+
+  const ignored = rooms.find((room) => room.isIgnoredRoom);
+  if (ignored) return ignored.displayStatus || ignored.roomStatusPill;
+
+  return { key: "unknown", label: "UNKNOWN", className: "idle", priority: 5 };
+}
+
+exports.getOwnerSiteStatus = onCall(
+  {
+    region: "us-west2",
+    cors: [
+      "http://localhost:5173",
+      "http://127.0.0.1:5173",
+      "https://futbol-fantasy.com",
+      "https://www.futbol-fantasy.com",
+    ],
+  },
+  async (request) => {
+    try {
+      const uid = request.auth?.uid;
+      if (!uid) throw new HttpsError("unauthenticated", "Sign in required.");
+      requireAdminUid(uid);
+
+      const nowMs = Date.now();
+      const [roomsSnap, queueSnap] = await Promise.all([
+        db.collection("rooms").limit(1000).get(),
+        db.collection("tournamentPollQueue").limit(1000).get(),
+      ]);
+
+      const queueByRoomId = new Map(
+        queueSnap.docs.map((queueDoc) => [queueDoc.id, queueDoc.data() || {}])
+      );
+      const groupsByKey = new Map();
+      const totals = {
+        roomCount: 0,
+        scheduledCount: 0,
+        liveCount: 0,
+        resolvingCount: 0,
+        completeCount: 0,
+        doneCount: 0,
+        dueNowCount: 0,
+        futureQueueCount: 0,
+        missingQueueCount: 0,
+        actionableMissingQueueCount: 0,
+        ignoredMissingQueueCount: 0,
+        totalMissingQueueCount: 0,
+      };
+
+      for (const roomDoc of roomsSnap.docs) {
+        const roomStatus = buildOwnerRoomStatus({
+          roomDoc,
+          queueTask: queueByRoomId.get(roomDoc.id) || null,
+          nowMs,
+        });
+
+        const groupKey = getOwnerCompetitionGroupKey(roomStatus);
+        if (!groupsByKey.has(groupKey)) {
+          groupsByKey.set(groupKey, createOwnerCompetitionGroup(roomStatus));
+        }
+
+        const group = groupsByKey.get(groupKey);
+        const weekStatus = String(roomStatus.weekStatus || "").toLowerCase();
+
+        group.roomCount += 1;
+        totals.roomCount += 1;
+        ownerCountBy(group.countsByPhaseLabel, roomStatus.phaseLabel);
+        ownerCountBy(group.countsByWeekStatus, roomStatus.weekStatus);
+        ownerCountBy(group.countsByEngineType, roomStatus.engineType);
+        ownerCountBy(group.countsByWorldCupPhase, roomStatus.worldCupPhase);
+        ownerCountBy(group.countsByPipelineMode, roomStatus.pipelineMode);
+
+        if (weekStatus === "scheduled") {
+          group.scheduledCount += 1;
+          totals.scheduledCount += 1;
+        }
+        if (weekStatus === "live") {
+          group.liveCount += 1;
+          totals.liveCount += 1;
+        }
+        if (weekStatus === "resolving") {
+          group.resolvingCount += 1;
+          totals.resolvingCount += 1;
+        }
+        if (weekStatus === "complete" || String(roomStatus.seasonPhase || "").toUpperCase() === "COMPLETE") {
+          group.completeCount += 1;
+          totals.completeCount += 1;
+        }
+        if (roomStatus.isDone) {
+          group.doneCount += 1;
+          totals.doneCount += 1;
+        }
+        if (roomStatus.queue?.dueNow) {
+          group.dueNowCount += 1;
+          totals.dueNowCount += 1;
+        } else if (roomStatus.queue?.nextPollAtMs && roomStatus.queue.nextPollAtMs > nowMs) {
+          group.futureQueueCount += 1;
+          totals.futureQueueCount += 1;
+        }
+        if (roomStatus.actionableMissingQueue) {
+          group.missingQueueCount += 1;
+          group.actionableMissingQueueCount += 1;
+          totals.missingQueueCount += 1;
+          totals.actionableMissingQueueCount += 1;
+          totals.totalMissingQueueCount += 1;
+        }
+        if (roomStatus.ignoredMissingQueue) {
+          group.ignoredMissingQueueCount += 1;
+          totals.ignoredMissingQueueCount += 1;
+          totals.totalMissingQueueCount += 1;
+        }
+
+        group.soonestNextPollAtMs = ownerMinMs(
+          group.soonestNextPollAtMs,
+          roomStatus.queue?.nextPollAtMs || roomStatus.nextPollAtMs
+        );
+        group.soonestNextKickoffMs = ownerMinMs(group.soonestNextKickoffMs, roomStatus.nextKickoffMs);
+        group.latestUpdatedAtMs = ownerMaxMs(group.latestUpdatedAtMs, roomStatus.updatedAtMs);
+        if (ownerIsWorldCupRoom(roomStatus)) {
+          group.isWorldCupGroup = true;
+        }
+
+        group.rooms.push(roomStatus);
+      }
+
+      const groups = Array.from(groupsByKey.values())
+        .map((group) => {
+          const sortedRooms = (group.rooms || []).sort((a, b) => {
+            if (a.isIgnoredRoom !== b.isIgnoredRoom) return a.isIgnoredRoom ? 1 : -1;
+            const aP = Number(a.roomStatusPill?.priority || 0);
+            const bP = Number(b.roomStatusPill?.priority || 0);
+            if (aP !== bP) return bP - aP;
+            const aDue = ownerStatusMs(a.queue?.nextPollAtMs || a.nextPollAtMs) || Number.MAX_SAFE_INTEGER;
+            const bDue = ownerStatusMs(b.queue?.nextPollAtMs || b.nextPollAtMs) || Number.MAX_SAFE_INTEGER;
+            if (aDue !== bDue) return aDue - bDue;
+            return String(a.name || "").localeCompare(String(b.name || ""));
+          });
+          const healthSource = sortedRooms.reduce(
+            (best, room) => {
+              const current = room.roomHealth || { key: "ok", label: "OK", priority: 10 };
+              return Number(current.priority || 0) > Number(best.priority || 0) ? current : best;
+            },
+            { key: "ok", label: "OK", priority: 10 }
+          );
+          const allRoomsIgnored = sortedRooms.length > 0 && sortedRooms.every((room) => room.isIgnoredRoom);
+          const groupDisplayStatus = selectOwnerGroupDisplayStatus(sortedRooms);
+
+          return {
+            ...group,
+            groupStatusPill: groupDisplayStatus,
+            groupDisplayStatus,
+            groupDisplayStatusLabel: groupDisplayStatus.label,
+            groupDisplayStatusClass: groupDisplayStatus.className,
+            groupHealth: allRoomsIgnored ? { key: "ignored", label: "Ignored", priority: 0 } : healthSource,
+            rooms: sortedRooms.slice(0, 25),
+          };
+        })
+        .sort((a, b) => {
+          if (a.isWorldCupGroup !== b.isWorldCupGroup) return a.isWorldCupGroup ? -1 : 1;
+          const aProblem = String(a.groupHealth?.key || "") === "problem";
+          const bProblem = String(b.groupHealth?.key || "") === "problem";
+          if (aProblem !== bProblem) return aProblem ? -1 : 1;
+          const aActive = a.liveCount + a.resolvingCount;
+          const bActive = b.liveCount + b.resolvingCount;
+          if (aActive !== bActive) return bActive - aActive;
+          if (a.dueNowCount !== b.dueNowCount) return b.dueNowCount - a.dueNowCount;
+          const aWarning = String(a.groupHealth?.key || "") === "warning";
+          const bWarning = String(b.groupHealth?.key || "") === "warning";
+          if (aWarning !== bWarning) return aWarning ? -1 : 1;
+          const aPoll = ownerStatusMs(a.soonestNextPollAtMs) || Number.MAX_SAFE_INTEGER;
+          const bPoll = ownerStatusMs(b.soonestNextPollAtMs) || Number.MAX_SAFE_INTEGER;
+          if (aPoll !== bPoll) return aPoll - bPoll;
+          return String(a.label || "").localeCompare(String(b.label || ""));
+        });
+
+      return {
+        ok: true,
+        readOnly: true,
+        nowMs,
+        roomLimit: 1000,
+        scannedRoomCount: roomsSnap.size,
+        queueTaskCount: queueSnap.size,
+        competitionGroupCount: groups.length,
+        totals,
+        groups,
+      };
+    } catch (err) {
+      console.error("[getOwnerSiteStatus] failed", {
+        code: err?.code,
+        message: err?.message,
+        stack: err?.stack,
+      });
+
+      if (err instanceof HttpsError) throw err;
+      throw new HttpsError("internal", err?.message || "Owner status failed.");
+    }
   }
 );
 
@@ -8117,12 +9452,14 @@ exports.pollLiveTournamentWeeks = onSchedule(
     ]);
 
     const roomDocsById = new Map();
+    const queueDueRoomIds = new Set();
 
     // Queue tasks: read the room doc only when its wake time is due.
     for (const taskDoc of queueSnap.docs) {
       const task = taskDoc.data() || {};
       const roomId = String(task.roomId || taskDoc.id || "");
       if (!roomId) continue;
+      queueDueRoomIds.add(roomId);
 
       const roomSnap = await db.doc(`rooms/${roomId}`).get();
       if (!roomSnap.exists) {
@@ -8200,6 +9537,38 @@ exports.pollLiveTournamentWeeks = onSchedule(
             await deleteTournamentPollTask(roomId);
             continue;
           }
+        }
+
+        const stateNextPollAtMs = Number(competitionState?.nextPollAtMs || 0);
+        const isQueuedDue = queueDueRoomIds.has(roomId);
+
+        if (
+          isWorldCupDailyRoom &&
+          weekStatus === "scheduled" &&
+          !runSweep &&
+          Number.isFinite(stateNextPollAtMs) &&
+          stateNextPollAtMs > nowMs
+        ) {
+          if (isQueuedDue) {
+            await upsertTournamentPollTask({
+              roomId,
+              phase: "WorldCupGroup",
+              nextPollAtMs: stateNextPollAtMs,
+              reason: "world-cup-sleep-until-next-poll",
+              nowMs,
+            });
+          }
+
+          console.log("[pollLiveTournamentWeeks] world cup room sleeping until nextPollAtMs", {
+            roomId,
+            weekStatus,
+            nextPollAtMs: stateNextPollAtMs,
+            nowMs,
+            isQueuedDue,
+            runSweep,
+          });
+
+          continue;
         }
 
         // -------------------------
@@ -8952,6 +10321,9 @@ exports.scheduleDraft = onCall({ region: "us-west2" }, async (request) => {
   const whenStr = formatWhen(Number(startAtMs), tz);
 
   const memberUids = await getRoomMemberUids(roomRef, room);
+  if (!room.started) {
+    requireDraftManagerCount(memberUids);
+  }
 
   const reminderSendAtMs = Number(startAtMs) - 10 * 60 * 1000;
   const oldReminderId = room.draftReminderId || null;

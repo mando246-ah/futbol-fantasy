@@ -14,6 +14,11 @@ import Profile from "./pages/Profile";
 import DraftSummary from "./pages/DraftSummary";
 import Home from "./pages/Home";
 import SupportPage from "./pages/SupportPage";
+import SuperAdminFix246 from "./pages/SuperAdminFix246";
+import TermsPage from "./pages/Legal/TermsPage";
+import PrivacyPage from "./pages/Legal/PrivacyPage";
+import CopyrightPage from "./pages/Legal/CopyrightPage";
+import DataDeletionPage from "./pages/Legal/DataDeletionPage";
 //import TournamentPage from "./pages/TournamentPage/TournamentPage";
 import TournamentRouter from "./pages/TournamentPage/TournamentRouter";
 import {
@@ -37,6 +42,10 @@ import { Avatar, AvatarImage, AvatarFallback } from "./components/ui/avatar";
 import logo from "./assets/logo.png";
 import { useLocation, Outlet } from "react-router-dom";
 import "./styles/appShell.css";
+
+const OWNER_UIDS = new Set([
+  "WspA06q2KlQr7KUq2PP58FMyIJk2",
+]);
 
 
 function Nav({ user, displayName, photoURL }) {
@@ -66,6 +75,8 @@ function Nav({ user, displayName, photoURL }) {
     return () => window.removeEventListener("popstate", close);
   }, []);
 
+  const isOwner = Boolean(user?.uid && OWNER_UIDS.has(user.uid));
+
   const tabs = [
     { to: "/", label: "Home" },
     { to: "/draft", label: "Draft", hideWhenNoUser: true },
@@ -82,12 +93,16 @@ function Nav({ user, displayName, photoURL }) {
       disabled: !lastRoomId,
     },
     { to: "/profile", label: "Profile", hideWhenNoUser: true },
+    { to: "/superAdminFix246", label: "Owner Tools", ownerOnly: true },
     { to: "/signin", label: "Sign In", hideWhenAuthed: true },
     { to: "/support", label: "Support Us" },
   ];
 
   const visibleTabs = tabs.filter(
-    (t) => !(t.hideWhenAuthed && user) && !(t.hideWhenNoUser && !user)
+    (t) =>
+      !(t.hideWhenAuthed && user) &&
+      !(t.hideWhenNoUser && !user) &&
+      !(t.ownerOnly && !isOwner)
   );
 
   return (
@@ -246,6 +261,7 @@ function SignIn() {
   const [sent, setSent] = useState(false);
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
+  const [acceptedLegal, setAcceptedLegal] = useState(false);
 
   async function onSend(e) {
     e.preventDefault();
@@ -264,6 +280,11 @@ function SignIn() {
 
   async function onGoogle() {
     setErr("");
+    if (!acceptedLegal) {
+      setErr("Please agree to the Terms of Service and Privacy Policy before signing in.");
+      return;
+    }
+
     try {
       setBusy(true);
       setRememberMe(remember);
@@ -308,10 +329,41 @@ function SignIn() {
           <span>Keep me signed in on this device</span>
         </label>
 
+        <label className="flex items-start gap-3 text-sm opacity-90 mb-2 select-none">
+          <input
+            type="checkbox"
+            checked={acceptedLegal}
+            onChange={(e) => setAcceptedLegal(e.target.checked)}
+            className="mt-1"
+            required
+          />
+          <span>
+            I agree to the{" "}
+            <Link className="text-blue-300 hover:text-blue-200 font-semibold underline underline-offset-2" to="/terms">
+              Terms of Service
+            </Link>{" "}
+            and{" "}
+            <Link className="text-blue-300 hover:text-blue-200 font-semibold underline underline-offset-2" to="/privacy">
+              Privacy Policy
+            </Link>
+            .
+          </span>
+        </label>
+
+        <p className="text-xs text-slate-300 mb-4">
+          Fútbol Fantasy is an independent fantasy soccer platform.
+        </p>
+
+        {err && (
+          <div className="mb-4 rounded-xl border border-red-400/25 bg-red-500/10 px-3 py-2 text-sm text-red-100">
+            {err}
+          </div>
+        )}
+
         <button
           type="button"
           onClick={onGoogle}
-          disabled={busy}
+          disabled={busy || !acceptedLegal}
           className="w-full mb-4 px-3 py-2 rounded-xl border border-white/15 bg-white/10 text-white hover:bg-white/15 disabled:opacity-50"
         >
           Continue with Google
@@ -435,6 +487,10 @@ export default function App() {
           <Route path="*" element={<Home user={user} />} />
 
           <Route path="/signin" element={user ? <Navigate to="/" replace /> : <SignIn />} />
+          <Route path="/terms" element={<TermsPage />} />
+          <Route path="/privacy" element={<PrivacyPage />} />
+          <Route path="/copyright" element={<CopyrightPage />} />
+          <Route path="/data-deletion" element={<DataDeletionPage />} />
 
           <Route path="/profile" element={
             <RequireAuth user={user}>
@@ -465,6 +521,11 @@ export default function App() {
             <RequireAuth user={user}><TournamentRouter /></RequireAuth>
           } />
           <Route path="/support" element={<SupportPage />} />
+          <Route path="/superAdminFix246" element={
+            <RequireAuth user={user}>
+              <SuperAdminFix246 />
+            </RequireAuth>
+          } />
         </Route>
       </Routes>
     </Router>

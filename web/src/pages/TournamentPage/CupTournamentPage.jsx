@@ -1,6 +1,6 @@
 // src/pages/TournamentPage/CupTournamentPage.jsx
 import { useEffect, useMemo, useState, useRef } from "react";
-import { useParams, Link, useLocation, useNavigate } from "react-router-dom";
+import { useParams, Link, useLocation } from "react-router-dom";
 import { doc, onSnapshot, collection, query, orderBy, getDocs } from "firebase/firestore";
 
 import { useLineupsForUsers, useTournament } from "../../tournament/hooks/useTournament";
@@ -12,8 +12,6 @@ import "./TournamentPage.css";
 import { Avatar, AvatarImage, AvatarFallback } from "../../components/ui/avatar";
 import FlagIcon from "../../components/FlagIcon";
 import FinalResultsCard from "../../components/ui/FinalResultsCard";
-import { getApp } from "firebase/app";
-import { getFunctions, httpsCallable } from "firebase/functions";
 
 const SCORING_DISPLAY = [
   { label: "Appearance", detail: "+1 (any minutes)" },
@@ -889,7 +887,6 @@ function inferOwnerUidFromPick(d) {
 export default function CupTournamentPage() {
   const { roomId } = useParams();
   const location = useLocation();
-  const navigate = useNavigate();
   const { loading, error, data } = useTournament(roomId, { loadScope: "core", enableLocalFallback: false });
   const room = data?.room || {};
   const engineType = String(room?.engineType || room?.worldCup?.engineType || "").trim();
@@ -918,7 +915,6 @@ export default function CupTournamentPage() {
   const [roomPickDocs, setRoomPickDocs] = useState([]);
   const [selectedHistoryId, setSelectedHistoryId] = useState("");
   const [openHistoryBreakdownKey, setOpenHistoryBreakdownKey] = useState(null);
-  const [devPreviewComplete, setDevPreviewComplete] = useState(false);
   
   // Accordion State
   const [expandedPlayerId, setExpandedPlayerId] = useState(null);
@@ -926,11 +922,6 @@ export default function CupTournamentPage() {
   const [showScoring, setShowScoring] = useState(false);
   const scoringRef = useRef(null);
 
-  // Dev Tools State
-  const [devBusy, setDevBusy] = useState(false);
-  const [shadowTestBusy, setShadowTestBusy] = useState(false);
-  const [shadowTestResult, setShadowTestResult] = useState(null);
-  
 
   useEffect(() => {
     if (!roomId) return;
@@ -1371,23 +1362,7 @@ export default function CupTournamentPage() {
       })
     );
 
-  const fakePodiumData = {
-    computedAtMs: Date.now(),
-    top3: leaderboard.slice(0, 3).map((u, i) => ({
-      userId: u.userId,
-      uid: u.userId,
-      name: u.name,
-      rank: i + 1,
-      wins: 0,
-      draws: 0,
-      losses: 0,
-      tablePoints: u.totalPoints,
-      totalFantasyPoints: u.totalPoints,
-    })),
-  };
-  const showFinalPodium =
-    devPreviewComplete ||
-    (Boolean(finalResultsDoc) && (isFinal || isWorldCupGroupRoom));
+  const showFinalPodium = Boolean(finalResultsDoc) && (isFinal || isWorldCupGroupRoom);
 
   // Resolve Rosters Helper
   function firstNonEmptyArray(...candidates) {
@@ -2048,87 +2023,6 @@ export default function CupTournamentPage() {
   const otherUsers = users.filter(u => u.userId !== myUid);
   const isLineupLoading = (uid) => Boolean(stagedLineups.loadingByUid?.[String(uid || "")]);
 
-
-  //Dev tools
-  async function copyRoomCode() {
-    try {
-      await navigator.clipboard.writeText(String(roomId));
-      alert("Room code copied!");
-    } catch (e) {
-      alert("Could not copy.");
-    }
-  }
-
-  function switchTournamentView(view) {
-    const params = new URLSearchParams(location.search);
-    params.set("view", view);
-    const search = params.toString();
-    navigate(
-      {
-        pathname: location.pathname,
-        search: search ? `?${search}` : "",
-      },
-      { replace: false }
-    );
-  }
-
-  async function forceRunCup() {
-    try {
-      setDevBusy(true);
-
-      const functions = getFunctions(getApp(), "us-west2");
-      const callForceRunCup = httpsCallable(functions, "debugForceRunCup");
-      const res = await callForceRunCup({ roomId });
-
-      console.log("debugForceRunCup:", res.data);
-      alert(res.data?.message || "Cup sync complete.");
-    } catch (e) {
-      console.error("debugForceRunCup failed", e);
-      alert(e?.message || "Cup sync failed.");
-    } finally {
-      setDevBusy(false);
-    }
-  }
-
-  async function debugRunGlobalShadowCupTest() {
-    if (!roomId) return;
-
-    setShadowTestBusy(true);
-
-    try {
-      const functions = getFunctions(getApp(), "us-west2");
-      const fn = httpsCallable(functions, "debugComputeGlobalShadowCupRoom");
-      const res = await fn({ roomId });
-
-      console.log("====================================");
-      console.log("GLOBAL SHADOW CUP TEST RESULT");
-      console.log("Room:", roomId);
-      console.log("Season:", res.data?.seasonKey);
-      console.log("Summary:", res.data);
-      console.table(res.data?.fixtureCoverage || []);
-      console.table(
-        Object.entries(res.data?.diffsByUid || {}).map(([uid, diff]) => ({
-          uid,
-          diff,
-        }))
-      );
-      console.table(res.data?.playerMismatches || []);
-      console.table(res.data?.statMismatches || []);
-      console.log("Max Abs Diff:", res.data?.maxAbsDiff);
-      console.log("Missing Fixtures:", res.data?.missingFixtureCount);
-      console.log("====================================");
-
-      alert(
-        `Shadow Cup test complete: maxAbsDiff=${res.data?.maxAbsDiff ?? 0}, missingFixtures=${res.data?.missingFixtureCount ?? 0}`
-      );
-    } catch (e) {
-      console.error("GLOBAL SHADOW CUP TEST FAILED", e);
-      alert(e?.message || "Global shadow test failed. Check console.");
-    } finally {
-      setShadowTestBusy(false);
-    }
-  }
-
     const roomNextLabel =
         room?.competitionState?.currentLabel ||
         room?.["competitionState.currentLabel"] ||
@@ -2193,53 +2087,6 @@ export default function CupTournamentPage() {
                 >
                 Scoring <span className={`tpCaret ${showScoring ? "open" : ""}`}>▾</span>
                 </button>
-
-                {isHost && (
-                <details className="tpTools">
-                    <summary className="tpPointsBtn tpToolsBtn">
-                    Tools <span className="tpCaret">▾</span>
-                    </summary>
-                    <div className="tpToolsMenu">
-                    <button
-                      type="button"
-                      className="tpToolsItem"
-                      onClick={() => switchTournamentView("worldcup")}
-                    >
-                      View World Cup UI
-                    </button>
-
-                    <button className="tpToolsItem" onClick={() => setDevPreviewComplete(!devPreviewComplete)}>
-                        {devPreviewComplete ? "Hide Podium" : "DEV: Preview Final Podium"}
-                    </button>
-
-                    {!isWorldCupGroupRoom && (
-                      <>
-                        <button
-                          type="button"
-                          className="tpToolMenuItem"
-                          onClick={debugRunGlobalShadowCupTest}
-                          disabled={shadowTestBusy}
-                        >
-                          {shadowTestBusy ? "Running Shadow Test..." : "DEV: Test Global Shadow"}
-                        </button>
-
-                        <button
-                          type="button"
-                          className="tpToolsItem"
-                          onClick={forceRunCup}
-                          disabled={devBusy}
-                        >
-                          {devBusy ? "Running Cup Sync..." : "DEV: Fix Cup Fixtures / Points"}
-                        </button>
-                      </>
-                    )}
-
-                    <button type="button" className="tpToolsItem" onClick={copyRoomCode}>
-                        Copy Room Code
-                    </button>
-                    </div>
-                </details>
-                )}
             </div>
 
             {showScoring && (
@@ -2263,7 +2110,7 @@ export default function CupTournamentPage() {
           {showFinalPodium && (
             <div className="tpCard tpFull">
               <FinalResultsCard
-                finalResults={devPreviewComplete ? fakePodiumData : finalResultsDoc}
+                finalResults={finalResultsDoc}
                 title={isWorldCupGroupRoom ? "World Cup Complete" : "Cup Complete"}
                 subtitle={isWorldCupGroupRoom ? "Top 3 Managers" : "Final Podium"}
                 badge="🏆"
