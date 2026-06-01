@@ -6,11 +6,12 @@ import "./SuperAdminFix246.css";
 function formatWhen(ms) {
   const n = Number(ms);
   if (!Number.isFinite(n) || n <= 0) return "Not set";
-  return new Date(n).toLocaleString([], {
+  return new Date(n).toLocaleString("en-US", {
     month: "short",
     day: "numeric",
     hour: "numeric",
     minute: "2-digit",
+    hour12: true,
   });
 }
 
@@ -116,6 +117,181 @@ function getOwnerActionSections(room = {}) {
             payloadBuilder: (r) => ({ roomId: r.roomId }),
             className: "shadow",
           },
+          {
+            key: "cupGlobalWriteRehearsal",
+            label: "Rehearse Cup Global Write",
+            callableName: "ownerRehearseCupGlobalWriteFromHistory",
+            payloadBuilder: (r) => ({ roomId: r.roomId }),
+            description:
+              "Builds the Cup global write payload from the clean shadow result, but only saves it to globalShadowResults. Does not change real room scores.",
+            confirm: true,
+            confirmMessage:
+              "This only writes a Cup global rehearsal payload under globalShadowResults. It will not change real scores. Continue?",
+            className: "shadow",
+          },
+          {
+            key: "prepareCupGlobalReplay",
+            label: "Prepare Cup Replay From History",
+            callableName: "ownerPrepareCupGlobalReplayFromHistory",
+            payloadBuilder: (r) => ({ roomId: r.roomId, confirm: "PREPARE_CUP_REPLAY" }),
+            description:
+              "Temporarily loads the latest completed Cup history fixture IDs into cup/current so Apply Cup Global Current Window can be tested before a live knockout match. Creates a backup first.",
+            confirm: true,
+            confirmMessage:
+              "This prepares a Cup replay test by modifying cup/current and saving a backup. Use only on test rooms. Continue?",
+            className: "apply",
+          },
+          {
+            key: "enableGlobalPipeline",
+            label: "Enable Global Pipeline",
+            callableName: "ownerEnableRoomGlobalPipeline",
+            payloadBuilder: (r) => ({ roomId: r.roomId, confirm: "ENABLE_GLOBAL_PIPELINE" }),
+            description:
+              "Enables globalPipeline.mode='global' and roomAggregator=true for this room. Useful for old test rooms before running global apply tools.",
+            confirm: true,
+            confirmMessage:
+              "This backs up the current globalPipeline and enables global mode for this room. Continue?",
+            className: "apply",
+          },
+          {
+            key: "refreshCupGlobalFixtureCache",
+            label: "Refresh Cup Global Fixture Cache",
+            callableName: "ownerRefreshCupGlobalFixtureCache",
+            payloadBuilder: (r) => ({ roomId: r.roomId }),
+            description:
+              "Refreshes global fixture status/stats for the current Cup window from API-Football. Use before Apply Cup Global Current Window if status looks stale.",
+            confirm: true,
+            confirmMessage:
+              "This refreshes global fixture cache docs for the current Cup window from API-Football. Continue?",
+            className: "shadow",
+          },
+          {
+            key: "enableCupGlobalAutoApply",
+            label: "Enable Cup Global Auto Apply",
+            callableName: "ownerSetCupGlobalAutoApply",
+            payloadBuilder: (r) => ({
+              roomId: r.roomId,
+              enabled: true,
+              confirm: "CUP_GLOBAL_AUTO_ON",
+            }),
+            description:
+              "Turns on automatic Cup current-window global projection writes for this room. Does not enable finalization yet.",
+            confirm: true,
+            confirmMessage:
+              "This enables automatic Cup current-window global projection writes for this room. Continue?",
+            className: "apply",
+          },
+          {
+            key: "disableCupGlobalAutoApply",
+            label: "Disable Cup Global Auto Apply",
+            callableName: "ownerSetCupGlobalAutoApply",
+            payloadBuilder: (r) => ({
+              roomId: r.roomId,
+              enabled: false,
+              confirm: "CUP_GLOBAL_AUTO_OFF",
+            }),
+            description:
+              "Turns off automatic Cup current-window global projection writes for this room.",
+            confirm: true,
+            confirmMessage:
+              "This disables automatic Cup global projection writes for this room. Continue?",
+            className: "shadow",
+          },
+          {
+            key: "runCupGlobalAutoOnce",
+            label: "Run Cup Global Auto Once",
+            callableName: "ownerRunCupGlobalAutoOnce",
+            payloadBuilder: (r) => ({ roomId: r.roomId }),
+            description:
+              "Runs the same Cup global auto path once. Requires Cup Global Auto Apply to be enabled.",
+            confirm: true,
+            confirmMessage:
+              "This runs the Cup global auto projection path once for this room. Continue?",
+            className: "apply",
+          },
+          {
+            key: "enableCupGlobalFinalize",
+            label: "Enable Cup Global Finalize",
+            callableName: "ownerSetCupGlobalFinalize",
+            payloadBuilder: (r) => ({
+              roomId: r.roomId,
+              enabled: true,
+              confirm: "CUP_GLOBAL_FINALIZE_ON",
+            }),
+            description:
+              "Allows global Cup rooms to finalize completed current windows into cupHistory and standings. Requires Cup Global Auto Apply.",
+            confirm: true,
+            confirmMessage:
+              "This enables Cup global finalization for this room. Continue?",
+            className: "apply",
+          },
+          {
+            key: "disableCupGlobalFinalize",
+            label: "Disable Cup Global Finalize",
+            callableName: "ownerSetCupGlobalFinalize",
+            payloadBuilder: (r) => ({
+              roomId: r.roomId,
+              enabled: false,
+              confirm: "CUP_GLOBAL_FINALIZE_OFF",
+            }),
+            description:
+              "Turns off Cup global finalization for this room.",
+            confirm: true,
+            confirmMessage:
+              "This disables Cup global finalization for this room. Continue?",
+            className: "shadow",
+          },
+          {
+            key: "rehearseCupGlobalFinalize",
+            label: "Rehearse Cup Global Finalize",
+            callableName: "ownerRehearseCupGlobalFinalizeCurrentWindow",
+            payloadBuilder: (r) => ({ roomId: r.roomId }),
+            description:
+              "Builds the finalization payload and saves it only to globalShadowResults. Safe for replay testing.",
+            confirm: true,
+            confirmMessage:
+              "This writes only a Cup global finalization rehearsal payload. Continue?",
+            className: "shadow",
+          },
+          {
+            key: "finalizeCupGlobalCurrentWindow",
+            label: "Finalize Cup Global Current Window",
+            callableName: "ownerFinalizeCupGlobalCurrentWindowOnce",
+            payloadBuilder: (r) => ({
+              roomId: r.roomId,
+              confirm: "FINALIZE_CUP_GLOBAL_WINDOW",
+            }),
+            description:
+              "Writes cupHistory and final Cup standings from global cache. Blocked in replay mode. Requires finalization enabled.",
+            confirm: true,
+            confirmMessage:
+              "This writes Cup global finalization data to cupHistory and standings. Continue?",
+            className: "danger",
+          },
+          {
+            key: "applyCupGlobalCurrentWindow",
+            label: "Apply Cup Global Current Window",
+            callableName: "ownerApplyCupGlobalCurrentWindowOnce",
+            payloadBuilder: (r) => ({ roomId: r.roomId }),
+            description:
+              "Writes current Cup window projected scores from global cache. Only works when cup/current has active fixture IDs. Does not write cupHistory or finalResults.",
+            confirm: true,
+            confirmMessage:
+              "This writes projection-only Cup current-window scores from global cache. It does not write cupHistory or finalResults. Continue?",
+            className: "apply",
+          },
+          {
+            key: "restoreCupReplayBackup",
+            label: "Restore Cup Replay Backup",
+            callableName: "ownerRestoreCupCurrentFromReplayBackup",
+            payloadBuilder: (r) => ({ roomId: r.roomId, confirm: "RESTORE_CUP_REPLAY" }),
+            description:
+              "Restores cup/current from the backup created before replay testing.",
+            confirm: true,
+            confirmMessage:
+              "This restores cup/current from the replay backup. Continue?",
+            className: "shadow",
+          },
         ],
       },
     ];
@@ -203,6 +379,8 @@ function formatResultValue(key, value) {
   if (key === "nextPollAtMs" || key === "nextKickoffMs") {
     return `${value} (${formatWhen(value)})`;
   }
+  if (Array.isArray(value)) return value.join(", ");
+  if (value && typeof value === "object") return JSON.stringify(value);
   if (typeof value === "boolean") return value ? "true" : "false";
   return String(value);
 }
@@ -214,12 +392,22 @@ function renderActionResult(resultWrapper) {
   const fields = [
     "ok",
     "roomId",
+    "mode",
     "message",
+    "seasonKey",
+    "enabled",
+    "finalizeEnabled",
     "weekIndex",
     "status",
     "weekStatus",
+    "statusValue",
+    "pipelineMode",
+    "windowKey",
+    "historyDocId",
     "fixtureCount",
+    "refreshedCount",
     "missingFixtureCount",
+    "missingCount",
     "maxAbsDiff",
     "userCount",
     "standingsCount",
@@ -227,8 +415,36 @@ function renderActionResult(resultWrapper) {
     "nextPollAtMs",
     "nextKickoffMs",
     "realWriteApplied",
+    "projectionOnly",
+    "allFinished",
+    "anyInPlay",
+    "finalizedUserCount",
+    "wroteFinalResults",
     "source",
     "compareScope",
+    "shadowSource",
+    "replaySource",
+    "statusByFixtureId",
+    "historyLabel",
+    "historyFixtureCount",
+    "noFixtureIdsReason",
+    "fixtureIds",
+    "missingFixtureIds",
+    "writtenSummaryCount",
+    "writtenLiveFixtureCount",
+    "playerMismatchCount",
+    "statMismatchCount",
+    "projectedUserCount",
+    "backupPath",
+    "writtenPath",
+    "historyPath",
+    "cupCurrentPath",
+    "standingsPath",
+    "finalResultsPath",
+    "restoredPath",
+    "replayTestMode",
+    "replayHistoryLabel",
+    "auditPath",
   ];
 
   return (
@@ -269,6 +485,11 @@ function renderActionResult(resultWrapper) {
           </span>
         )}
       </div>
+      {result?.noFixtureIdsReason ? (
+        <div className="ownerActionWarning">
+          {result.noFixtureIdsReason}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -452,6 +673,15 @@ export default function SuperAdminFix246() {
               <strong>{status.competitionGroupCount ?? groups.length}</strong>
             </div>
             <div className="ownerSummaryCard">
+              <span>Total users</span>
+              <strong>{status?.authUserCount ?? "—"}</strong>
+            </div>
+            <div className="ownerSummaryCard">
+              <span>Live users</span>
+              <strong>{status?.liveUserCount ?? "—"}</strong>
+              <small>Last 3 min</small>
+            </div>
+            <div className="ownerSummaryCard">
               <span>Due now</span>
               <strong>{status.totals?.dueNowCount ?? 0}</strong>
             </div>
@@ -565,7 +795,22 @@ export default function SuperAdminFix246() {
                         <span>{room.phaseLabel || "No phase"}</span>
                         <span>{room.engineType || "No engine"}</span>
                         <span>{room.pipelineMode || "No pipeline"}</span>
-                        <span>Managers: {room.managerCount ?? 0}/{room.managerLimit ?? 10}</span>
+                        {room.draftStatusLabel && (
+                          <span className={`ownerPill ownerPill--${room.draftStatusTone || "muted"}`}>
+                            {room.draftStatusLabel}
+                          </span>
+                        )}
+                        {room.progressLabel && (
+                          <span className={`ownerPill ownerPill--${room.progressTone || "muted"}`}>
+                            {room.progressLabel}
+                          </span>
+                        )}
+                        {room.progressDetail && (
+                          <span className="ownerPill ownerPill--muted">
+                            {room.progressDetail}
+                          </span>
+                        )}
+                        <span>Managers: {room.managerCountLabel || `${room.managerCount ?? 0}/${room.managerLimit ?? 10}`}</span>
                         <span>Players: {room.playerCount || 0}</span>
                         <span>From: {room.playersFrom || "unknown"}</span>
                         <span>Queue: {room.queueState || (room.queue?.dueNow ? "due" : room.queue?.nextPollAtMs ? "future" : room.queueMissing ? "missing" : "none")}</span>

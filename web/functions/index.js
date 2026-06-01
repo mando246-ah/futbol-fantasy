@@ -8,6 +8,7 @@ const db = admin.firestore();
 const { FieldValue } = admin.firestore;
 const { scorePlayer, scoreTeam, SCORING } = require("./shared/scoringCore");
 const { runCupEngine } = require("./cup/cupEngine");
+const { createCupGlobalEngine } = require("./cup/cupGlobalEngine");
 const { detectPhaseFromRoundLabel } = require("./shared/phaseDetect");
 const { deriveSeasonContext } = require("./shared/seasonMeta");
 const {
@@ -295,7 +296,30 @@ async function getRoomMemberUids(roomRef, room) {
   return Array.from(new Set([...fromArray, ...fromSub]));
 }
 
-function requireDraftManagerCount(memberUids = []) {
+function roomRequiresEvenManagers(room = {}) {
+  const competitionState = getCompetitionState(room);
+  const phase = String(
+    competitionState?.phaseLabel ||
+      room?.competitionState?.phaseLabel ||
+      room?.phaseLabel ||
+      ""
+  );
+
+  const isWorldCupGroup =
+    room?.engineType === "worldCupDaily" ||
+    room?.worldCup?.engineType === "worldCupDaily" ||
+    room?.worldCupPhase === WORLD_CUP_GROUP_PHASE ||
+    room?.worldCupPhase === "group" ||
+    room?.worldCupPhase === "WorldCupGroup" ||
+    room?.worldCup?.phase === WORLD_CUP_GROUP_PHASE ||
+    room?.worldCup?.phase === "group" ||
+    phase === "WorldCupGroup";
+
+  const isCup = phase === "Cup" && !isWorldCupGroup;
+  return !isCup && !isWorldCupGroup;
+}
+
+function requireDraftManagerCount(memberUids = [], room = {}) {
   const managerCount = Array.from(new Set((memberUids || []).map(String).filter(Boolean))).length;
 
   if (managerCount < 2) {
@@ -305,7 +329,7 @@ function requireDraftManagerCount(memberUids = []) {
     );
   }
 
-  if (managerCount % 2 !== 0) {
+  if (roomRequiresEvenManagers(room) && managerCount % 2 !== 0) {
     throw new HttpsError(
       "failed-precondition",
       "Regular Season head-to-head rooms need an even number of managers."
@@ -3953,11 +3977,111 @@ async function loadRoomUsersLineupsForGlobalAggregation({ db, roomId }) {
     return null;
   }
 
-  const [membersSnap, lineupsSnap, picksSnap, playersSnap] = await Promise.all([
+  function inferPlayerId(d, fallback = "") {
+    return String(
+      d?.playerId ??
+        d?.pid ??
+        d?.apiPlayerId ??
+        d?.id ??
+        d?.player?.id ??
+        d?.player?.playerId ??
+        fallback ??
+        ""
+    ).trim();
+  }
+
+  function normalizePlayerMeta(d = {}, fallbackId = "") {
+    const pid = inferPlayerId(d, fallbackId);
+    if (!pid) return null;
+
+    return {
+      id: pid,
+      playerId: pid,
+      name: d.name || d.playerName || d.fullName || d.displayName || d.player?.name || "Unknown",
+      position: toPos(d.position || d.pos || d.role || d.player?.position || ""),
+      teamName: d.teamName || d.team?.name || d.clubName || d.club || "",
+      nationality: d.nationality || d.country || d.playerCountry || "",
+      teamLogo: d.teamLogo || d.team?.logo || "",
+    };
+  }
+
+  function mergePlayerMeta(existing = null, incoming = null) {
+    if (!existing) return incoming;
+    if (!incoming) return existing;
+
+    return {
+      ...existing,
+      ...incoming,
+      id: incoming.id || existing.id,
+      playerId: incoming.playerId || existing.playerId || incoming.id || existing.id,
+      name:
+        incoming.name && incoming.name !== "Unknown"
+          ? incoming.name
+          : existing.name || "Unknown",
+      position: toPos(incoming.position || existing.position || ""),
+      teamName: incoming.teamName || existing.teamName || "",
+      nationality: incoming.nationality || existing.nationality || "",
+      teamLogo: incoming.teamLogo || existing.teamLogo || "",
+    };
+  }
+
+  function hasUsefulPlayerMeta(player = {}) {
+    return Boolean(
+      player?.name &&
+        player.name !== "Unknown" &&
+        (player.position || player.teamName || player.nationality || player.teamLogo)
+    );
+  }
+
+  function rememberPlayer(playersById, player) {
+    if (!player?.id) return null;
+    const pid = String(player.id);
+    const merged = mergePlayerMeta(playersById.get(pid), player);
+    playersById.set(pid, merged);
+    return merged;
+  }
+
+  function rawLineupEntryId(entry) {
+    return String(
+      entry?.id ??
+        entry?.playerId ??
+        entry?.pid ??
+        entry?.apiPlayerId ??
+        entry?.player?.id ??
+        entry ??
+        ""
+    ).trim();
+  }
+
+  async function fetchNeededPlayerDocs(playersById, neededIds) {
+    const ids = [...new Set((neededIds || []).map(String).filter(Boolean))]
+      .filter((id) => !hasUsefulPlayerMeta(playersById.get(id)));
+    let docsRead = 0;
+    const chunkSize = 300;
+
+    for (let i = 0; i < ids.length; i += chunkSize) {
+      const chunk = ids.slice(i, i + chunkSize);
+      if (!chunk.length) continue;
+
+      const snaps = await db.getAll(
+        ...chunk.map((id) => db.doc(`rooms/${roomId}/players/${id}`))
+      );
+
+      for (let j = 0; j < snaps.length; j += 1) {
+        const snap = snaps[j];
+        if (!snap.exists) continue;
+        docsRead += 1;
+        rememberPlayer(playersById, normalizePlayerMeta(snap.data() || {}, snap.id));
+      }
+    }
+
+    return { requested: ids.length, docsRead };
+  }
+
+  const [membersSnap, lineupsSnap, picksSnap] = await Promise.all([
     db.collection(`rooms/${roomId}/members`).get(),
     db.collection(`rooms/${roomId}/lineups`).get(),
     db.collection(`rooms/${roomId}/picks`).get(),
-    db.collection(`rooms/${roomId}/players`).get(),
   ]);
 
   const membersByUid = new Map();
@@ -3973,49 +4097,57 @@ async function loadRoomUsersLineupsForGlobalAggregation({ db, roomId }) {
   });
 
   const playersById = new Map();
-  playersSnap.forEach((doc) => {
-    const d = doc.data() || {};
-    const pid = String(d.id ?? d.playerId ?? doc.id);
-    if (!pid) return;
-
-    playersById.set(pid, {
-      id: pid,
-      name: d.name || d.playerName || "Unknown",
-      position: toPos(d.position || d.pos || d.role),
-      teamName: d.teamName || "",
-      nationality: d.nationality || "",
-      teamLogo: d.teamLogo || "",
-    });
-  });
-
   const pickDocToPlayer = new Map();
-  const rosterByUid = {};
+  const pickRows = [];
+  const neededPlayerIds = new Set();
 
   picksSnap.forEach((doc) => {
     const d = doc.data() || {};
     const owner = inferOwnerUid(d);
-    const pid = String(d.playerId ?? d.pid ?? d.apiPlayerId ?? d.player?.id ?? d.player?.playerId ?? "");
+    const pid = inferPlayerId(d);
     if (!owner || !pid) return;
 
-    const player = {
-      id: pid,
-      name: d.playerName || d.name || playersById.get(pid)?.name || "Unknown",
-      position: toPos(d.position || d.pos || d.role || playersById.get(pid)?.position || ""),
-      teamName: d.teamName || playersById.get(pid)?.teamName || "",
-      nationality: d.nationality || playersById.get(pid)?.nationality || "",
-      teamLogo: d.teamLogo || playersById.get(pid)?.teamLogo || "",
-    };
-
-    if (!playersById.has(pid)) {
-      playersById.set(pid, player);
-    }
-
-    (rosterByUid[String(owner)] ||= []).push(player);
+    const player = rememberPlayer(playersById, normalizePlayerMeta(d, pid));
+    if (!hasUsefulPlayerMeta(player)) neededPlayerIds.add(pid);
     pickDocToPlayer.set(doc.id, player);
+    pickDocToPlayer.set(pid, player);
+    pickRows.push({ owner: String(owner), pid, pickDocId: doc.id });
   });
 
   const lineupsByUid = new Map();
-  lineupsSnap.forEach((doc) => lineupsByUid.set(String(doc.id), doc.data() || {}));
+  lineupsSnap.forEach((doc) => {
+    const lineup = doc.data() || {};
+    lineupsByUid.set(String(doc.id), lineup);
+
+    for (const entry of [...extractStarters(lineup), ...extractBench(lineup)]) {
+      const raw = rawLineupEntryId(entry);
+      const embedded = normalizePlayerMeta(entry, raw);
+      if (embedded) rememberPlayer(playersById, embedded);
+      if (raw && !pickDocToPlayer.has(raw)) neededPlayerIds.add(raw);
+    }
+  });
+
+  const playerDocFetch = await fetchNeededPlayerDocs(playersById, neededPlayerIds);
+
+  for (const row of pickRows) {
+    const merged = mergePlayerMeta(
+      playersById.get(row.pid),
+      pickDocToPlayer.get(row.pickDocId)
+    );
+    if (!merged) continue;
+    playersById.set(row.pid, merged);
+    pickDocToPlayer.set(row.pid, merged);
+    pickDocToPlayer.set(row.pickDocId, merged);
+  }
+
+  const rosterByUid = {};
+  for (const row of pickRows) {
+    const player =
+      playersById.get(row.pid) ||
+      pickDocToPlayer.get(row.pickDocId) ||
+      { id: row.pid, playerId: row.pid, name: "Unknown", position: "MID" };
+    (rosterByUid[row.owner] ||= []).push(player);
+  }
 
   const memberUids = Array.from(
     new Set([
@@ -4036,7 +4168,7 @@ async function loadRoomUsersLineupsForGlobalAggregation({ db, roomId }) {
 
       const fromPick = pickDocToPlayer.get(raw) || null;
       const pid = String(fromPick?.id ?? raw);
-      const known = playersById.get(pid) || fromPick || null;
+      const known = mergePlayerMeta(playersById.get(pid), fromPick) || normalizePlayerMeta(entry, pid);
 
       return {
         id: pid,
@@ -4073,6 +4205,16 @@ async function loadRoomUsersLineupsForGlobalAggregation({ db, roomId }) {
       bench,
     });
   }
+
+  console.log("[loadRoomUsersLineupsForGlobalAggregation] read counts", {
+    roomId,
+    membersRead: membersSnap.size,
+    lineupDocsRead: lineupsSnap.size,
+    picksRead: picksSnap.size,
+    playerDocsRequested: playerDocFetch.requested,
+    playerDocsRead: playerDocFetch.docsRead,
+    playersResolved: playersById.size,
+  });
 
   return users;
 }
@@ -4284,425 +4426,37 @@ function buildAggregatedGlobalRawStatsByPlayerId(liveFixturesById = {}) {
   return aggregated;
 }
 
-async function computeGlobalCupShadowResults({ db, roomId, nowMs }) {
-  const roomRef = db.doc(`rooms/${roomId}`);
-  const roomSnap = await roomRef.get();
-  if (!roomSnap.exists) throw new HttpsError("not-found", "Room not found.");
 
-  const room = roomSnap.data() || {};
-  if (getRoomPhaseLabel(room) !== "Cup") {
-    throw new HttpsError("failed-precondition", "Room is not in Cup phase.");
-  }
-
-  const cupRef = roomRef.collection("cup").doc("current");
-  const cupSnap = await cupRef.get();
-  const cup = cupSnap.exists ? (cupSnap.data() || {}) : {};
-  const fixtureIds = [...new Set((Array.isArray(cup?.currentWindowFixtureIds) ? cup.currentWindowFixtureIds : [])
-    .map((id) => String(id || "").trim())
-    .filter(Boolean))];
-
-  const seasonContext = deriveRoomSeasonContext(room);
-  if (!seasonContext?.seasonKey) {
-    throw new HttpsError("failed-precondition", "Could not resolve seasonKey for room.");
-  }
-
-  const { liveFixturesById, missingFixtureIds } = await loadGlobalLiveFixturesForSeason({
-    db,
-    seasonKey: seasonContext.seasonKey,
-    fixtureIds,
-  });
-  const fixtureSummariesById = await loadGlobalFixtureSummariesForSeason({
-    db,
-    seasonKey: seasonContext.seasonKey,
-    fixtureIds,
-  });
-  const patchedLiveFixturesById = patchGlobalLiveFixturesWithSummaries(
-    liveFixturesById,
-    fixtureSummariesById
-  );
-
-  const fixtureCoverage = fixtureIds.map((fixtureId) => {
-    const live = patchedLiveFixturesById[String(fixtureId)] || null;
-    const summary = fixtureSummariesById[String(fixtureId)] || null;
-    const fantasyByPlayerId =
-      live?.fantasyByPlayerId && typeof live.fantasyByPlayerId === "object"
-        ? live.fantasyByPlayerId
-        : {};
-    const rawStatsByPlayerId =
-      live?.rawStatsByPlayerId && typeof live.rawStatsByPlayerId === "object"
-        ? live.rawStatsByPlayerId
-        : {};
-    const rawSample =
-      Object.values(rawStatsByPlayerId).find((value) => value && typeof value === "object") || {};
-
-    return {
-      fixtureId: String(fixtureId),
-      hasLivePayload: Boolean(live),
-      hasSummary: Boolean(summary),
-      statusShort:
-        live?.statusShort ||
-        summary?.short ||
-        summary?.statusShort ||
-        rawSample?.statusShort ||
-        rawSample?.fixtureStatus ||
-        rawSample?.matchStatus ||
-        null,
-      statusLong: live?.statusLong || summary?.statusLong || rawSample?.statusLong || null,
-      kickoffMs: Number(live?.kickoffMs ?? summary?.kickoffMs ?? rawSample?.kickoffMs ?? 0) || null,
-      fantasyPlayerCount: Object.keys(fantasyByPlayerId).length,
-      rawStatsPlayerCount: Object.keys(rawStatsByPlayerId).length,
-    };
-  });
-
-  const users = await loadRoomUsersLineupsForGlobalAggregation({ db, roomId });
-  const globalRawStatsByPlayerId = buildAggregatedGlobalRawStatsByPlayerId(patchedLiveFixturesById);
-  const playersById = new Map();
-
-  for (const user of users) {
-    for (const player of [...(user.starters || []), ...(user.bench || [])]) {
-      const pid = String(player?.id ?? player?.playerId ?? player?.apiPlayerId ?? "").trim();
-      if (!pid || playersById.has(pid)) continue;
-      playersById.set(pid, {
-        id: pid,
-        name: player?.name || player?.playerName || player?.fullName || "Unknown",
-        position: toPos(player?.position || player?.pos || player?.role || "MID"),
-        teamName: player?.teamName || "",
-        nationality: player?.nationality || "",
-      });
-    }
-  }
-
-  const globalTotalsByUid = {};
-  const globalBreakdownByUserId = {};
-  const globalBenchTotalsByUid = {};
-  const missingPlayerIdsByUid = {};
-
-  for (const user of users) {
-    const uid = String(user.uid);
-    const perPlayer = {};
-    const startersOut = [];
-    const benchOut = [];
-    const missing = new Set();
-    let starterTotal = 0;
-    let benchTotal = 0;
-
-    const consumePlayer = (player, counted) => {
-      const pid = String(player?.id || "").trim();
-      if (!pid) return;
-
-      const aggregated = globalRawStatsByPlayerId[pid] || null;
-      const rawStats = aggregated?.stats || null;
-
-      // IMPORTANT:
-      // Score global raw stats using the room/fantasy player position,
-      // not API-Football's fixture position.
-      const scorePosition = toPos(
-        player?.position ||
-        playersById.get(pid)?.position ||
-        aggregated?.position ||
-        rawStats?.position ||
-        "MID"
-      );
-
-      const scored = rawStats
-        ? scorePlayer(rawStats, scorePosition)
-        : { points: 0, breakdown: {} };
-
-      const entry = {
-        id: pid,
-        name: player?.name || "Unknown",
-        position: scorePosition,
-        teamName: rawStats?.teamName || aggregated?.teamName || player?.teamName || "",
-        nationality: player?.nationality || "",
-        opponentName: rawStats?.opponentName || aggregated?.opponentName || "",
-        points: Number(scored?.points ?? scored?.total ?? 0),
-        breakdown: scored?.breakdown || scored?.parts || scored?.pointsBreakdown || {},
-        stats: rawStats || { teamName: player?.teamName || "" },
-        counted,
-      };
-
-      perPlayer[pid] = entry;
-
-      if (aggregated) {
-        if (counted) starterTotal += entry.points;
-        else benchTotal += entry.points;
-      } else {
-        missing.add(pid);
-      }
-
-      if (counted) startersOut.push(entry);
-      else benchOut.push(entry);
-    };
-
-    for (const player of Array.isArray(user.starters) ? user.starters : []) {
-      consumePlayer(player, true);
-    }
-
-    for (const player of Array.isArray(user.bench) ? user.bench : []) {
-      consumePlayer(player, false);
-    }
-
-    globalTotalsByUid[uid] = starterTotal;
-    globalBenchTotalsByUid[uid] = benchTotal;
-    globalBreakdownByUserId[uid] = {
-      uid,
-      displayName: user.displayName || uid,
-      total: starterTotal,
-      benchTotal,
-      starters: startersOut,
-      bench: benchOut,
-      perPlayer,
-    };
-    missingPlayerIdsByUid[uid] = Array.from(missing);
-  }
-
-  const legacyCupTotalsByUid =
-    cup?.cupTotalsByUid && typeof cup.cupTotalsByUid === "object"
-      ? cup.cupTotalsByUid
-      : {};
-
-  const legacyProjectedTotalsByUid =
-    cup?.projectedTotalsByUid && typeof cup.projectedTotalsByUid === "object"
-      ? cup.projectedTotalsByUid
-      : {};
-
-  const legacyWindowPointsByUid =
-    cup?.windowPointsByUid && typeof cup.windowPointsByUid === "object"
-      ? cup.windowPointsByUid
-      : {};
-
-  const legacyLivePointsByUid =
-    cup?.livePointsByUid && typeof cup.livePointsByUid === "object"
-      ? cup.livePointsByUid
-      : {};
-
-  function mergeCupShadowPerPlayerEntry(prev = {}, next = {}) {
-    return {
-      id: next.id || prev.id || "",
-      name: next.name || prev.name || "Unknown",
-      position: next.position || prev.position || "MID",
-      points: Number(prev.points || 0) + Number(next.points || 0),
-      breakdown: { ...(prev.breakdown || {}), ...(next.breakdown || {}) },
-      stats: { ...(prev.stats || {}), ...(next.stats || {}) },
-      counted: next.counted ?? prev.counted ?? true,
-    };
-  }
-
-  function mergeCupShadowBreakdownMaps(...maps) {
-    const out = {};
-
-    for (const map of maps) {
-      if (!map || typeof map !== "object") continue;
-
-      for (const [uid, incoming] of Object.entries(map)) {
-        const prev = out[uid] || { total: 0, benchTotal: 0, perPlayer: {} };
-        const mergedPerPlayer = { ...(prev.perPlayer || {}) };
-
-        for (const [pid, entry] of Object.entries(incoming?.perPlayer || {})) {
-          mergedPerPlayer[String(pid)] = mergeCupShadowPerPlayerEntry(
-            mergedPerPlayer[String(pid)] || {},
-            entry || {}
-          );
-        }
-
-        out[uid] = {
-          total: Number(prev.total || 0) + Number(incoming?.total || 0),
-          benchTotal: Number(prev.benchTotal || 0) + Number(incoming?.benchTotal || 0),
-          perPlayer: mergedPerPlayer,
-        };
-      }
-    }
-
-    return out;
-  }
-
-  function flattenCupShadowPerPlayer(legacyUserBreakdown = {}) {
-    const out = {};
-    const directCandidates = [
-      legacyUserBreakdown?.perPlayer,
-      legacyUserBreakdown?.partsByPlayerId,
-      legacyUserBreakdown?.playersById,
-    ];
-
-    for (const candidate of directCandidates) {
-      if (!candidate || typeof candidate !== "object") continue;
-      for (const [playerId, value] of Object.entries(candidate)) {
-        out[String(playerId)] = value || {};
-      }
-    }
-
-    const addList = (list) => {
-      for (const entry of Array.isArray(list) ? list : []) {
-        const pid = String(entry?.id ?? entry?.playerId ?? entry?.apiPlayerId ?? "").trim();
-        if (!pid || out[pid]) continue;
-        out[pid] = entry || {};
-      }
-    };
-
-    addList(legacyUserBreakdown?.starters);
-    addList(legacyUserBreakdown?.bench);
-
-    return out;
-  }
-
-  function hasCupShadowMeaningfulStats(value) {
-    if (!value || typeof value !== "object") return false;
-    return Object.entries(value).some(([key, val]) => {
-      if (["teamName", "opponentName", "fixtureId", "fixtureIds"].includes(key)) return false;
-      return val !== undefined && val !== null && val !== "" && val !== 0 && val !== false;
-    });
-  }
-
-  const creditedBreakdownCandidates = [
-    cup?.windowBreakdownByUserId,
-    cup?.currentWindowBreakdownByUserId,
-    cup?.breakdownByUserId,
-  ];
-  const creditedCurrentWindowBreakdownByUserId =
-    creditedBreakdownCandidates.find(
-      (candidate) => candidate && typeof candidate === "object" && Object.keys(candidate).length
-    ) || {};
-  const legacyCurrentWindowBreakdownByUserId = mergeCupShadowBreakdownMaps(
-    creditedCurrentWindowBreakdownByUserId,
-    cup?.liveBreakdownByUserId || {}
-  );
-
-  // Shadow comparison should be current window vs current window.
-  // Global reads cup.currentWindowFixtureIds, so compare it against
-  // legacy windowPointsByUid + livePointsByUid, not full Cup totals.
-  const legacyCurrentWindowTotalsByUid = {};
-  const legacyTotalUsedByUid = {};
-  const legacyCompareSourceByUid = {};
-  const diffsByUid = {};
-
-  const allUids = new Set([
-    ...Object.keys(globalTotalsByUid || {}),
-    ...Object.keys(legacyWindowPointsByUid || {}),
-    ...Object.keys(legacyLivePointsByUid || {}),
-    ...Object.keys(legacyCurrentWindowBreakdownByUserId || {}),
-  ]);
-
-  for (const uid of allUids) {
-    const legacyTotal =
-      Number(legacyWindowPointsByUid[uid] || 0) +
-      Number(legacyLivePointsByUid[uid] || 0);
-
-    legacyCurrentWindowTotalsByUid[uid] = legacyTotal;
-    legacyTotalUsedByUid[uid] = legacyTotal;
-    legacyCompareSourceByUid[uid] = "windowPointsByUid+livePointsByUid";
-
-    diffsByUid[uid] = Number(globalTotalsByUid[uid] || 0) - legacyTotal;
-  }
-
-  const playerMismatches = [];
-  const statMismatches = [];
-
-  for (const uid of allUids) {
-    const legacyPerPlayer = flattenCupShadowPerPlayer(
-      legacyCurrentWindowBreakdownByUserId?.[uid] || {}
-    );
-    const globalPerPlayer =
-      globalBreakdownByUserId?.[uid]?.perPlayer &&
-      typeof globalBreakdownByUserId[uid].perPlayer === "object"
-        ? globalBreakdownByUserId[uid].perPlayer
-        : {};
-    const playerIds = new Set([
-      ...Object.keys(legacyPerPlayer),
-      ...Object.keys(globalPerPlayer),
-    ]);
-
-    for (const playerId of playerIds) {
-      const legacyEntry = legacyPerPlayer[playerId] || {};
-      const globalEntry = globalPerPlayer[playerId] || {};
-      const legacyPoints = Number(legacyEntry.points ?? legacyEntry.total ?? legacyEntry.fantasyPoints ?? 0);
-      const globalPoints = Number(globalEntry.points ?? 0);
-      const diff = globalPoints - legacyPoints;
-      const legacyStats = legacyEntry.stats || {};
-      const globalStats = globalEntry.stats || {};
-      const legacyHasStats = hasCupShadowMeaningfulStats(legacyStats);
-      const globalHasStats = hasCupShadowMeaningfulStats(globalStats);
-
-      if (diff !== 0 || legacyHasStats !== globalHasStats) {
-        playerMismatches.push({
-          uid,
-          playerId,
-          name: globalEntry.name || legacyEntry.name || "Unknown",
-          legacyPoints,
-          globalPoints,
-          diff,
-          legacyBreakdown: legacyEntry.breakdown || {},
-          globalBreakdown: globalEntry.breakdown || {},
-          legacyStats,
-          globalStats,
-        });
-      }
-
-      if (legacyHasStats !== globalHasStats) {
-        statMismatches.push({
-          uid,
-          playerId,
-          name: globalEntry.name || legacyEntry.name || "Unknown",
-          legacyHasStats,
-          globalHasStats,
-        });
-      }
-    }
-  }
-
-  const diffValues = Object.values(diffsByUid || {}).map((value) => Math.abs(Number(value || 0)));
-  const maxAbsDiff = diffValues.length ? Math.max(...diffValues) : 0;
-
-  const payload = {
-    mode: "cup-shadow-aggregator",
-    source: "global-live-fixtures",
-    compareScope: "current-cup-window",
-
-    roomId,
-    seasonKey: seasonContext.seasonKey,
-    fixtureIds,
-    fixtureCount: fixtureIds.length,
-    missingFixtureCount: missingFixtureIds.length,
-    userCount: users.length,
-
-    globalTotalsByUid,
-    globalBreakdownByUserId,
-    globalBenchTotalsByUid,
-
-    // Kept for debugging full Cup state
-    legacyCupTotalsByUid,
-    legacyProjectedTotalsByUid,
-
-    // Used for the actual shadow diff
-    legacyWindowPointsByUid,
-    legacyLivePointsByUid,
-    legacyCurrentWindowTotalsByUid,
-    legacyCurrentWindowBreakdownByUserId,
-
-    diffsByUid,
-    maxAbsDiff,
-    fixtureCoverage,
-    playerMismatches,
-    statMismatches,
-    missingFixtureIds,
-    missingPlayerIdsByUid,
-
-    updatedAtMs: nowMs,
-
-    legacyTotalUsedByUid,
-    legacyCompareSourceByUid,
-  };
-
-  await roomRef.collection("globalShadowResults").doc("cup-current").set(
-    {
-      ...payload,
-      updatedAt: FieldValue.serverTimestamp(),
-    },
-    { merge: false }
-  );
-
-  return payload;
-}
-
+const {
+  loadLatestCupHistoryWindow,
+  computeGlobalCupShadowResults,
+  buildCupGlobalWriteRehearsalPayload,
+  computeCupCurrentWindowFromGlobalCache,
+  buildCupGlobalFinalizationPayload,
+  finalizeCupGlobalCurrentWindow,
+  isCupGlobalAutoApplyEnabled,
+  isCupGlobalFinalizationEnabled,
+} = createCupGlobalEngine({
+  FieldValue,
+  HttpsError,
+  scorePlayer,
+  toPos,
+  safeId,
+  hashToUint32,
+  getRoomPhaseLabel,
+  deriveRoomSeasonContext,
+  getGlobalPipelineMode,
+  isGlobalLiveFixtureCacheEnabled,
+  isGlobalRoomAggregatorEnabled,
+  loadGlobalLiveFixturesForSeason,
+  loadGlobalFixtureSummariesForSeason,
+  patchGlobalLiveFixturesWithSummaries,
+  buildAggregatedGlobalRawStatsByPlayerId,
+  loadRoomUsersLineupsForGlobalAggregation,
+  hasFixtureStarted,
+  isInPlay,
+  isFinished,
+});
 async function computeRegularWeekFromGlobalCache({
   db,
   roomId,
@@ -4800,10 +4554,19 @@ async function computeRegularWeekFromGlobalCache({
     liveFixturesById,
     fixtureSummariesById
   );
+  const weekFixtureMetaById = new Map(
+    (Array.isArray(week?.fixtures) ? week.fixtures : [])
+      .map((fixture) => [
+        String(fixture?.fixtureId || fixture?.id || fixture?.fixture?.id || "").trim(),
+        fixture || {},
+      ])
+      .filter(([fixtureId]) => Boolean(fixtureId))
+  );
 
   const fixtureCoverage = fixtureIds.map((fixtureId) => {
     const live = patchedLiveFixturesById[String(fixtureId)] || null;
     const summary = fixtureSummariesById[String(fixtureId)] || null;
+    const weekFixture = weekFixtureMetaById.get(String(fixtureId)) || {};
     const fantasyByPlayerId =
       live?.fantasyByPlayerId && typeof live.fantasyByPlayerId === "object"
         ? live.fantasyByPlayerId
@@ -4823,12 +4586,21 @@ async function computeRegularWeekFromGlobalCache({
         live?.statusShort ||
         summary?.short ||
         summary?.statusShort ||
+        statusShortFromFixture(weekFixture) ||
         rawSample?.statusShort ||
         rawSample?.fixtureStatus ||
         rawSample?.matchStatus ||
         null,
-      statusLong: live?.statusLong || summary?.statusLong || rawSample?.statusLong || null,
-      kickoffMs: Number(live?.kickoffMs ?? summary?.kickoffMs ?? rawSample?.kickoffMs ?? 0) || null,
+      statusLong: live?.statusLong || summary?.statusLong || weekFixture?.statusLong || rawSample?.statusLong || null,
+      kickoffMs: Number(
+        live?.kickoffMs ??
+          summary?.kickoffMs ??
+          weekFixture?.kickoffMs ??
+          weekFixture?.startAtMs ??
+          (weekFixture?.fixture?.timestamp ? Number(weekFixture.fixture.timestamp) * 1000 : undefined) ??
+          rawSample?.kickoffMs ??
+          0
+      ) || null,
       fantasyPlayerCount: Object.keys(fantasyByPlayerId).length,
       rawStatsPlayerCount: Object.keys(rawStatsByPlayerId).length,
     };
@@ -4841,9 +4613,22 @@ async function computeRegularWeekFromGlobalCache({
     }
   }
 
-  const anyInPlay = fixtureCoverage.some((coverage) => isInPlay(coverage.statusShort || null));
+  const anyInPlay = fixtureCoverage.some((coverage) =>
+    isInPlay(coverage.statusShort || null) &&
+    !isCoverageStalePastPostTail(coverage, nowMs)
+  );
+  const hasStartedOrResolvingFixture = fixtureCoverage.some((coverage) => {
+    const kickoffMs = coverageKickoffMs(coverage);
+    const short = coverageStatusShort(coverage);
+    return (
+      (hasFixtureStarted(short) && !isFinished(short) && !isCancelledOrAbandonedStatus(short)) ||
+      (kickoffMs != null && nowMs >= kickoffMs && nowMs <= kickoffMs + TOURNAMENT_POST_MS)
+    );
+  });
   const allFinished = fixtureIds.length > 0 && fixtureCoverage.every((coverage) =>
-    isFinished(coverage.statusShort || "")
+    isFinished(coverage.statusShort || "") ||
+    isCancelledOrAbandonedStatus(coverage.statusShort || "") ||
+    isCoverageStalePastPostTail(coverage, nowMs)
   );
   const forcedFinalByExpiredWindow = pastPostWindow && !anyInPlay;
   const statusValue =
@@ -4858,6 +4643,63 @@ async function computeRegularWeekFromGlobalCache({
     const ko = Number(coverage.kickoffMs);
     if (!Number.isFinite(ko) || ko <= nowMs) continue;
     if (nextKickoffMs == null || ko < nextKickoffMs) nextKickoffMs = ko;
+  }
+
+  const inActiveWakeWindow = fixtureCoverage.some((coverage) =>
+    isCoverageInActiveWakeWindow(coverage, nowMs)
+  );
+
+  if (!hasStartedOrResolvingFixture && !allFinished && !forcedFinalByExpiredWindow) {
+    let skippedReason = "regular-week-not-due";
+    let nextPollAtMs = nowMs + TOURNAMENT_UNKNOWN_RECHECK_MS;
+
+    if (nextKickoffMs) {
+      if (nowMs < nextKickoffMs - TOURNAMENT_PRE_MS) {
+        nextPollAtMs = nextKickoffMs - TOURNAMENT_PRE_MS;
+      } else if (nowMs < nextKickoffMs) {
+        nextPollAtMs = Math.min(nowMs + TOURNAMENT_PREGAME_POLL_MS, nextKickoffMs);
+        skippedReason = "regular-week-pregame-5min-check";
+      }
+    }
+
+    return {
+      mode: realWriteAllowed ? "regular-global-aggregator" : "regular-shadow-aggregator",
+      source: "global-live-fixtures",
+      compareScope: "current-regular-week",
+      writeMode: normalizedWriteMode,
+      dryRun: Boolean(dryRun),
+      realWriteApplied: false,
+      skippedReason,
+      roomId,
+      weekIndex: resolvedWeekIndex,
+      seasonKey: seasonContext.seasonKey,
+      fixtureIds,
+      fixtureCount: fixtureIds.length,
+      missingFixtureCount: missingFixtureIds.length,
+      userCount: 0,
+      globalTotalsByUid: {},
+      globalBenchTotalsByUid: {},
+      globalBreakdownByUserId: {},
+      legacyTotalsByUid: {},
+      diffsByUid: {},
+      maxAbsDiff: 0,
+      fixtureCoverage,
+      playerMismatches: [],
+      statMismatches: [],
+      missingFixtureIds,
+      missingPlayerIdsByUid: {},
+      activeScorers: {},
+      benchByUserId: {},
+      startersByUserId: {},
+      matchups: [],
+      weekLeaderboard: [],
+      weekResultPayload: null,
+      weekStatus: statusValue,
+      nextKickoffMs,
+      nextPollAtMs,
+      roundLabel: week.roundLabel || null,
+      updatedAtMs: nowMs,
+    };
   }
 
   const users = await loadRoomUsersLineupsForGlobalAggregation({ db, roomId });
@@ -5188,6 +5030,10 @@ async function computeRegularWeekFromGlobalCache({
     Math.abs(Number(value || 0))
   );
   const maxAbsDiff = diffValues.length ? Math.max(...diffValues) : 0;
+  const nextPollAtMs =
+    statusValue === "final"
+      ? null
+      : nowMs + TOURNAMENT_ACTIVE_POLL_MS;
 
   const weekResultPayload = {
     roomId,
@@ -5197,6 +5043,7 @@ async function computeRegularWeekFromGlobalCache({
     roundLabel: week.roundLabel || null,
     status: statusValue,
     nextKickoffMs: nextKickoffMs ?? null,
+    nextPollAtMs,
     forcedFinalByExpiredWindow,
     pastPostWindow,
     allFinished,
@@ -5256,6 +5103,7 @@ async function computeRegularWeekFromGlobalCache({
 
     weekResultPayload,
     weekStatus: statusValue,
+    nextPollAtMs,
     roundLabel: week.roundLabel || null,
 
     updatedAtMs: nowMs,
@@ -5297,18 +5145,23 @@ async function computeRegularWeekFromGlobalCache({
   return payload;
 }
 
-async function collectActiveSeasonFixtureTargets(nowMs = Date.now(), roomDocs = null) {
+async function collectActiveSeasonFixtureTargets(nowMs = Date.now(), roomDocs = null, options = {}) {
   const docs = Array.isArray(roomDocs)
     ? roomDocs
     : (await db.collection("rooms")
       .where("competitionState.weekStatus", "in", ["scheduled", "live", "resolving"])
       .get()).docs;
+  const queueDueRoomIds = options?.queueDueRoomIds instanceof Set
+    ? options.queueDueRoomIds
+    : new Set();
+  const runSweep = options?.runSweep === true;
 
   const stats = {
     roomsInput: docs.length,
     activeRoomCount: 0,
     sleepingRoomCount: 0,
     skippedDoneCount: 0,
+    skippedFuturePollCount: 0,
     seasonTargetCount: 0,
   };
 
@@ -5320,6 +5173,18 @@ async function collectActiveSeasonFixtureTargets(nowMs = Date.now(), roomDocs = 
       if (String(room?.seasonPhase || "").toUpperCase() === "COMPLETE" || competitionState?.isDone === true) {
         stats.skippedDoneCount += 1;
         return null;
+      }
+
+      if (!runSweep) {
+        const sleepGuard = buildDeepPollingSkip(room, competitionState, nowMs, {
+          isQueuedDue: queueDueRoomIds.has(roomId),
+          enforceGlobalDue: true,
+        });
+        if (sleepGuard.skip) {
+          stats.skippedFuturePollCount += 1;
+          stats.sleepingRoomCount += 1;
+          return null;
+        }
       }
 
       if (!isGlobalLiveFixtureCacheEnabled(room)) {
@@ -5595,6 +5460,91 @@ function buildGlobalFantasyByPlayerId(rawStatsByPlayerId = {}) {
   }
 
   return fantasyByPlayerId;
+}
+
+function normalizeApiFootballFixtureDetail(fixture = {}, nowMs = Date.now()) {
+  const fixtureId = String(fixture?.fixture?.id ?? "").trim();
+  const kickoffMs = fixture?.fixture?.timestamp
+    ? Number(fixture.fixture.timestamp) * 1000
+    : Date.parse(fixture?.fixture?.date);
+  const statusShort = fixture?.fixture?.status?.short ?? null;
+
+  return {
+    fixtureId,
+    statusShort,
+    short: statusShort,
+    fixtureStatus: statusShort,
+    matchStatus: statusShort,
+    statusLong: fixture?.fixture?.status?.long ?? null,
+    elapsed: Number.isFinite(Number(fixture?.fixture?.status?.elapsed))
+      ? Number(fixture.fixture.status.elapsed)
+      : null,
+    extra: Number.isFinite(Number(fixture?.fixture?.status?.extra))
+      ? Number(fixture.fixture.status.extra)
+      : null,
+    kickoffMs: Number.isFinite(kickoffMs) ? kickoffMs : null,
+    homeTeamId: fixture?.teams?.home?.id ?? null,
+    homeTeamName: fixture?.teams?.home?.name || "",
+    homeTeamLogo: fixture?.teams?.home?.logo || "",
+    awayTeamId: fixture?.teams?.away?.id ?? null,
+    awayTeamName: fixture?.teams?.away?.name || "",
+    awayTeamLogo: fixture?.teams?.away?.logo || "",
+    goalsHome: toNum(fixture?.goals?.home),
+    goalsAway: toNum(fixture?.goals?.away),
+    leagueId: fixture?.league?.id ?? null,
+    leagueName: fixture?.league?.name || "",
+    leagueRound: fixture?.league?.round || null,
+    statusUpdatedAtMs: nowMs,
+    updatedAtMs: nowMs,
+  };
+}
+
+async function fetchFixtureDetailsMapFromApiFootball({
+  fixtureIds = [],
+  timezone = "America/Los_Angeles",
+  apiKey,
+  nowMs = Date.now(),
+}) {
+  const ids = [...new Set((fixtureIds || []).map((id) => String(id || "").trim()).filter(Boolean))];
+  const detailsByFixtureId = {};
+  if (!ids.length) return { detailsByFixtureId, missingFixtureIds: [] };
+
+  const fetchList = async (params) => {
+    const response = await apiFootballGet("fixtures", { ...params, timezone }, apiKey);
+    return Array.isArray(response?.response) ? response.response : [];
+  };
+
+  let list = [];
+  if (ids.length > 1) {
+    list = await fetchList({ ids: ids.join("-") });
+    if (!list.length) list = await fetchList({ ids: ids.join(",") });
+  } else {
+    list = await fetchList({ id: ids[0] });
+  }
+
+  const seen = new Set();
+  for (const fixture of list || []) {
+    const detail = normalizeApiFootballFixtureDetail(fixture, nowMs);
+    if (!detail.fixtureId) continue;
+    detailsByFixtureId[detail.fixtureId] = detail;
+    seen.add(detail.fixtureId);
+  }
+
+  for (const id of ids) {
+    if (seen.has(id)) continue;
+    const one = await fetchList({ id });
+    for (const fixture of one || []) {
+      const detail = normalizeApiFootballFixtureDetail(fixture, nowMs);
+      if (!detail.fixtureId) continue;
+      detailsByFixtureId[detail.fixtureId] = detail;
+      seen.add(detail.fixtureId);
+    }
+  }
+
+  return {
+    detailsByFixtureId,
+    missingFixtureIds: ids.filter((id) => !detailsByFixtureId[id]),
+  };
 }
 
 async function pollGlobalSeasonLiveFixturesOnce({ seasonTarget, apiKey, nowMs }) {
@@ -7504,6 +7454,11 @@ exports.debugComputeGlobalShadowCupRoom = onCall(
       ok: true,
       roomId,
       seasonKey: result.seasonKey,
+      shadowSource: result.shadowSource || "cup-current",
+      historyId: result.historyId || null,
+      historyLabel: result.historyLabel || null,
+      historyFixtureCount: result.historyFixtureCount || null,
+      noFixtureIdsReason: result.noFixtureIdsReason || null,
       fixtureIds: result.fixtureIds || [],
       fixtureCount: Number(result.fixtureCount || 0),
       missingFixtureCount: Number(result.missingFixtureCount || 0),
@@ -7516,12 +7471,13 @@ exports.debugComputeGlobalShadowCupRoom = onCall(
       legacyWindowPointsByUid: result.legacyWindowPointsByUid || {},
       legacyLivePointsByUid: result.legacyLivePointsByUid || {},
       legacyCurrentWindowTotalsByUid: result.legacyCurrentWindowTotalsByUid || {},
+      legacyCurrentWindowBreakdownByUserId: result.legacyCurrentWindowBreakdownByUserId || {},
       fixtureCoverage: result.fixtureCoverage || [],
       playerMismatches: result.playerMismatches || [],
       statMismatches: result.statMismatches || [],
       missingFixtureIds: result.missingFixtureIds || [],
       missingPlayerIdsByUid: result.missingPlayerIdsByUid || {},
-      compareScope: "current-cup-window",
+      compareScope: result.compareScope || "current-cup-window",
       source: "global-live-fixtures",
     };
   }
@@ -8007,16 +7963,978 @@ exports.ownerRunCupShadowTest = onCall(
         ok: true,
         roomId,
         seasonKey: result.seasonKey,
+        shadowSource: result.shadowSource || "cup-current",
+        historyId: result.historyId || null,
+        historyLabel: result.historyLabel || null,
+        historyFixtureCount: result.historyFixtureCount || null,
+        noFixtureIdsReason: result.noFixtureIdsReason || null,
+        fixtureIds: result.fixtureIds || [],
+        missingFixtureIds: result.missingFixtureIds || [],
         fixtureCount: Number(result.fixtureCount || 0),
         missingFixtureCount: Number(result.missingFixtureCount || 0),
         userCount: Number(result.userCount || 0),
         maxAbsDiff: Number(result.maxAbsDiff || 0),
         diffsByUid: result.diffsByUid || {},
+        globalTotalsByUid: result.globalTotalsByUid || {},
+        legacyWindowPointsByUid: result.legacyWindowPointsByUid || {},
+        legacyLivePointsByUid: result.legacyLivePointsByUid || {},
+        legacyCurrentWindowTotalsByUid: result.legacyCurrentWindowTotalsByUid || {},
+        globalBreakdownByUserId: result.globalBreakdownByUserId || {},
+        legacyCurrentWindowBreakdownByUserId: result.legacyCurrentWindowBreakdownByUserId || {},
         fixtureCoverage: result.fixtureCoverage || [],
         playerMismatches: result.playerMismatches || [],
         statMismatches: result.statMismatches || [],
-        compareScope: "current-cup-window",
+        compareScope: result.compareScope || "current-cup-window",
         source: "global-live-fixtures",
+      };
+    } catch (err) {
+      handleOwnerActionError(functionName, err);
+    }
+  }
+);
+
+exports.ownerEnableRoomGlobalPipeline = onCall(
+  { region: "us-west2", timeoutSeconds: 120, memory: "512MiB" },
+  async (request) => {
+    const functionName = "ownerEnableRoomGlobalPipeline";
+    const nowMs = Date.now();
+
+    try {
+      const uid = requireOwnerActionUid(request);
+      const roomId = getOwnerActionRoomId(request);
+
+      if (request.data?.confirm !== "ENABLE_GLOBAL_PIPELINE") {
+        throw new HttpsError(
+          "failed-precondition",
+          "Enable global pipeline requires confirm='ENABLE_GLOBAL_PIPELINE'."
+        );
+      }
+
+      const { roomRef, room } = await loadOwnerActionRoom(roomId);
+      logOwnerAction(functionName, { functionName, uid, roomId, nowMs });
+
+      const backupPath = `rooms/${roomId}/globalShadowResults/global-pipeline-before-owner-enable`;
+      const globalPipeline = buildDefaultGlobalPipeline("global");
+
+      await db.doc(backupPath).set(
+        {
+          roomId,
+          mode: "global-pipeline-backup",
+          originalGlobalPipeline: room.globalPipeline || null,
+          backedUpAtMs: nowMs,
+          backedUpAt: FieldValue.serverTimestamp(),
+        },
+        { merge: false }
+      );
+
+      await roomRef.set(
+        {
+          globalPipeline,
+          updatedAt: FieldValue.serverTimestamp(),
+          updatedAtMs: nowMs,
+        },
+        { merge: true }
+      );
+
+      return {
+        ok: true,
+        roomId,
+        mode: "owner-enable-global-pipeline",
+        pipelineMode: "global",
+        globalPipeline,
+        backupPath,
+        writtenPath: `rooms/${roomId}`,
+      };
+    } catch (err) {
+      handleOwnerActionError(functionName, err);
+    }
+  }
+);
+
+exports.ownerSetCupGlobalAutoApply = onCall(
+  { region: "us-west2", timeoutSeconds: 120, memory: "512MiB" },
+  async (request) => {
+    const functionName = "ownerSetCupGlobalAutoApply";
+    const nowMs = Date.now();
+
+    try {
+      const uid = requireOwnerActionUid(request);
+      const roomId = getOwnerActionRoomId(request);
+      const enabled = request.data?.enabled === true;
+
+      if (request.data?.enabled !== true && request.data?.enabled !== false) {
+        throw new HttpsError("invalid-argument", "enabled must be true or false.");
+      }
+
+      const expectedConfirm = enabled ? "CUP_GLOBAL_AUTO_ON" : "CUP_GLOBAL_AUTO_OFF";
+      if (request.data?.confirm !== expectedConfirm) {
+        throw new HttpsError(
+          "failed-precondition",
+          `Cup global auto apply requires confirm='${expectedConfirm}'.`
+        );
+      }
+
+      const { roomRef, room } = await loadOwnerActionRoom(roomId);
+      assertOwnerCupRoom(room);
+      logOwnerAction(functionName, { functionName, uid, roomId, enabled, nowMs });
+
+      const backupPath = `rooms/${roomId}/globalShadowResults/cup-global-auto-before-toggle`;
+      const previousPipeline =
+        room.globalPipeline && typeof room.globalPipeline === "object"
+          ? room.globalPipeline
+          : {};
+      const nextGlobalPipeline = {
+        ...buildDefaultGlobalPipeline("global"),
+        ...previousPipeline,
+        mode: "global",
+        liveFixtureCache: true,
+        roomAggregator: true,
+        cupGlobalAutoApply: enabled,
+        cupGlobalAutoApplyUpdatedAtMs: nowMs,
+      };
+
+      await db.doc(backupPath).set(
+        {
+          roomId,
+          mode: "cup-global-auto-backup",
+          originalGlobalPipeline: previousPipeline,
+          backedUpAtMs: nowMs,
+          backedUpAt: FieldValue.serverTimestamp(),
+        },
+        { merge: false }
+      );
+
+      await roomRef.set(
+        {
+          globalPipeline: nextGlobalPipeline,
+          updatedAtMs: nowMs,
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      const verifySnap = await roomRef.get();
+      const verifyRoom = verifySnap.exists ? (verifySnap.data() || {}) : {};
+      const autoApplyEnabled = isCupGlobalAutoApplyEnabled(verifyRoom);
+
+      if (enabled === true && autoApplyEnabled !== true) {
+        throw new HttpsError(
+          "failed-precondition",
+          "Cup global auto apply write did not verify."
+        );
+      }
+
+      return {
+        ok: true,
+        roomId,
+        mode: "owner-set-cup-global-auto-apply",
+        enabled,
+        autoApplyEnabled,
+        pipelineMode: getGlobalPipelineMode(verifyRoom),
+        globalPipeline: verifyRoom.globalPipeline || nextGlobalPipeline,
+        backupPath,
+        writtenPath: `rooms/${roomId}`,
+      };
+    } catch (err) {
+      handleOwnerActionError(functionName, err);
+    }
+  }
+);
+
+exports.ownerRunCupGlobalAutoOnce = onCall(
+  { region: "us-west2", timeoutSeconds: 540, memory: "1GiB" },
+  async (request) => {
+    const functionName = "ownerRunCupGlobalAutoOnce";
+    const nowMs = Date.now();
+
+    try {
+      const uid = requireOwnerActionUid(request);
+      const roomId = getOwnerActionRoomId(request);
+      const { room } = await loadOwnerActionRoom(roomId);
+      assertOwnerCupRoom(room);
+
+      if (!isCupGlobalAutoApplyEnabled(room)) {
+        throw new HttpsError(
+          "failed-precondition",
+          "Cup global auto apply is not enabled for this room."
+        );
+      }
+
+      logOwnerAction(functionName, { functionName, uid, roomId, nowMs });
+
+      const result = await computeCupCurrentWindowFromGlobalCache({
+        db,
+        roomId,
+        nowMs,
+        writeMode: "global",
+        dryRun: false,
+      });
+
+      return {
+        ok: true,
+        roomId,
+        mode: "cup-global-auto-once",
+        realWriteApplied: Boolean(result.realWriteApplied),
+        projectionOnly: true,
+        fixtureCount: Number(result.fixtureCount || 0),
+        missingFixtureCount: Number(result.missingFixtureCount || 0),
+        statusValue: result.statusValue || null,
+        allFinished: Boolean(result.allFinished),
+        anyInPlay: Boolean(result.anyInPlay),
+        projectedUserCount: Array.isArray(result.projectedStandingsRows)
+          ? result.projectedStandingsRows.length
+          : 0,
+        writtenPath: `rooms/${roomId}/cup/current`,
+        auditPath: `rooms/${roomId}/globalShadowResults/cup-apply-current-window`,
+      };
+    } catch (err) {
+      handleOwnerActionError(functionName, err);
+    }
+  }
+);
+
+exports.ownerSetCupGlobalFinalize = onCall(
+  { region: "us-west2", timeoutSeconds: 120, memory: "512MiB" },
+  async (request) => {
+    const functionName = "ownerSetCupGlobalFinalize";
+    const nowMs = Date.now();
+
+    try {
+      const uid = requireOwnerActionUid(request);
+      const roomId = getOwnerActionRoomId(request);
+      const enabled = request.data?.enabled === true;
+
+      if (request.data?.enabled !== true && request.data?.enabled !== false) {
+        throw new HttpsError("invalid-argument", "enabled must be true or false.");
+      }
+
+      const expectedConfirm = enabled ? "CUP_GLOBAL_FINALIZE_ON" : "CUP_GLOBAL_FINALIZE_OFF";
+      if (request.data?.confirm !== expectedConfirm) {
+        throw new HttpsError(
+          "failed-precondition",
+          `Cup global finalization requires confirm='${expectedConfirm}'.`
+        );
+      }
+
+      const { roomRef, room } = await loadOwnerActionRoom(roomId);
+      assertOwnerCupRoom(room);
+      logOwnerAction(functionName, { functionName, uid, roomId, enabled, nowMs });
+
+      const backupPath = `rooms/${roomId}/globalShadowResults/cup-global-finalize-before-toggle`;
+      const previousPipeline =
+        room.globalPipeline && typeof room.globalPipeline === "object"
+          ? room.globalPipeline
+          : {};
+      const previousAutoApply =
+        previousPipeline.cupGlobalAutoApply === true ||
+        previousPipeline.cupAggregator === true ||
+        previousPipeline.cupGlobalCurrentWindowApply === true;
+      const nextGlobalPipeline = {
+        ...buildDefaultGlobalPipeline("global"),
+        ...previousPipeline,
+        mode: "global",
+        liveFixtureCache: true,
+        roomAggregator: true,
+        cupGlobalAutoApply: enabled ? true : previousAutoApply,
+        cupGlobalFinalize: enabled,
+        cupGlobalFinalizeUpdatedAtMs: nowMs,
+      };
+
+      await db.doc(backupPath).set(
+        {
+          roomId,
+          mode: "cup-global-finalize-backup",
+          originalGlobalPipeline: previousPipeline,
+          backedUpAtMs: nowMs,
+          backedUpAt: FieldValue.serverTimestamp(),
+        },
+        { merge: false }
+      );
+
+      await roomRef.set(
+        {
+          globalPipeline: nextGlobalPipeline,
+          updatedAtMs: nowMs,
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      const verifySnap = await roomRef.get();
+      const verifyRoom = verifySnap.exists ? (verifySnap.data() || {}) : {};
+      const finalizeEnabled = isCupGlobalFinalizationEnabled(verifyRoom);
+      const autoApplyEnabled = isCupGlobalAutoApplyEnabled(verifyRoom);
+
+      if (finalizeEnabled !== enabled) {
+        throw new HttpsError(
+          "failed-precondition",
+          "Cup global finalization write did not verify."
+        );
+      }
+
+      return {
+        ok: true,
+        roomId,
+        mode: "owner-set-cup-global-finalize",
+        enabled,
+        finalizeEnabled,
+        autoApplyEnabled,
+        pipelineMode: getGlobalPipelineMode(verifyRoom),
+        backupPath,
+        writtenPath: `rooms/${roomId}`,
+      };
+    } catch (err) {
+      handleOwnerActionError(functionName, err);
+    }
+  }
+);
+
+exports.ownerRehearseCupGlobalFinalizeCurrentWindow = onCall(
+  { region: "us-west2", timeoutSeconds: 540, memory: "1GiB" },
+  async (request) => {
+    const functionName = "ownerRehearseCupGlobalFinalizeCurrentWindow";
+    const nowMs = Date.now();
+
+    try {
+      const uid = requireOwnerActionUid(request);
+      const roomId = getOwnerActionRoomId(request);
+      const { room } = await loadOwnerActionRoom(roomId);
+      assertOwnerCupRoom(room);
+      logOwnerAction(functionName, { functionName, uid, roomId, nowMs });
+
+      const cupSnap = await db.doc(`rooms/${roomId}/cup/current`).get();
+      const cup = cupSnap.exists ? (cupSnap.data() || {}) : {};
+      const applyResult = await computeCupCurrentWindowFromGlobalCache({
+        db,
+        roomId,
+        nowMs,
+        writeMode: "shadow",
+        dryRun: true,
+      });
+      const finalization = buildCupGlobalFinalizationPayload({
+        roomId,
+        room,
+        cup,
+        applyResult,
+        nowMs,
+      });
+      const writtenPath = `rooms/${roomId}/globalShadowResults/cup-finalize-rehearsal`;
+
+      await db.doc(writtenPath).set(
+        {
+          mode: "cup-global-finalize-rehearsal",
+          roomId,
+          windowKey: finalization.windowKey,
+          historyDocId: finalization.historyDocId,
+          fixtureCount: finalization.fixtureCount,
+          statusValue: finalization.statusValue,
+          allFinished: finalization.allFinished,
+          projectedUserCount: finalization.standingsRows.length,
+          historyPayload: finalization.historyPayload,
+          builtAtMs: nowMs,
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: false }
+      );
+
+      return {
+        ok: true,
+        roomId,
+        mode: "cup-global-finalize-rehearsal",
+        windowKey: finalization.windowKey,
+        historyDocId: finalization.historyDocId,
+        fixtureCount: finalization.fixtureCount,
+        statusValue: finalization.statusValue,
+        allFinished: finalization.allFinished,
+        projectedUserCount: finalization.standingsRows.length,
+        writtenPath,
+      };
+    } catch (err) {
+      handleOwnerActionError(functionName, err);
+    }
+  }
+);
+
+exports.ownerFinalizeCupGlobalCurrentWindowOnce = onCall(
+  { region: "us-west2", timeoutSeconds: 540, memory: "1GiB" },
+  async (request) => {
+    const functionName = "ownerFinalizeCupGlobalCurrentWindowOnce";
+    const nowMs = Date.now();
+
+    try {
+      const uid = requireOwnerActionUid(request);
+      const roomId = getOwnerActionRoomId(request);
+      const { room } = await loadOwnerActionRoom(roomId);
+      assertOwnerCupRoom(room);
+
+      const cupSnap = await db.doc(`rooms/${roomId}/cup/current`).get();
+      const cup = cupSnap.exists ? (cupSnap.data() || {}) : {};
+      if (cup?.replayTestMode === true) {
+        throw new HttpsError(
+          "failed-precondition",
+          "Real Cup global finalization is blocked in replayTestMode. Use rehearsal for replay testing."
+        );
+      }
+
+      if (!isCupGlobalFinalizationEnabled(room)) {
+        throw new HttpsError(
+          "failed-precondition",
+          "Cup global finalization is not enabled for this room."
+        );
+      }
+
+      if (request.data?.confirm !== "FINALIZE_CUP_GLOBAL_WINDOW") {
+        throw new HttpsError(
+          "failed-precondition",
+          "Cup global finalization requires confirm='FINALIZE_CUP_GLOBAL_WINDOW'."
+        );
+      }
+
+      logOwnerAction(functionName, { functionName, uid, roomId, nowMs });
+
+      const applyResult = await computeCupCurrentWindowFromGlobalCache({
+        db,
+        roomId,
+        nowMs,
+        writeMode: "global",
+        dryRun: false,
+      });
+
+      if (
+        applyResult?.realWriteApplied !== true ||
+        applyResult?.allFinished !== true ||
+        String(applyResult?.statusValue || "").toLowerCase() !== "final" ||
+        Number(applyResult?.missingFixtureCount || 0) !== 0
+      ) {
+        throw new HttpsError(
+          "failed-precondition",
+          "Cup global finalization requires a successful final global apply."
+        );
+      }
+
+      const finalization = await finalizeCupGlobalCurrentWindow({
+        db,
+        roomId,
+        room,
+        cup,
+        applyResult,
+        nowMs,
+      });
+
+      return {
+        ok: true,
+        roomId,
+        mode: "cup-global-finalized-window",
+        windowKey: finalization.windowKey,
+        historyDocId: finalization.historyDocId,
+        fixtureCount: finalization.fixtureCount,
+        statusValue: finalization.statusValue,
+        allFinished: finalization.allFinished,
+        finalizedUserCount: finalization.finalizedUserCount,
+        wroteFinalResults: finalization.wroteFinalResults,
+        historyPath: finalization.historyPath,
+        cupCurrentPath: finalization.cupCurrentPath,
+        standingsPath: finalization.standingsPath,
+        finalResultsPath: finalization.finalResultsPath,
+      };
+    } catch (err) {
+      handleOwnerActionError(functionName, err);
+    }
+  }
+);
+
+exports.ownerRefreshCupGlobalFixtureCache = onCall(
+  { region: "us-west2", secrets: [APIFOOTBALL_KEY], timeoutSeconds: 540, memory: "1GiB" },
+  async (request) => {
+    const functionName = "ownerRefreshCupGlobalFixtureCache";
+    const nowMs = Date.now();
+
+    try {
+      const uid = requireOwnerActionUid(request);
+      const roomId = getOwnerActionRoomId(request);
+      const { room } = await loadOwnerActionRoom(roomId);
+      assertOwnerCupRoom(room);
+      logOwnerAction(functionName, { functionName, uid, roomId, nowMs });
+
+      const cupSnap = await db.doc(`rooms/${roomId}/cup/current`).get();
+      const cup = cupSnap.exists ? (cupSnap.data() || {}) : {};
+      const fixtureIds = [...new Set((Array.isArray(cup?.currentWindowFixtureIds) ? cup.currentWindowFixtureIds : [])
+        .map((id) => String(id || "").trim())
+        .filter(Boolean))];
+
+      if (!fixtureIds.length) {
+        throw new HttpsError(
+          "failed-precondition",
+          "Refresh requires cup/current.currentWindowFixtureIds."
+        );
+      }
+
+      const seasonContext = deriveRoomSeasonContext(room);
+      if (!seasonContext?.seasonKey) {
+        throw new HttpsError("failed-precondition", "Could not resolve seasonKey for room.");
+      }
+
+      const competition = room.competition || {};
+      const timezone = String(
+        competition?.timezone ||
+          room?.timezone ||
+          "America/Los_Angeles"
+      );
+      const apiKey = APIFOOTBALL_KEY.value();
+      const { detailsByFixtureId, missingFixtureIds } = await fetchFixtureDetailsMapFromApiFootball({
+        fixtureIds,
+        timezone,
+        apiKey,
+        nowMs,
+      });
+
+      let refreshedCount = 0;
+      let writtenSummaryCount = 0;
+      let writtenLiveFixtureCount = 0;
+      const statusByFixtureId = {};
+
+      for (const fixtureId of fixtureIds) {
+        const detail = detailsByFixtureId[String(fixtureId)] || null;
+        if (!detail) continue;
+
+        const statusShort = detail.statusShort || null;
+        statusByFixtureId[String(fixtureId)] = statusShort;
+
+        await db.doc(`apiCache/fixtureStatus_${fixtureId}`).set(
+          {
+            ...detail,
+            short: statusShort,
+            statusShort,
+            updatedAtMs: nowMs,
+          },
+          { merge: true }
+        );
+
+        const fixtureMeta = {
+          ...detail,
+          fixtureId: String(fixtureId),
+          fixtureStatus: statusShort,
+          matchStatus: statusShort,
+          statusUpdatedAtMs: nowMs,
+        };
+
+        const playersResponse = await apiFootballGet(
+          "fixtures/players",
+          { fixture: String(fixtureId) },
+          apiKey
+        );
+        let rawStatsByPlayerId = patchPlayerStatsWithFixtureMeta(
+          buildPlayerStatsMapFromFixturePlayersResponse(playersResponse?.response || [], fixtureMeta),
+          fixtureMeta
+        );
+        let rawStatsSource = "api-football";
+
+        if (!rawStatsByPlayerId || Object.keys(rawStatsByPlayerId).length === 0) {
+          const existingLiveSnap = await getSeasonLiveFixtureRef(
+            db,
+            seasonContext.seasonKey,
+            fixtureId
+          ).get();
+          const existingLive = existingLiveSnap.exists ? (existingLiveSnap.data() || {}) : {};
+          const existingRawStats =
+            existingLive?.rawStatsByPlayerId && typeof existingLive.rawStatsByPlayerId === "object"
+              ? existingLive.rawStatsByPlayerId
+              : {};
+
+          if (Object.keys(existingRawStats).length > 0) {
+            rawStatsByPlayerId = patchPlayerStatsWithFixtureMeta(existingRawStats, fixtureMeta);
+            rawStatsSource = "existing-global-live-fixture";
+          }
+        }
+
+        const fantasyByPlayerId = buildGlobalFantasyByPlayerId(rawStatsByPlayerId);
+        const livePayload = {
+          fixtureId: String(fixtureId),
+          seasonKey: seasonContext.seasonKey,
+          source: "owner-cup-global-fixture-cache-refresh",
+          rawStatsSource,
+          updatedAtMs: nowMs,
+          computedAt: FieldValue.serverTimestamp(),
+          statusShort,
+          statusLong: detail.statusLong || null,
+          elapsed: detail.elapsed ?? null,
+          extra: detail.extra ?? null,
+          kickoffMs: detail.kickoffMs ?? null,
+          rawStatsByPlayerId,
+          fantasyByPlayerId,
+          rawStatsPlayerCount: Object.keys(rawStatsByPlayerId || {}).length,
+          fantasyPlayerCount: Object.keys(fantasyByPlayerId || {}).length,
+        };
+        const payloadBytesEstimate = estimateDocBytes(livePayload);
+
+        await writeSeasonLiveFixture({
+          db,
+          seasonKey: seasonContext.seasonKey,
+          fixtureId,
+          payload: {
+            ...livePayload,
+            payloadBytesEstimate,
+          },
+        });
+        writtenLiveFixtureCount += 1;
+
+        await db.doc(`apiCache/fixturePlayers_${fixtureId}`).set(
+          {
+            updatedAtMs: nowMs,
+            playerStats: rawStatsByPlayerId,
+          },
+          { merge: true }
+        );
+
+        await writeSeasonFixtureSummary({
+          db,
+          seasonKey: seasonContext.seasonKey,
+          fixtureId,
+          summary: {
+            fixtureId: String(fixtureId),
+            seasonKey: seasonContext.seasonKey,
+            competitionKey: seasonContext.competitionKey || room.competitionKey || "",
+            competitionType: seasonContext.competitionType || room.competitionType || "",
+            league: String(competition?.league || ""),
+            season: String(competition?.season || ""),
+            timezone,
+            source: "owner-cup-global-fixture-cache-refresh",
+            updatedAtMs: nowMs,
+            computedAt: FieldValue.serverTimestamp(),
+            kickoffMs: detail.kickoffMs ?? null,
+            statusShort,
+            statusLong: detail.statusLong || null,
+            elapsed: detail.elapsed ?? null,
+            extra: detail.extra ?? null,
+            isLive: isInPlay(statusShort),
+            isFinished: isFinished(statusShort),
+            hasStarted: hasFixtureStarted(statusShort),
+            homeTeamId: detail.homeTeamId ?? null,
+            homeTeamName: detail.homeTeamName || "",
+            homeTeamLogo: detail.homeTeamLogo || "",
+            awayTeamId: detail.awayTeamId ?? null,
+            awayTeamName: detail.awayTeamName || "",
+            awayTeamLogo: detail.awayTeamLogo || "",
+            goalsHome: toNum(detail.goalsHome),
+            goalsAway: toNum(detail.goalsAway),
+            leagueId: detail.leagueId ?? null,
+            leagueName: detail.leagueName || "",
+            leagueRound: detail.leagueRound || null,
+            roundLabel: detail.leagueRound || null,
+            rawStatsPlayerCount: Object.keys(rawStatsByPlayerId || {}).length,
+            fantasyPlayerCount: Object.keys(fantasyByPlayerId || {}).length,
+            payloadBytesEstimate,
+            sourceRoomCount: 1,
+          },
+        });
+        writtenSummaryCount += 1;
+        refreshedCount += 1;
+      }
+
+      return {
+        ok: true,
+        roomId,
+        mode: "cup-global-fixture-cache-refresh",
+        seasonKey: seasonContext.seasonKey,
+        fixtureIds,
+        fixtureCount: fixtureIds.length,
+        refreshedCount,
+        statusByFixtureId,
+        missingCount: missingFixtureIds.length,
+        missingFixtureIds,
+        writtenSummaryCount,
+        writtenLiveFixtureCount,
+      };
+    } catch (err) {
+      handleOwnerActionError(functionName, err);
+    }
+  }
+);
+
+exports.ownerRehearseCupGlobalWriteFromHistory = onCall(
+  { region: "us-west2", timeoutSeconds: 540, memory: "1GiB" },
+  async (request) => {
+    const functionName = "ownerRehearseCupGlobalWriteFromHistory";
+    const nowMs = Date.now();
+
+    try {
+      const uid = requireOwnerActionUid(request);
+      const roomId = getOwnerActionRoomId(request);
+      const { room } = await loadOwnerActionRoom(roomId);
+      assertOwnerCupRoom(room);
+      logOwnerAction(functionName, { functionName, uid, roomId, nowMs });
+
+      const shadowResult = await computeGlobalCupShadowResults({
+        db,
+        roomId,
+        nowMs,
+      });
+
+      if (shadowResult.shadowSource !== "cup-history-latest") {
+        throw new HttpsError(
+          "failed-precondition",
+          "Cup global rehearsal requires a completed cupHistory window."
+        );
+      }
+
+      if (
+        Number(shadowResult.fixtureCount || 0) <= 0 ||
+        Number(shadowResult.missingFixtureCount || 0) !== 0 ||
+        Number(shadowResult.maxAbsDiff || 0) !== 0 ||
+        (Array.isArray(shadowResult.playerMismatches) && shadowResult.playerMismatches.length > 0) ||
+        (Array.isArray(shadowResult.statMismatches) && shadowResult.statMismatches.length > 0)
+      ) {
+        throw new HttpsError(
+          "failed-precondition",
+          "Cannot rehearse Cup global write until Cup shadow result is clean."
+        );
+      }
+
+      const rehearsalPayload = buildCupGlobalWriteRehearsalPayload(shadowResult, nowMs);
+      const writtenPath = `rooms/${roomId}/globalShadowResults/cup-write-rehearsal`;
+
+      await db
+        .doc(writtenPath)
+        .set(
+          {
+            ...rehearsalPayload,
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: false }
+        );
+
+      return {
+        ok: true,
+        roomId,
+        mode: "cup-global-write-rehearsal",
+        shadowSource: rehearsalPayload.shadowSource,
+        compareScope: rehearsalPayload.compareScope,
+        historyId: rehearsalPayload.historyId,
+        historyLabel: rehearsalPayload.historyLabel,
+        historyFixtureCount: rehearsalPayload.historyFixtureCount,
+        fixtureCount: rehearsalPayload.fixtureCount,
+        missingFixtureCount: rehearsalPayload.missingFixtureCount,
+        maxAbsDiff: rehearsalPayload.maxAbsDiff,
+        playerMismatchCount: rehearsalPayload.playerMismatchCount,
+        statMismatchCount: rehearsalPayload.statMismatchCount,
+        projectedUserCount: rehearsalPayload.projectedStandingsRows.length,
+        writtenPath,
+      };
+    } catch (err) {
+      handleOwnerActionError(functionName, err);
+    }
+  }
+);
+
+exports.ownerPrepareCupGlobalReplayFromHistory = onCall(
+  { region: "us-west2", timeoutSeconds: 540, memory: "1GiB" },
+  async (request) => {
+    const functionName = "ownerPrepareCupGlobalReplayFromHistory";
+    const nowMs = Date.now();
+
+    try {
+      const uid = requireOwnerActionUid(request);
+      const roomId = getOwnerActionRoomId(request);
+
+      if (request.data?.confirm !== "PREPARE_CUP_REPLAY") {
+        throw new HttpsError(
+          "failed-precondition",
+          "Cup replay preparation requires confirm='PREPARE_CUP_REPLAY'."
+        );
+      }
+
+      const { room } = await loadOwnerActionRoom(roomId);
+      assertOwnerCupRoom(room);
+      logOwnerAction(functionName, { functionName, uid, roomId, nowMs });
+
+      const cupCurrentRef = db.doc(`rooms/${roomId}/cup/current`);
+      const backupPath = `rooms/${roomId}/globalShadowResults/cup-current-before-replay`;
+      const backupRef = db.doc(backupPath);
+
+      const [cupCurrentSnap, backupSnap] = await Promise.all([
+        cupCurrentRef.get(),
+        backupRef.get(),
+      ]);
+
+      if (backupSnap.exists) {
+        const backupData = backupSnap.data() || {};
+        if (backupData.originalCupCurrent && typeof backupData.originalCupCurrent === "object") {
+          throw new HttpsError(
+            "failed-precondition",
+            "Cup replay backup already exists. Restore it before preparing another replay."
+          );
+        }
+      }
+
+      const originalCupCurrent = cupCurrentSnap.exists ? (cupCurrentSnap.data() || {}) : {};
+      const historyWindow = await loadLatestCupHistoryWindow({ db, roomId });
+      const fixtureIds = [...new Set((Array.isArray(historyWindow?.fixtureIds) ? historyWindow.fixtureIds : [])
+        .map((id) => String(id || "").trim())
+        .filter(Boolean))];
+
+      if (!fixtureIds.length) {
+        throw new HttpsError("failed-precondition", "No cupHistory fixture IDs found for replay.");
+      }
+
+      const historyId = historyWindow?.historyId || historyWindow?.id || null;
+      const historyLabel = historyWindow?.label || historyWindow?.currentWindowLabel || null;
+      const writtenPath = `rooms/${roomId}/cup/current`;
+
+      await backupRef.set(
+        {
+          roomId,
+          mode: "cup-global-replay-backup",
+          originalCupCurrent,
+          backedUpAtMs: nowMs,
+          backedUpAt: FieldValue.serverTimestamp(),
+        },
+        { merge: false }
+      );
+
+      await cupCurrentRef.set(
+        {
+          replayTestMode: true,
+          replaySource: "cup-history-latest",
+          replayHistoryId: historyId,
+          replayHistoryLabel: historyLabel,
+          replayPreparedAtMs: nowMs,
+          status: "replay",
+          completed: false,
+          completedAtMs: FieldValue.delete(),
+          currentWindowLabel: historyLabel || "Replay Window",
+          currentWindowFixtureIds: fixtureIds,
+          currentWindowFixtures: Array.isArray(historyWindow?.fixtures)
+            ? historyWindow.fixtures
+            : [],
+          currentWindowStartAtMs: Number(historyWindow?.startAtMs || 0) || null,
+          currentWindowEndAtMs: Number(historyWindow?.endAtMs || 0) || null,
+          replayBaselineTotalsByUid: {},
+          updatedAtMs: nowMs,
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      return {
+        ok: true,
+        roomId,
+        mode: "cup-global-replay-prepared",
+        replayTestMode: true,
+        replaySource: "cup-history-latest",
+        historyId,
+        historyLabel,
+        replayHistoryLabel: historyLabel,
+        fixtureIds,
+        fixtureCount: fixtureIds.length,
+        backupPath,
+        writtenPath,
+      };
+    } catch (err) {
+      handleOwnerActionError(functionName, err);
+    }
+  }
+);
+
+exports.ownerRestoreCupCurrentFromReplayBackup = onCall(
+  { region: "us-west2", timeoutSeconds: 540, memory: "1GiB" },
+  async (request) => {
+    const functionName = "ownerRestoreCupCurrentFromReplayBackup";
+    const nowMs = Date.now();
+
+    try {
+      const uid = requireOwnerActionUid(request);
+      const roomId = getOwnerActionRoomId(request);
+
+      if (request.data?.confirm !== "RESTORE_CUP_REPLAY") {
+        throw new HttpsError(
+          "failed-precondition",
+          "Cup replay restore requires confirm='RESTORE_CUP_REPLAY'."
+        );
+      }
+
+      const { room } = await loadOwnerActionRoom(roomId);
+      assertOwnerCupRoom(room);
+      logOwnerAction(functionName, { functionName, uid, roomId, nowMs });
+
+      const backupPath = `rooms/${roomId}/globalShadowResults/cup-current-before-replay`;
+      const restoredPath = `rooms/${roomId}/cup/current`;
+      const backupRef = db.doc(backupPath);
+      const backupSnap = await backupRef.get();
+      const backup = backupSnap.exists ? (backupSnap.data() || {}) : {};
+      const originalCupCurrent = backup.originalCupCurrent;
+
+      if (!originalCupCurrent || typeof originalCupCurrent !== "object") {
+        throw new HttpsError(
+          "failed-precondition",
+          "Cup replay backup is missing original cup/current data."
+        );
+      }
+
+      await db.doc(restoredPath).set(
+        {
+          ...originalCupCurrent,
+          restoredFromReplayAtMs: nowMs,
+          restoredFromReplayAt: FieldValue.serverTimestamp(),
+        },
+        { merge: false }
+      );
+      await backupRef.delete();
+
+      return {
+        ok: true,
+        roomId,
+        mode: "cup-global-replay-restored",
+        restoredPath,
+        backupPath,
+        backupDeleted: true,
+      };
+    } catch (err) {
+      handleOwnerActionError(functionName, err);
+    }
+  }
+);
+
+exports.ownerApplyCupGlobalCurrentWindowOnce = onCall(
+  { region: "us-west2", timeoutSeconds: 540, memory: "1GiB" },
+  async (request) => {
+    const functionName = "ownerApplyCupGlobalCurrentWindowOnce";
+    const nowMs = Date.now();
+
+    try {
+      const uid = requireOwnerActionUid(request);
+      const roomId = getOwnerActionRoomId(request);
+      const { room } = await loadOwnerActionRoom(roomId);
+      assertOwnerCupRoom(room);
+      logOwnerAction(functionName, { functionName, uid, roomId, nowMs });
+
+      const result = await computeCupCurrentWindowFromGlobalCache({
+        db,
+        roomId,
+        nowMs,
+        writeMode: "global",
+        dryRun: false,
+      });
+
+      return {
+        ok: true,
+        roomId,
+        mode: "cup-global-current-window-apply",
+        realWriteApplied: true,
+        projectionOnly: true,
+        replayTestMode: Boolean(result.replayTestMode),
+        replaySource: result.replaySource || null,
+        replayHistoryId: result.replayHistoryId || null,
+        replayHistoryLabel: result.replayHistoryLabel || null,
+        fixtureCount: Number(result.fixtureCount || 0),
+        missingFixtureCount: Number(result.missingFixtureCount || 0),
+        statusValue: result.statusValue || null,
+        allFinished: Boolean(result.allFinished),
+        anyInPlay: Boolean(result.anyInPlay),
+        projectedUserCount: Array.isArray(result.projectedStandingsRows)
+          ? result.projectedStandingsRows.length
+          : 0,
+        writtenPath: `rooms/${roomId}/cup/current`,
+        auditPath: `rooms/${roomId}/globalShadowResults/cup-apply-current-window`,
       };
     } catch (err) {
       handleOwnerActionError(functionName, err);
@@ -8250,6 +9168,21 @@ function ownerStatusMs(value) {
   return null;
 }
 
+const LIVE_USER_WINDOW_MS = 3 * 60 * 1000;
+
+async function countFirebaseAuthUsers() {
+  let total = 0;
+  let pageToken;
+
+  do {
+    const result = await admin.auth().listUsers(1000, pageToken);
+    total += Array.isArray(result.users) ? result.users.length : 0;
+    pageToken = result.pageToken;
+  } while (pageToken);
+
+  return total;
+}
+
 function ownerCountBy(map, key) {
   const k = String(key || "unknown");
   map[k] = Number(map[k] || 0) + 1;
@@ -8263,16 +9196,202 @@ function ownerMemberUid(member) {
   ).trim();
 }
 
-function getOwnerRoomManagerCount(room = {}) {
+function getOwnerRoomManagerCount(room = {}, memberUids = []) {
+  const ids = new Set();
   const members = Array.isArray(room?.members) ? room.members : [];
-  const ids = new Set(members.map(ownerMemberUid).filter(Boolean));
-  const count =
-    ids.size ||
-    members.length ||
-    Number(room?.managerCount || room?.memberCount || 0) ||
-    0;
 
-  return Number.isFinite(count) ? count : 0;
+  for (const member of members) {
+    const uid = ownerMemberUid(member);
+    if (uid) ids.add(uid);
+  }
+
+  for (const uid of Array.isArray(memberUids) ? memberUids : []) {
+    const clean = String(uid || "").trim();
+    if (clean) ids.add(clean);
+  }
+
+  if (ids.size > 0) return ids.size;
+
+  const fallback = Number(room?.managerCount ?? room?.memberCount ?? 0);
+  return Number.isFinite(fallback) && fallback > 0 ? fallback : 0;
+}
+
+function buildOwnerDraftStatus(room = {}) {
+  const status = String(room?.status || "").toLowerCase();
+  const draftStatusRaw = String(room?.draftStatus || "").toLowerCase();
+
+  const started =
+    room?.started === true ||
+    room?.draftStarted === true ||
+    room?.draftComplete === true ||
+    status === "drafting" ||
+    status === "draft_started" ||
+    status === "draft_complete" ||
+    status === "ready" ||
+    status === "live" ||
+    status === "active";
+
+  const complete =
+    room?.draftComplete === true ||
+    room?.draftCompleted === true ||
+    status === "draft_complete" ||
+    status === "complete" ||
+    status === "ready" ||
+    status === "live" ||
+    status === "active";
+
+  const scheduled =
+    Boolean(room?.draftScheduledAt || room?.scheduledDraftAt || room?.draftStartAtMs || room?.startAt) ||
+    status === "draft_scheduled" ||
+    draftStatusRaw === "scheduled";
+
+  const active =
+    status === "drafting" ||
+    status === "draft_started" ||
+    draftStatusRaw === "active" ||
+    draftStatusRaw === "drafting";
+
+  if (active && !complete) {
+    return {
+      draftStatus: "active",
+      draftStatusLabel: "Draft: Live",
+      draftStatusTone: "live",
+    };
+  }
+
+  if (complete || started) {
+    return {
+      draftStatus: "complete",
+      draftStatusLabel: "Draft: Complete",
+      draftStatusTone: "ok",
+    };
+  }
+
+  if (scheduled) {
+    return {
+      draftStatus: "scheduled",
+      draftStatusLabel: "Draft: Scheduled",
+      draftStatusTone: "scheduled",
+    };
+  }
+
+  return {
+    draftStatus: "not_started",
+    draftStatusLabel: "Draft: Not started",
+    draftStatusTone: "muted",
+  };
+}
+
+function ownerRoomLooksWorldCupGroup(room = {}, competitionState = null) {
+  const state = competitionState || getCompetitionState(room) || {};
+  const phaseLabel = String(state?.phaseLabel || room?.phaseLabel || "");
+
+  return (
+    room?.engineType === "worldCupDaily" ||
+    room?.worldCup?.engineType === "worldCupDaily" ||
+    room?.worldCupPhase === "group" ||
+    room?.worldCupPhase === "WorldCupGroup" ||
+    room?.worldCup?.phase === "group" ||
+    phaseLabel === "WorldCupGroup"
+  );
+}
+
+function buildOwnerProgressStatus(room = {}, cupDoc = null) {
+  const competitionState = getCompetitionState(room) || {};
+  const phaseLabel = String(
+    competitionState?.phaseLabel ||
+      room?.phaseLabel ||
+      ""
+  );
+
+  const isWorldCupGroup = ownerRoomLooksWorldCupGroup(room, competitionState);
+  const isCup = phaseLabel === "Cup" && !isWorldCupGroup;
+  const draft = buildOwnerDraftStatus(room);
+  const draftNotDone =
+    draft.draftStatus === "not_started" ||
+    draft.draftStatus === "scheduled" ||
+    draft.draftStatus === "active";
+
+  if (draftNotDone) {
+    return {
+      progressLabel: "Progress: Waiting for draft",
+      progressTone: "muted",
+      progressDetail: "",
+    };
+  }
+
+  if (isWorldCupGroup) {
+    const dayIndex =
+      Number(room?.worldCup?.currentDayIndex) ||
+      Number(room?.currentDayIndex) ||
+      null;
+
+    const dayLabel =
+      room?.worldCup?.currentDayLabel ||
+      competitionState?.currentLabel ||
+      (dayIndex ? `Day ${dayIndex}` : "");
+
+    const dayCount = Number(room?.worldCup?.dayCount || 0) || null;
+
+    return {
+      progressLabel: dayLabel
+        ? `Progress: ${dayLabel}${dayCount ? ` / ${dayCount}` : ""}`
+        : "Progress: World Cup group",
+      progressTone: "worldCup",
+      progressDetail: phaseLabel || "WorldCupGroup",
+    };
+  }
+
+  if (isCup) {
+    const cupLabel =
+      cupDoc?.currentWindowLabel ||
+      cupDoc?.roundLabel ||
+      cupDoc?.label ||
+      competitionState?.currentLabel ||
+      room?.cup?.currentWindowLabel ||
+      "";
+
+    const cupStatus =
+      cupDoc?.status ||
+      competitionState?.weekStatus ||
+      "";
+
+    const fixtureCount = Array.isArray(cupDoc?.currentWindowFixtureIds)
+      ? cupDoc.currentWindowFixtureIds.length
+      : Array.isArray(cupDoc?.fixtureIds)
+        ? cupDoc.fixtureIds.length
+        : null;
+
+    return {
+      progressLabel: cupLabel
+        ? `Progress: ${cupLabel}`
+        : "Progress: Cup",
+      progressTone: "cup",
+      progressDetail: [
+        cupStatus ? `Status: ${cupStatus}` : "",
+        fixtureCount != null ? `Fixtures: ${fixtureCount}` : "",
+      ].filter(Boolean).join(" · "),
+    };
+  }
+
+  const weekIndex =
+    Number(room?.currentWeekIndex) ||
+    Number(room?.weekIndex) ||
+    null;
+
+  const totalRounds =
+    Number(room?.competitionMeta?.totalRounds) ||
+    Number(room?.["competitionMeta.totalRounds"]) ||
+    Number(room?.competition?.totalRounds) ||
+    null;
+
+  return {
+    progressLabel: weekIndex
+      ? `Progress: Week ${weekIndex}${totalRounds ? ` / ${totalRounds}` : ""}`
+      : "Progress: Regular Season",
+    progressTone: "regular",
+    progressDetail: competitionState?.currentLabel || "",
+  };
 }
 
 function ownerMinMs(current, next) {
@@ -8476,7 +9595,7 @@ function buildOwnerRoomHealth(roomStatus = {}, nowMs) {
   return { key: "ok", label: "OK", priority: 10 };
 }
 
-function buildOwnerRoomStatus({ roomDoc, queueTask, nowMs }) {
+function buildOwnerRoomStatus({ roomDoc, queueTask, nowMs, memberUids = [], cupDoc = null }) {
   const room = roomDoc.data() || {};
   const competition = room.competition || {};
   const competitionMeta = room.competitionMeta || {};
@@ -8497,13 +9616,20 @@ function buildOwnerRoomStatus({ roomDoc, queueTask, nowMs }) {
   const roomUpdatedAtMs = ownerStatusMs(room.updatedAtMs);
   const roomUpdatedAt = ownerStatusMs(room.updatedAt);
   const competitionStateUpdatedAtMs = ownerStatusMs(competitionState?.updatedAtMs);
-  const managerCount = getOwnerRoomManagerCount(room);
+  const managerCount = getOwnerRoomManagerCount(room, memberUids);
   const managerLimit = 10;
+  const requiresEvenManagers = roomRequiresEvenManagers(room);
+  const draftStatusInfo = buildOwnerDraftStatus(room);
+  const progressStatusInfo = buildOwnerProgressStatus(room, cupDoc);
   let managerCountWarning = "";
-  if (managerCount < 2 && !room.started) {
-    managerCountWarning = "Need at least 2 managers before draft start.";
-  } else if (managerCount % 2 !== 0 && !room.started) {
-    managerCountWarning = "Head-to-head rooms need an even number of managers.";
+  if (managerCount < 2) {
+    managerCountWarning = room.started
+      ? "Started with fewer than 2 managers; tournament may not work correctly."
+      : "Need at least 2 managers before draft start.";
+  } else if (requiresEvenManagers && managerCount % 2 !== 0) {
+    managerCountWarning = room.started
+      ? "Started with an odd number of managers; Regular Season head-to-head pairing may fail."
+      : "Regular Season head-to-head rooms need an even number of managers.";
   }
   const lastUpdateAtMs =
     roomUpdatedAtMs ||
@@ -8557,6 +9683,8 @@ function buildOwnerRoomStatus({ roomDoc, queueTask, nowMs }) {
     currentWeekIndex: room.currentWeekIndex ?? null,
     competitionLocked: Boolean(room.competitionLocked),
     started: Boolean(room.started),
+    ...draftStatusInfo,
+    ...progressStatusInfo,
     managerCount,
     managerLimit,
     managerCountLabel: `${managerCount}/${managerLimit}`,
@@ -8714,14 +9842,69 @@ exports.getOwnerSiteStatus = onCall(
       requireAdminUid(uid);
 
       const nowMs = Date.now();
-      const [roomsSnap, queueSnap] = await Promise.all([
+      const liveSinceMs = nowMs - LIVE_USER_WINDOW_MS;
+      const [roomsSnap, queueSnap, membersSnap, livePresenceSnap, authUserCount] = await Promise.all([
         db.collection("rooms").limit(1000).get(),
         db.collection("tournamentPollQueue").limit(1000).get(),
+        db.collectionGroup("members").limit(12000).get(),
+        db.collection("sitePresence").where("lastSeenAtMs", ">=", liveSinceMs).limit(1000).get(),
+        countFirebaseAuthUsers(),
       ]);
+      const liveUserCount = livePresenceSnap.size;
 
       const queueByRoomId = new Map(
         queueSnap.docs.map((queueDoc) => [queueDoc.id, queueDoc.data() || {}])
       );
+      const memberUidsByRoomId = new Map();
+
+      for (const memberDoc of membersSnap.docs) {
+        const roomRef = memberDoc.ref.parent.parent;
+        const roomId = roomRef?.id;
+        if (!roomId) continue;
+
+        const data = memberDoc.data() || {};
+        const uid = String(
+          memberDoc.id ||
+            data.uid ||
+            data.userId ||
+            data.id ||
+            ""
+        ).trim();
+
+        if (!uid) continue;
+
+        const set = memberUidsByRoomId.get(roomId) || new Set();
+        set.add(uid);
+        memberUidsByRoomId.set(roomId, set);
+      }
+
+      const cupCurrentRefs = [];
+      for (const roomDoc of roomsSnap.docs) {
+        const room = roomDoc.data() || {};
+        const competitionState = getCompetitionState(room) || {};
+        const phaseLabel = String(
+          competitionState?.phaseLabel ||
+            room?.phaseLabel ||
+            ""
+        );
+
+        if (phaseLabel === "Cup" && !ownerRoomLooksWorldCupGroup(room, competitionState)) {
+          cupCurrentRefs.push(db.doc(`rooms/${roomDoc.id}/cup/current`));
+        }
+      }
+
+      const cupCurrentSnaps = cupCurrentRefs.length
+        ? await db.getAll(...cupCurrentRefs)
+        : [];
+      const cupCurrentByRoomId = new Map();
+
+      for (const snap of cupCurrentSnaps) {
+        const roomRef = snap.ref.parent.parent;
+        const roomId = roomRef?.id;
+        if (!roomId) continue;
+        cupCurrentByRoomId.set(roomId, snap.exists ? (snap.data() || {}) : null);
+      }
+
       const groupsByKey = new Map();
       const totals = {
         roomCount: 0,
@@ -8743,6 +9926,8 @@ exports.getOwnerSiteStatus = onCall(
           roomDoc,
           queueTask: queueByRoomId.get(roomDoc.id) || null,
           nowMs,
+          memberUids: Array.from(memberUidsByRoomId.get(roomDoc.id) || []),
+          cupDoc: cupCurrentByRoomId.get(roomDoc.id) || null,
         });
 
         const groupKey = getOwnerCompetitionGroupKey(roomStatus);
@@ -8866,11 +10051,15 @@ exports.getOwnerSiteStatus = onCall(
 
       return {
         ok: true,
-        readOnly: true,
+        ownerActionsEnabled: true,
         nowMs,
+        authUserCount,
+        liveUserCount,
+        liveUserWindowMs: LIVE_USER_WINDOW_MS,
         roomLimit: 1000,
         scannedRoomCount: roomsSnap.size,
         queueTaskCount: queueSnap.size,
+        memberDocCount: membersSnap.size,
         competitionGroupCount: groups.length,
         totals,
         groups,
@@ -9098,23 +10287,29 @@ exports.pollGlobalSeasonLiveFixtures = onSchedule(
         .where("competitionState.weekStatus", "in", ["live", "resolving"])
         .get(),
 
-      db.collection("rooms")
-        .where("competitionState.weekStatus", "==", "scheduled")
-        .where("engineType", "==", "worldCupDaily")
-        .limit(50)
-        .get(),
+      runSweep
+        ? db.collection("rooms")
+            .where("competitionState.weekStatus", "==", "scheduled")
+            .where("engineType", "==", "worldCupDaily")
+            .limit(50)
+            .get()
+        : Promise.resolve({ docs: [], size: 0 }),
 
-      db.collection("rooms")
-        .where("competitionState.weekStatus", "==", "scheduled")
-        .where("worldCup.engineType", "==", "worldCupDaily")
-        .limit(50)
-        .get(),
+      runSweep
+        ? db.collection("rooms")
+            .where("competitionState.weekStatus", "==", "scheduled")
+            .where("worldCup.engineType", "==", "worldCupDaily")
+            .limit(50)
+            .get()
+        : Promise.resolve({ docs: [], size: 0 }),
 
-      db.collection("rooms")
-        .where("competitionState.weekStatus", "==", "scheduled")
-        .where("competitionState.phaseLabel", "==", "WorldCupGroup")
-        .limit(50)
-        .get(),
+      runSweep
+        ? db.collection("rooms")
+            .where("competitionState.weekStatus", "==", "scheduled")
+            .where("competitionState.phaseLabel", "==", "WorldCupGroup")
+            .limit(50)
+            .get()
+        : Promise.resolve({ docs: [], size: 0 }),
 
       runSweep
         ? db.collection("rooms")
@@ -9124,11 +10319,13 @@ exports.pollGlobalSeasonLiveFixtures = onSchedule(
     ]);
 
     const roomDocsById = new Map();
+    const queueDueRoomIds = new Set();
 
     for (const taskDoc of queueSnap.docs) {
       const task = taskDoc.data() || {};
       const roomId = String(task.roomId || taskDoc.id || "");
       if (!roomId) continue;
+      queueDueRoomIds.add(roomId);
 
       const roomSnap = await db.doc(`rooms/${roomId}`).get();
       if (!roomSnap.exists) {
@@ -9161,7 +10358,8 @@ exports.pollGlobalSeasonLiveFixtures = onSchedule(
 
     const { targets: seasonTargets, stats } = await collectActiveSeasonFixtureTargets(
       nowMs,
-      Array.from(roomDocsById.values())
+      Array.from(roomDocsById.values()),
+      { queueDueRoomIds, runSweep }
     );
 
     console.log("[pollGlobalSeasonLiveFixtures] summary", {
@@ -9174,6 +10372,7 @@ exports.pollGlobalSeasonLiveFixtures = onSchedule(
       sweepRooms: sweepSnap.size || 0,
       roomsRead: roomDocsById.size,
       sleepingRoomCount: stats.sleepingRoomCount,
+      skippedFuturePollCount: stats.skippedFuturePollCount,
       activeRoomCount: stats.activeRoomCount,
       skippedDoneCount: stats.skippedDoneCount,
       runSweep,
@@ -9214,10 +10413,121 @@ exports.pollGlobalSeasonLiveFixtures = onSchedule(
 );
 
 const TOURNAMENT_PRE_MS = 20 * 60 * 1000;          // wake 20 min before kickoff
+const TOURNAMENT_PREGAME_POLL_MS = 5 * 60 * 1000;  // every 5 min before kickoff
 const TOURNAMENT_ACTIVE_POLL_MS = 60 * 1000;       // every minute during active window
 const TOURNAMENT_UNKNOWN_RECHECK_MS = 60 * 60 * 1000; // check hourly if no kickoff time
 const TOURNAMENT_POST_MS = 3 * 60 * 60 * 1000;     // keep your current 3h post-kickoff
 const TOURNAMENT_SWEEP_MS = 60 * 60 * 1000;        // hourly safety sweep
+const TOURNAMENT_SLEEP_GUARD_GRACE_MS = 30 * 1000;
+
+function pollingNextPollAtMs(competitionState = {}) {
+  const direct = Number(competitionState?.nextPollAtMs || 0);
+  if (Number.isFinite(direct) && direct > 0) return direct;
+
+  const cup = Number(competitionState?.nextCupPollAtMs || 0);
+  if (Number.isFinite(cup) && cup > 0) return cup;
+
+  return null;
+}
+
+function roomLooksCompleteForPolling(room = {}, competitionState = {}) {
+  const status = String(room?.status || "").trim().toLowerCase();
+  const seasonPhase = String(room?.seasonPhase || "").trim().toUpperCase();
+  const weekStatus = String(competitionState?.weekStatus || "").trim().toLowerCase();
+  const cupCompleted = room?.cup?.completed === true;
+  const worldCupCompleted = room?.worldCup?.completed === true;
+
+  return (
+    competitionState?.isDone === true ||
+    seasonPhase === "COMPLETE" ||
+    status === "completed" ||
+    status === "complete" ||
+    status === "done" ||
+    weekStatus === "complete" ||
+    weekStatus === "final" ||
+    cupCompleted ||
+    worldCupCompleted
+  );
+}
+
+function buildDeepPollingSkip(room = {}, competitionState = {}, nowMs = Date.now(), {
+  isQueuedDue = false,
+  enforceGlobalDue = false,
+} = {}) {
+  if (roomLooksCompleteForPolling(room, competitionState)) {
+    return { skip: true, reason: "room-complete" };
+  }
+
+  const weekStatus = String(competitionState?.weekStatus || "").trim().toLowerCase();
+  const isSleepingStatus = weekStatus === "scheduled" || weekStatus === "idle";
+  const nextPollAtMs = pollingNextPollAtMs(competitionState);
+
+  if (
+    isSleepingStatus &&
+    Number.isFinite(Number(nextPollAtMs)) &&
+    Number(nextPollAtMs) > nowMs + TOURNAMENT_SLEEP_GUARD_GRACE_MS
+  ) {
+    return {
+      skip: true,
+      reason: "sleep-until-next-poll",
+      nextPollAtMs: Number(nextPollAtMs),
+    };
+  }
+
+  if (
+    enforceGlobalDue &&
+    isSleepingStatus &&
+    !isQueuedDue &&
+    !(
+      Number.isFinite(Number(nextPollAtMs)) &&
+      Number(nextPollAtMs) <= nowMs
+    )
+  ) {
+    return {
+      skip: true,
+      reason: "scheduled-global-room-not-due",
+      nextPollAtMs: Number.isFinite(Number(nextPollAtMs)) ? Number(nextPollAtMs) : null,
+    };
+  }
+
+  return { skip: false, reason: "" };
+}
+
+function coverageKickoffMs(coverage = {}) {
+  const kickoffMs = Number(coverage?.kickoffMs || coverage?.startAtMs || 0);
+  return Number.isFinite(kickoffMs) && kickoffMs > 0 ? kickoffMs : null;
+}
+
+function coverageStatusShort(coverage = {}) {
+  return String(
+    coverage?.statusShort ||
+      coverage?.fixtureStatus ||
+      coverage?.matchStatus ||
+      ""
+  ).trim().toUpperCase();
+}
+
+function isCancelledOrAbandonedStatus(short = "") {
+  return ["CANC", "PST", "ABD", "AWD", "WO"].includes(String(short || "").trim().toUpperCase());
+}
+
+function isCoverageInActiveWakeWindow(coverage = {}, nowMs = Date.now()) {
+  const kickoffMs = coverageKickoffMs(coverage);
+  return (
+    Number.isFinite(kickoffMs) &&
+    nowMs >= kickoffMs - TOURNAMENT_PRE_MS &&
+    nowMs <= kickoffMs + TOURNAMENT_POST_MS
+  );
+}
+
+function isCoverageStalePastPostTail(coverage = {}, nowMs = Date.now()) {
+  const kickoffMs = coverageKickoffMs(coverage);
+  return (
+    isInPlay(coverageStatusShort(coverage)) &&
+    Number.isFinite(kickoffMs) &&
+    nowMs > kickoffMs + TOURNAMENT_POST_MS
+  );
+}
 
 function kickoffMsFromFixture(g) {
   return Number(
@@ -9227,10 +10537,39 @@ function kickoffMsFromFixture(g) {
   );
 }
 
+function statusShortFromFixture(fixture = {}) {
+  return String(
+    fixture?.statusShort ||
+      fixture?.fixtureStatus ||
+      fixture?.matchStatus ||
+      fixture?.status?.short ||
+      fixture?.fixture?.status?.short ||
+      ""
+  ).trim().toUpperCase();
+}
+
+function isFixtureFinalForPolling(fixture = {}) {
+  const short = statusShortFromFixture(fixture);
+  return isFinished(short) || isCancelledOrAbandonedStatus(short);
+}
+
+function hasFixtureStartedForPolling(fixture = {}, nowMs = Date.now()) {
+  const short = statusShortFromFixture(fixture);
+  if (isFinished(short)) return true;
+  if (isCancelledOrAbandonedStatus(short)) return false;
+  if (hasFixtureStarted(short) || isInPlay(short)) return true;
+
+  const koMs = kickoffMsFromFixture(fixture);
+  return Number.isFinite(koMs) && nowMs >= koMs && nowMs <= koMs + TOURNAMENT_POST_MS;
+}
+
 function shouldPollFixtureNow(fixture, nowMs) {
   const koMs = kickoffMsFromFixture(fixture);
   if (!Number.isFinite(koMs)) return false;
-  return nowMs >= koMs - TOURNAMENT_PRE_MS && nowMs <= koMs + TOURNAMENT_POST_MS;
+
+  // "Active" means kickoff has reached.
+  // Pregame is handled separately by getNextPollAtMsFromFixtures.
+  return nowMs >= koMs && nowMs <= koMs + TOURNAMENT_POST_MS;
 }
 
 function filterFixturesForActivePolling(fixtures, nowMs) {
@@ -9254,6 +10593,19 @@ function hasActivePollingFixture(fixtures, nowMs) {
   return getActivePollingFixtureIds(fixtures, nowMs).length > 0;
 }
 
+function getAggregationPollingFixtures(fixtures, nowMs) {
+  return (Array.isArray(fixtures) ? fixtures : []).filter((fixture) =>
+    hasFixtureStartedForPolling(fixture, nowMs)
+  );
+}
+
+function getAggregationPollingFixtureIds(fixtures, nowMs) {
+  return extractFixtureIdsFromWeekDoc({
+    fixtures: getAggregationPollingFixtures(fixtures, nowMs),
+    fixtureIds: [],
+  });
+}
+
 function getFutureKickoffs(fixtures, nowMs) {
   return (Array.isArray(fixtures) ? fixtures : [])
     .map(kickoffMsFromFixture)
@@ -9265,11 +10617,13 @@ function getFutureKickoffs(fixtures, nowMs) {
 function getNextPollAtMsFromFixtures(fixtures, nowMs) {
   const activeFixtureIds = getActivePollingFixtureIds(fixtures, nowMs);
 
+  // Kickoff reached / live-resolving window.
+  // This is the only path that should schedule every 1 minute.
   if (activeFixtureIds.length > 0) {
     return {
       nextKickoffMs: null,
       nextPollAtMs: nowMs + TOURNAMENT_ACTIVE_POLL_MS,
-      reason: "active-fixture-window",
+      reason: "live-or-resolving-1min-check",
       activeFixtureIds,
     };
   }
@@ -9277,19 +10631,41 @@ function getNextPollAtMsFromFixtures(fixtures, nowMs) {
   const futureKickoffs = getFutureKickoffs(fixtures, nowMs);
   const nextKickoffMs = futureKickoffs[0] || null;
 
-  // No kickoff known yet, or API did not give times. Recheck once per hour.
   if (!nextKickoffMs) {
     return {
       nextKickoffMs: null,
       nextPollAtMs: nowMs + TOURNAMENT_UNKNOWN_RECHECK_MS,
       reason: "no-known-kickoff",
+      activeFixtureIds: [],
+    };
+  }
+
+  // Far away: sleep until 20 minutes before kickoff.
+  if (nowMs < nextKickoffMs - TOURNAMENT_PRE_MS) {
+    return {
+      nextKickoffMs,
+      nextPollAtMs: nextKickoffMs - TOURNAMENT_PRE_MS,
+      reason: "sleep-until-pregame-window",
+      activeFixtureIds: [],
+    };
+  }
+
+  // Pregame: 20 minutes before kickoff until kickoff.
+  // This should be every 5 minutes, not every 1 minute.
+  if (nowMs < nextKickoffMs) {
+    return {
+      nextKickoffMs,
+      nextPollAtMs: Math.min(nowMs + TOURNAMENT_PREGAME_POLL_MS, nextKickoffMs),
+      reason: "pregame-5min-check",
+      activeFixtureIds: [],
     };
   }
 
   return {
-    nextKickoffMs,
-    nextPollAtMs: Math.max(nowMs + TOURNAMENT_ACTIVE_POLL_MS, nextKickoffMs - TOURNAMENT_PRE_MS),
-    reason: "next-kickoff-minus-20min",
+    nextKickoffMs: null,
+    nextPollAtMs: nowMs + TOURNAMENT_ACTIVE_POLL_MS,
+    reason: "live-or-resolving-1min-check",
+    activeFixtureIds,
   };
 }
 
@@ -9420,29 +10796,37 @@ exports.pollLiveTournamentWeeks = onSchedule(
         .get(),
 
       // ✅ Hourly safety check for scheduled rooms without queue/missing kickoff.
-      db.collection("rooms")
-        .where("competitionState.weekStatus", "==", "scheduled")
-        .where("engineType", "==", "worldCupDaily")
-        .limit(50)
-        .get(),
+      runSweep
+        ? db.collection("rooms")
+            .where("competitionState.weekStatus", "==", "scheduled")
+            .where("engineType", "==", "worldCupDaily")
+            .limit(50)
+            .get()
+        : Promise.resolve({ docs: [], size: 0 }),
 
-      db.collection("rooms")
-        .where("competitionState.weekStatus", "==", "scheduled")
-        .where("worldCup.engineType", "==", "worldCupDaily")
-        .limit(50)
-        .get(),
+      runSweep
+        ? db.collection("rooms")
+            .where("competitionState.weekStatus", "==", "scheduled")
+            .where("worldCup.engineType", "==", "worldCupDaily")
+            .limit(50)
+            .get()
+        : Promise.resolve({ docs: [], size: 0 }),
 
-      db.collection("rooms")
-        .where("competitionState.weekStatus", "==", "scheduled")
-        .where("competitionState.phaseLabel", "==", "WorldCupGroup")
-        .limit(50)
-        .get(),
+      runSweep
+        ? db.collection("rooms")
+            .where("competitionState.weekStatus", "==", "scheduled")
+            .where("competitionState.phaseLabel", "==", "WorldCupGroup")
+            .limit(50)
+            .get()
+        : Promise.resolve({ docs: [], size: 0 }),
 
-      db.collection("rooms")
-        .where("competitionState.weekStatus", "==", "scheduled")
-        .where("globalPipeline.mode", "==", "global")
-        .limit(50)
-        .get(),
+      runSweep
+        ? db.collection("rooms")
+            .where("competitionState.weekStatus", "==", "scheduled")
+            .where("globalPipeline.mode", "==", "global")
+            .limit(50)
+            .get()
+        : Promise.resolve({ docs: [], size: 0 }),
 
       runSweep
         ? db.collection("rooms")
@@ -9518,7 +10902,7 @@ exports.pollLiveTournamentWeeks = onSchedule(
 
       try {
         const competitionState = getCompetitionState(room);
-        if (String(room?.seasonPhase || "").toUpperCase() === "COMPLETE" || competitionState?.isDone === true) {
+        if (roomLooksCompleteForPolling(room, competitionState)) {
           await deleteTournamentPollTask(roomId);
           continue;
         }
@@ -9539,33 +10923,22 @@ exports.pollLiveTournamentWeeks = onSchedule(
           }
         }
 
-        const stateNextPollAtMs = Number(competitionState?.nextPollAtMs || 0);
         const isQueuedDue = queueDueRoomIds.has(roomId);
-
-        if (
-          isWorldCupDailyRoom &&
-          weekStatus === "scheduled" &&
-          !runSweep &&
-          Number.isFinite(stateNextPollAtMs) &&
-          stateNextPollAtMs > nowMs
-        ) {
-          if (isQueuedDue) {
-            await upsertTournamentPollTask({
-              roomId,
-              phase: "WorldCupGroup",
-              nextPollAtMs: stateNextPollAtMs,
-              reason: "world-cup-sleep-until-next-poll",
-              nowMs,
+        const sleepGuard = runSweep
+          ? { skip: false, reason: "" }
+          : buildDeepPollingSkip(room, competitionState, nowMs, {
+              isQueuedDue,
+              enforceGlobalDue: getGlobalPipelineMode(room) === "global",
             });
-          }
 
-          console.log("[pollLiveTournamentWeeks] world cup room sleeping until nextPollAtMs", {
+        if (sleepGuard.skip) {
+          console.log("[pollLiveTournamentWeeks] room sleeping before deep reads", {
             roomId,
             weekStatus,
-            nextPollAtMs: stateNextPollAtMs,
+            reason: sleepGuard.reason,
+            nextPollAtMs: sleepGuard.nextPollAtMs || null,
             nowMs,
             isQueuedDue,
-            runSweep,
           });
 
           continue;
@@ -9630,14 +11003,127 @@ exports.pollLiveTournamentWeeks = onSchedule(
           const nextCupPollAtMs = Number(competitionState?.nextCupPollAtMs || 0);
 
           if (Number.isFinite(nextCupPollAtMs) && nextCupPollAtMs > nowMs && !runSweep) {
-            await upsertTournamentPollTask({
+            console.log("[pollLiveTournamentWeeks] cup room sleeping until nextCupPollAtMs", {
               roomId,
-              phase,
-              nextPollAtMs: nextCupPollAtMs,
-              reason: "cup-next-poll",
+              nextCupPollAtMs,
               nowMs,
             });
             continue;
+          }
+
+          if (isCupGlobalAutoApplyEnabled(room)) {
+            try {
+              const result = await computeCupCurrentWindowFromGlobalCache({
+                db,
+                roomId,
+                nowMs,
+                writeMode: "global",
+                dryRun: false,
+              });
+
+              const statusValue = String(result?.statusValue || "").toLowerCase();
+              const nextKickoffMsRaw = Number(result?.nextKickoffMs || 0);
+              const resultNextPollAtMsRaw = Number(result?.nextPollAtMs || 0);
+              const nextKickoffMs =
+                Number.isFinite(nextKickoffMsRaw) && nextKickoffMsRaw > nowMs
+                  ? nextKickoffMsRaw
+                  : null;
+              const nextCupPollAtMs =
+                Number.isFinite(resultNextPollAtMsRaw) && resultNextPollAtMsRaw > nowMs
+                  ? resultNextPollAtMsRaw
+                  : statusValue === "live"
+                    ? nowMs + TOURNAMENT_ACTIVE_POLL_MS
+                    : statusValue === "final"
+                      ? nowMs + TOURNAMENT_UNKNOWN_RECHECK_MS
+                      : nextKickoffMs
+                        ? getNextPollAtMsFromFixtures(
+                            [{ fixtureId: "cup-window", kickoffMs: nextKickoffMs }],
+                            nowMs
+                          ).nextPollAtMs
+                        : nowMs + TOURNAMENT_UNKNOWN_RECHECK_MS;
+              const nextWeekStatus =
+                statusValue === "live"
+                  ? "live"
+                  : statusValue === "final"
+                    ? "resolving"
+                    : "scheduled";
+
+              if (
+                statusValue === "final" &&
+                result?.allFinished === true &&
+                isCupGlobalFinalizationEnabled(room)
+              ) {
+                try {
+                  const cupSnap = await db.doc(`rooms/${roomId}/cup/current`).get();
+                  const cup = cupSnap.exists ? (cupSnap.data() || {}) : {};
+                  const finalization = await finalizeCupGlobalCurrentWindow({
+                    db,
+                    roomId,
+                    room,
+                    cup,
+                    applyResult: result,
+                    nowMs,
+                  });
+
+                  console.log("[pollLiveTournamentWeeks] Cup global finalization complete", {
+                    roomId,
+                    windowKey: finalization.windowKey,
+                    historyDocId: finalization.historyDocId,
+                    finalizedUserCount: finalization.finalizedUserCount,
+                    wroteFinalResults: finalization.wroteFinalResults,
+                  });
+                } catch (err) {
+                  console.warn("[pollLiveTournamentWeeks] Cup global finalization failed; falling back to runCupEngine", {
+                    roomId,
+                    code: err?.code,
+                    message: err?.message,
+                  });
+                  throw err;
+                }
+              }
+
+              await setCompetitionState(
+                roomRef,
+                {
+                  weekStatus: nextWeekStatus,
+                  nextPollAtMs: nextCupPollAtMs,
+                  nextCupPollAtMs,
+                  nextKickoffMs,
+                },
+                {
+                  roomData: room,
+                  nowMs,
+                }
+              );
+
+              await upsertTournamentPollTask({
+                roomId,
+                phase,
+                nextPollAtMs: nextCupPollAtMs,
+                reason: "cup-global-auto-apply-next",
+                nowMs,
+              });
+
+              console.log("[pollLiveTournamentWeeks] Cup global auto apply complete", {
+                roomId,
+                statusValue: result?.statusValue || null,
+                weekStatus: nextWeekStatus,
+                fixtureCount: Number(result?.fixtureCount || 0),
+                missingFixtureCount: Number(result?.missingFixtureCount || 0),
+                realWriteApplied: Boolean(result?.realWriteApplied),
+                projectionOnly: true,
+                nextCupPollAtMs,
+                nextKickoffMs,
+              });
+
+              continue;
+            } catch (err) {
+              console.warn("[pollLiveTournamentWeeks] Cup global auto apply failed; falling back to runCupEngine", {
+                roomId,
+                code: err?.code,
+                message: err?.message,
+              });
+            }
           }
 
           console.log("[pollLiveTournamentWeeks] running cup engine", {
@@ -9808,7 +11294,7 @@ exports.pollLiveTournamentWeeks = onSchedule(
           continue;
         }
 
-        const activeFixtureIds = getActivePollingFixtureIds(fixtures, nowMs);
+        const activeFixtureIds = getAggregationPollingFixtureIds(fixtures, nowMs);
         const hasActiveFixture = activeFixtureIds.length > 0;
         const shouldRun = hasActiveFixture;
 
@@ -10070,6 +11556,7 @@ exports.pollLiveTournamentWeeks = onSchedule(
             regularGlobalResult?.nextKickoffMs ||
             0
           );
+          const resultNextPollAtMs = Number(regularGlobalResult?.nextPollAtMs || 0);
           const resultFixtureCoverage = Array.isArray(regularGlobalResult?.fixtureCoverage)
             ? regularGlobalResult.fixtureCoverage
             : [];
@@ -10089,9 +11576,15 @@ exports.pollLiveTournamentWeeks = onSchedule(
               ? resultNextKickoffMs
               : null;
           const scheduledNextKickoffMs = computedNextKickoffMs || sleepInfo.nextKickoffMs || null;
-          const scheduledNextPollAtMs = scheduledNextKickoffMs
-            ? Math.max(nowMs + TOURNAMENT_ACTIVE_POLL_MS, scheduledNextKickoffMs - TOURNAMENT_PRE_MS)
-            : sleepInfo.nextPollAtMs;
+          const scheduledNextPollAtMs =
+            Number.isFinite(resultNextPollAtMs) && resultNextPollAtMs > nowMs
+              ? resultNextPollAtMs
+              : scheduledNextKickoffMs
+                ? getNextPollAtMsFromFixtures(
+                    [{ fixtureId: "regular-week", kickoffMs: scheduledNextKickoffMs }],
+                    nowMs
+                  ).nextPollAtMs
+                : sleepInfo.nextPollAtMs;
 
           if (resultStatus === "final") {
             const finalized = await putRegularFinalWeekToHoldIfNeeded({
@@ -10322,7 +11815,7 @@ exports.scheduleDraft = onCall({ region: "us-west2" }, async (request) => {
 
   const memberUids = await getRoomMemberUids(roomRef, room);
   if (!room.started) {
-    requireDraftManagerCount(memberUids);
+    requireDraftManagerCount(memberUids, room);
   }
 
   const reminderSendAtMs = Number(startAtMs) - 10 * 60 * 1000;

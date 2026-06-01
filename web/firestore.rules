@@ -48,6 +48,12 @@ service cloud.firestore {
         );
     }
 
+    match /sitePresence/{uid} {
+      allow read: if false;
+      allow create, update: if request.auth != null && request.auth.uid == uid;
+      allow delete: if request.auth != null && request.auth.uid == uid;
+    }
+
     /*user changing team name*/
     match /rooms/{roomId}/teamNames/{uid} {
       allow read: if authed(); // ideally also check user is in room

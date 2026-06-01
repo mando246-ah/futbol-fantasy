@@ -9,9 +9,10 @@ const {
 const { loadWorldCupGlobalFixtureCache } = require("./worldCupGlobalCache");
 
 const PRE_MS = 20 * 60 * 1000;
+const PREGAME_POLL_MS = 5 * 60 * 1000;
 const ACTIVE_POLL_MS = 60 * 1000;
 const UNKNOWN_RECHECK_MS = 60 * 60 * 1000;
-const POST_MS = 2 * 60 * 60 * 1000;
+const POST_MS = 3 * 60 * 60 * 1000;
 
 function toPos(pos) {
   const s = String(pos || "").toUpperCase();
@@ -400,22 +401,56 @@ function computeDayWindowStatus({ day, fixtureIds, statusByFixtureId }) {
   return "scheduled";
 }
 
-function computeNextPollFromFixtures(fixtures = [], nowMs) {
-  const kickoffs = fixtures
-    .map(kickoffMsFromFixture)
-    .filter(Number.isFinite)
-    .sort((a, b) => a - b);
+function statusShortForFixture(fixture = {}, statusByFixtureId = {}) {
+  const id = fixtureIdFromFixture(fixture);
+  return String(
+    statusByFixtureId[id] ||
+      fixture?.statusShort ||
+      fixture?.fixtureStatus ||
+      fixture?.matchStatus ||
+      fixture?.status?.short ||
+      fixture?.fixture?.status?.short ||
+      ""
+  ).trim().toUpperCase();
+}
 
-  const activeKickoff = kickoffs.find((ko) => nowMs >= ko - PRE_MS && nowMs <= ko + POST_MS);
-  if (activeKickoff) {
+function computeNextPollFromFixtures(fixtures = [], nowMs, statusByFixtureId = {}) {
+  const rows = (Array.isArray(fixtures) ? fixtures : [])
+    .map((fixture) => {
+      const kickoffMs = kickoffMsFromFixture(fixture);
+      const statusShort = statusShortForFixture(fixture, statusByFixtureId);
+      const final = isFinished(statusShort);
+      return {
+        fixture,
+        fixtureId: fixtureIdFromFixture(fixture),
+        kickoffMs,
+        statusShort,
+        final,
+      };
+    })
+    .filter((row) => Number.isFinite(row.kickoffMs));
+
+  const activeRow = rows.find((row) =>
+    !row.final &&
+    (
+      hasFixtureStarted(row.statusShort) ||
+      (nowMs >= row.kickoffMs && nowMs <= row.kickoffMs + POST_MS)
+    )
+  );
+
+  if (activeRow) {
     return {
-      nextKickoffMs: activeKickoff,
+      nextKickoffMs: activeRow.kickoffMs,
       nextPollAtMs: nowMs + ACTIVE_POLL_MS,
-      reason: "active-world-cup-day-window",
+      reason: "world-cup-live-or-resolving-1min-check",
     };
   }
 
-  const nextKickoffMs = kickoffs.find((ko) => ko > nowMs) || null;
+  const nextKickoffMs = rows
+    .filter((row) => !row.final && row.kickoffMs > nowMs)
+    .map((row) => row.kickoffMs)
+    .sort((a, b) => a - b)[0] || null;
+
   if (!nextKickoffMs) {
     return {
       nextKickoffMs: null,
@@ -424,10 +459,26 @@ function computeNextPollFromFixtures(fixtures = [], nowMs) {
     };
   }
 
+  if (nowMs < nextKickoffMs - PRE_MS) {
+    return {
+      nextKickoffMs,
+      nextPollAtMs: nextKickoffMs - PRE_MS,
+      reason: "world-cup-sleep-until-pregame-window",
+    };
+  }
+
+  if (nowMs < nextKickoffMs) {
+    return {
+      nextKickoffMs,
+      nextPollAtMs: Math.min(nowMs + PREGAME_POLL_MS, nextKickoffMs),
+      reason: "world-cup-pregame-5min-check",
+    };
+  }
+
   return {
     nextKickoffMs,
-    nextPollAtMs: Math.max(nowMs + ACTIVE_POLL_MS, nextKickoffMs - PRE_MS),
-    reason: "world-cup-next-kickoff-minus-20min",
+    nextPollAtMs: nowMs + ACTIVE_POLL_MS,
+    reason: "world-cup-live-or-resolving-1min-check",
   };
 }
 
@@ -831,6 +882,90 @@ async function runWorldCupGroupEngine({
     fixtureIds,
     statusByFixtureId,
   });
+  const pollInfoForCurrentDay = computeNextPollFromFixtures(
+    Array.isArray(currentDay?.fixtures) ? currentDay.fixtures : [],
+    nowMs,
+    statusByFixtureId
+  );
+  const hasStartedOrFinishedFixture = fixtureIds.some((fixtureId) =>
+    hasFixtureStarted(statusByFixtureId[fixtureId] || fixturesById.get(fixtureId)?.statusShort || "")
+  );
+
+  if (statusValue === "scheduled" && !hasStartedOrFinishedFixture) {
+    const fixtureCoverage = fixtureIds.map((fixtureId) => {
+      const fixture = fixturesById.get(fixtureId) || {};
+      const statusShort = statusByFixtureId[fixtureId] || fixture.statusShort || null;
+      return {
+        fixtureId,
+        statusShort,
+        kickoffMs: kickoffMsFromFixture(fixture) || null,
+        usedGlobalStats: false,
+        usedDirectFallback: false,
+        skippedReason: "world-cup-day-pregame-status-only",
+      };
+    });
+
+    await db.doc(`rooms/${roomId}/days/${String(currentDay.dayIndex)}`).set(
+      {
+        status: statusValue,
+        fixtureStatusById: statusByFixtureId,
+        updatedAtMs: nowMs,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    await roomRef.set(
+      {
+        worldCup: {
+          ...(roomData.worldCup || {}),
+          currentDayIndex: Number(currentDay.dayIndex),
+          currentDayLabel: currentDay.label || null,
+          currentDayStartAtMs: currentDay.startAtMs || null,
+          currentDayEndAtMs: currentDay.endAtMs || null,
+        },
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    await writeCompetitionState({
+      roomRef,
+      room: roomData,
+      patch: {
+        phaseLabel: "WorldCupGroup",
+        currentLabel: currentDay.label || null,
+        weekStatus: "scheduled",
+        isDone: false,
+        nextPollAtMs: pollInfoForCurrentDay.nextPollAtMs,
+        nextKickoffMs: pollInfoForCurrentDay.nextKickoffMs,
+      },
+      nowMs,
+      setCompetitionState,
+    });
+
+    return {
+      ok: true,
+      roomId,
+      dayIndex: Number(currentDay.dayIndex),
+      label: currentDay.label || `Day ${currentDay.dayIndex}`,
+      status: "scheduled",
+      weekStatus: "scheduled",
+      skippedReason: pollInfoForCurrentDay.reason,
+      nextPollAtMs: pollInfoForCurrentDay.nextPollAtMs,
+      nextKickoffMs: pollInfoForCurrentDay.nextKickoffMs,
+      fixtureCount: fixtureIds.length,
+      userCount: 0,
+      source: useGlobalCache ? "world-cup-global-live-fixtures" : "world-cup-direct-api",
+      globalCacheAttempted: Boolean(useGlobalCache),
+      globalCacheUsed: Boolean(useGlobalCache),
+      directFallbackUsed: false,
+      globalCacheFullyUsed: false,
+      missingGlobalSummaryFixtureIds,
+      missingGlobalLiveFixtureIds,
+      fixtureCoverage,
+    };
+  }
 
   const {
     statsByFixtureId,
@@ -1052,7 +1187,11 @@ async function runWorldCupGroupEngine({
           nextPollAtMs: nowMs + ACTIVE_POLL_MS,
           reason: "world-cup-day-live",
         }
-      : computeNextPollFromFixtures(Array.isArray(nextDay?.fixtures) ? nextDay.fixtures : [], nowMs);
+      : computeNextPollFromFixtures(
+          Array.isArray(nextDay?.fixtures) ? nextDay.fixtures : [],
+          nowMs,
+          statusValue === "final" ? {} : statusByFixtureId
+        );
 
   await roomRef.set(
     {

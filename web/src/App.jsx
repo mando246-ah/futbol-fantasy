@@ -35,6 +35,7 @@ import {
   getRememberMe,
   logPageView,
   logAnalyticsEvent,
+  writeUserPresence,
 } from "./firebase";
 
 
@@ -418,6 +419,40 @@ function AnalyticsRouteTracker() {
   return null;
 }
 
+function PresenceTracker({ user, displayName, photoURL }) {
+  const location = useLocation();
+
+  useEffect(() => {
+    if (!user?.uid) return undefined;
+
+    let cancelled = false;
+
+    const ping = async () => {
+      if (cancelled) return;
+      try {
+        await writeUserPresence(user, {
+          displayName,
+          photoURL,
+          path: location.pathname || "",
+        });
+      } catch (e) {
+        console.warn("[presence] failed to update", e);
+      }
+    };
+
+    ping();
+
+    const intervalId = window.setInterval(ping, 2 * 60 * 1000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [user?.uid, user?.displayName, user?.photoURL, displayName, photoURL, location.pathname]);
+
+  return null;
+}
+
 // ---------- App ----------
 export default function App() {
   const [user, setUser] = useState(null);
@@ -458,29 +493,10 @@ export default function App() {
     return watchUserProfile(user.uid, setProfile);
   }, [user?.uid]);
 
-  useEffect(() => {
-    const unsub = watchAuth((u) => {
-      setUser(u);
-
-      if (u && !loginLoggedRef.current) {
-        loginLoggedRef.current = true;
-
-        logAnalyticsEvent("login_success", {
-          method: u.providerData?.[0]?.providerId || "unknown",
-        });
-      }
-
-      if (!u) {
-        loginLoggedRef.current = false; // allow it to log next time user logs in
-      }
-    });
-
-    return () => unsub?.();
-  }, []);
-
   return (
     <Router>
       <AnalyticsRouteTracker />
+      <PresenceTracker user={user} displayName={displayName} photoURL={photoURL} />
       <Routes>
         <Route element={<AppLayout user={user} displayName={displayName} photoURL={photoURL} />}>
           <Route path="/" element={<Home user={user} />} />

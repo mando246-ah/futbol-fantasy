@@ -138,6 +138,36 @@ function getRoomMemberCount(room, members) {
   return fromMembersState || fromRoom || 0;
 }
 
+function getRoomPhaseLabelSafe(room = {}) {
+  return String(
+    room?.competitionState?.phaseLabel ||
+      room?.phaseLabel ||
+      room?.worldCup?.phaseLabel ||
+      ""
+  );
+}
+
+function isWorldCupGroupRoom(room = {}) {
+  const phase = getRoomPhaseLabelSafe(room);
+  return (
+    room?.engineType === "worldCupDaily" ||
+    room?.worldCup?.engineType === "worldCupDaily" ||
+    room?.worldCupPhase === "group" ||
+    room?.worldCupPhase === "WorldCupGroup" ||
+    room?.worldCup?.phase === "group" ||
+    phase === "WorldCupGroup"
+  );
+}
+
+function isCupRoom(room = {}) {
+  const phase = getRoomPhaseLabelSafe(room);
+  return phase === "Cup" && !isWorldCupGroupRoom(room);
+}
+
+function isRegularHeadToHeadRoom(room = {}) {
+  return !isCupRoom(room) && !isWorldCupGroupRoom(room);
+}
+
 function getDraftTurnSeconds(room) {
   const n = Number(room?.turnSeconds);
   return Number.isFinite(n) && n > 0 ? n : TURN_SECONDS;
@@ -352,8 +382,10 @@ export default function DraftWithPresence() {
     [room?.members, members]
   );
   const hasEnoughManagers = managerCount >= 2;
+  const requiresEvenManagers = isRegularHeadToHeadRoom(room);
   const hasEvenManagers = managerCount % 2 === 0;
-  const canStartByManagerCount = hasEnoughManagers && hasEvenManagers;
+  const canStartByManagerCount =
+    hasEnoughManagers && (!requiresEvenManagers || hasEvenManagers);
   const draftTurnSeconds = getDraftTurnSeconds(room);
   const estimatedDraftDurationLabel = useMemo(
     () => formatDraftDuration(getEstimatedDraftDurationSeconds(room, members)),
@@ -1112,8 +1144,8 @@ useEffect(() => {
   const hostControlsHelpText =
     managerCount < 2
       ? "Invite at least 1 more manager before starting."
-      : managerCount % 2 !== 0
-        ? "Head-to-head rooms need an even number of managers."
+      : requiresEvenManagers && managerCount % 2 !== 0
+        ? "Regular Season head-to-head rooms need an even number of managers."
         : !poolReady
           ? "Select + lock a competition and load players first."
           : "";
@@ -1124,7 +1156,7 @@ useEffect(() => {
       return false;
     }
 
-    if (managerCount % 2 !== 0) {
+    if (requiresEvenManagers && managerCount % 2 !== 0) {
       alert("Regular Season head-to-head rooms need an even number of managers.");
       return false;
     }
@@ -1415,7 +1447,7 @@ useEffect(() => {
                     </p>
                   )}
                   <p className="mt-4 text-xs opacity-90">
-                    Draft plan: Pick any player.
+                    Draft plan: Pick any player but meet the position requirements.
                   </p>
                 </CardContent>
               </Card>

@@ -120,6 +120,21 @@ async function buildWorldCupGroupSeasonTargetForRoom({
     return null;
   }
 
+  const weekStatus = String(room?.competitionState?.weekStatus || "").trim().toLowerCase();
+  const nextPollAtMs = toNumber(room?.competitionState?.nextPollAtMs, NaN);
+  if (
+    (weekStatus === "scheduled" || weekStatus === "idle") &&
+    Number.isFinite(nextPollAtMs) &&
+    nextPollAtMs > nowMs + 30 * 1000
+  ) {
+    return {
+      skipped: true,
+      reason: "world-cup-room-sleeping-until-next-poll",
+      sleeping: true,
+      nextPollAtMs,
+    };
+  }
+
   const currentDayIndex = room?.worldCup?.currentDayIndex;
   const preferredDay = await loadDayByIndex({ db, roomId, dayIndex: currentDayIndex });
   const preferredFixtureIds = preferredDay

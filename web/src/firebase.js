@@ -335,6 +335,23 @@ export function watchUserProfile(uid, cb) {
 );
 }
 
+export async function writeUserPresence(user, { displayName = "", photoURL = "", path = "" } = {}) {
+  if (!user?.uid) return;
+
+  await setDoc(
+    doc(db, "sitePresence", user.uid),
+    {
+      uid: user.uid,
+      displayName: displayName || user.displayName || "",
+      photoURL: photoURL || user.photoURL || "",
+      lastSeenAtMs: Date.now(),
+      lastSeenAt: serverTimestamp(),
+      path: path || window.location.pathname || "",
+    },
+    { merge: true }
+  );
+}
+
 /* =========================
    Room helpers
    ========================= */
@@ -537,6 +554,36 @@ function getDraftManagerCount(room = {}) {
   return new Set(memberUids).size || members.length;
 }
 
+function getRoomPhaseLabelSafe(room = {}) {
+  return String(
+    room?.competitionState?.phaseLabel ||
+      room?.phaseLabel ||
+      room?.worldCup?.phaseLabel ||
+      ""
+  );
+}
+
+function isWorldCupGroupRoom(room = {}) {
+  const phase = getRoomPhaseLabelSafe(room);
+  return (
+    room?.engineType === "worldCupDaily" ||
+    room?.worldCup?.engineType === "worldCupDaily" ||
+    room?.worldCupPhase === "group" ||
+    room?.worldCupPhase === "WorldCupGroup" ||
+    room?.worldCup?.phase === "group" ||
+    phase === "WorldCupGroup"
+  );
+}
+
+function isCupRoom(room = {}) {
+  const phase = getRoomPhaseLabelSafe(room);
+  return phase === "Cup" && !isWorldCupGroupRoom(room);
+}
+
+function roomRequiresEvenManagers(room = {}) {
+  return !isCupRoom(room) && !isWorldCupGroupRoom(room);
+}
+
 function assertDraftManagerCount(room = {}) {
   const managerCount = getDraftManagerCount(room);
 
@@ -544,7 +591,7 @@ function assertDraftManagerCount(room = {}) {
     throw new Error("Need at least 2 managers to start a draft.");
   }
 
-  if (managerCount % 2 !== 0) {
+  if (roomRequiresEvenManagers(room) && managerCount % 2 !== 0) {
     throw new Error("Regular Season head-to-head rooms need an even number of managers.");
   }
 
