@@ -40,6 +40,11 @@ import "./Draft.css";
 import useUserProfiles from "../lib/useUserProfiles";
 import { Avatar, AvatarImage, AvatarFallback } from "../components/ui/avatar";
 import FlagIcon from "@/components/FlagIcon";
+import {
+  friendlyErrorMessage,
+  reportClientError,
+} from "../utils/errorReporter";
+import { devError, devWarn } from "../utils/devLogger";
 
 
 // ----- Config -----
@@ -322,6 +327,10 @@ function isWorldCupSelection(selection) {
   return /\bworld cup\b/.test(name) && !/\bclub\b/.test(name);
 }
 
+function getRoomWorldCupPhase(room = {}) {
+  return String(room?.worldCupPhase || room?.worldCup?.phase || "").trim().toLowerCase();
+}
+
 
 export default function DraftWithPresence() {
   // Auth
@@ -511,16 +520,25 @@ useEffect(() => {
 
   //Live Listener
   const [poolPlayers, setPoolPlayers] = useState([]);
+  const [poolPlayersLoaded, setPoolPlayersLoaded] = useState(false);
 
   useEffect(() => {
     if (!roomId) {
       setPoolPlayers([]);
+      setPoolPlayersLoaded(false);
       return;
     }
+    setPoolPlayers([]);
+    setPoolPlayersLoaded(false);
     const ref = collection(db, "rooms", roomId, "players");
-    return onSnapshot(ref, (snap) => {
-      setPoolPlayers(snap.docs.map(d => ({ id: d.id, ...d.data() })));
-    });
+    return onSnapshot(
+      ref,
+      (snap) => {
+        setPoolPlayers(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+        setPoolPlayersLoaded(true);
+      },
+      () => setPoolPlayersLoaded(true)
+    );
   }, [roomId]);
 
 
@@ -539,6 +557,7 @@ useEffect(() => {
     if (!roomId || !user?.uid) return;
     setLastRoomId(roomId, user.uid);
     setJoinAttempted(false);
+    setPicks([]);
 
     const unsubRoom = watchRoom(roomId, (data) => {
       setRoom(data);
@@ -593,7 +612,14 @@ useEffect(() => {
     // Picks stream
     const unsubPicks = onSnapshot(
       query(collection(db, "rooms", roomId, "picks"), orderBy("turn", "asc")),
-      (snap) => setPicks(snap.docs.map((d) => d.data()))
+      (snap) =>
+        setPicks(
+          snap.docs.map((d) => ({
+            id: d.id,
+            pickDocId: d.id,
+            ...d.data(),
+          }))
+        )
     );
 
     return () => {
@@ -640,9 +666,10 @@ useEffect(() => {
 
     setCreatingRoom(true);
     setSeedingPlayers(false);
+    let key = "";
 
     try {
-      const key = randomKey();
+      key = randomKey();
       const ref = doc(db, "rooms", key);
       if ((await getDoc(ref)).exists()) return alert("Key collision, try again");
 
@@ -707,8 +734,19 @@ useEffect(() => {
     });
 
     } catch (e) {
-      console.error(e);
-      alert("Failed to create room. Check console for details.");
+      const userMessage = friendlyErrorMessage(
+        e,
+        "Could not create the room. Please refresh and try again."
+      );
+      await reportClientError({
+        roomId: key,
+        area: "Draft",
+        action: "createRoom",
+        error: e,
+        userMessage,
+      });
+      devError("[Draft] create room failed", e);
+      alert(userMessage);
     } finally {
       setCreatingRoom(false);
     }
@@ -765,7 +803,19 @@ useEffect(() => {
         join_method: "code",
       });
     } catch (e) {
-      alert(e?.message || "Could not join room.");
+      const userMessage = friendlyErrorMessage(
+        e,
+        "Could not join that room. Please check the code and try again."
+      );
+      await reportClientError({
+        roomId: key,
+        area: "Draft",
+        action: "joinRoom",
+        error: e,
+        userMessage,
+      });
+      devError("[Draft] join room failed", e);
+      alert(userMessage);
     }
   }
 
@@ -805,7 +855,23 @@ useEffect(() => {
     }
     if (!startLocalISO) return alert("Pick a date/time");
     const whenMillis = new Date(startLocalISO).getTime();
-    await fnScheduleDraft({ roomId, startAtMs: whenMillis });
+    try {
+      await fnScheduleDraft({ roomId, startAtMs: whenMillis });
+    } catch (e) {
+      const userMessage = friendlyErrorMessage(
+        e,
+        "Could not schedule the draft. Please refresh and try again."
+      );
+      await reportClientError({
+        roomId,
+        area: "Draft",
+        action: "scheduleDraft",
+        error: e,
+        userMessage,
+        extra: { startAtMs: whenMillis },
+      });
+      alert(userMessage);
+    }
   }
 
   //Display Market Schedule 
@@ -837,7 +903,19 @@ useEffect(() => {
         start_method: "manual",
       });
     } catch (e) {
-      alert(e?.message || "Failed to start");
+      const userMessage = friendlyErrorMessage(
+        e,
+        "Could not start the draft. Please refresh and try again."
+      );
+      await reportClientError({
+        roomId,
+        area: "Draft",
+        action: "startDraftNow",
+        error: e,
+        userMessage,
+        extra: { managerCount },
+      });
+      alert(userMessage);
     }
   }
 
@@ -1070,7 +1148,22 @@ useEffect(() => {
         nationality: player.nationality ?? "",
       });
     } catch (e) {
-      alert(e?.message || "Pick failed");
+      const userMessage = friendlyErrorMessage(
+        e,
+        "Could not make that pick. Please refresh and try again."
+      );
+      await reportClientError({
+        roomId,
+        area: "Draft",
+        action: "makePick",
+        error: e,
+        userMessage,
+        extra: {
+          playerId: String(player?.id || ""),
+          position: normalizeDraftPos(player?.position),
+        },
+      });
+      alert(userMessage);
     }
   }
 
@@ -1125,8 +1218,25 @@ useEffect(() => {
       } catch (e) {
         if (String(e?.message || "").includes("Deadline not reached")) {
           triedAutoRef.current = false;
+          devWarn("[Draft] auto-pick deadline not reached");
+          return;
         }
-        console.warn("Auto-pick failed:", e?.message || e);
+        const userMessage = friendlyErrorMessage(
+          e,
+          "Auto-pick could not complete. The host can refresh and try again."
+        );
+        await reportClientError({
+          roomId,
+          area: "Draft",
+          action: "autoPick",
+          error: e,
+          userMessage,
+          extra: {
+            candidateCount: candidates.length,
+            turnIndex: Number(room?.turnIndex || 0),
+          },
+        });
+        devWarn("[Draft] auto-pick failed", e);
       }
     })();
   }, [room?.started, room?.turnDeadlineAt, isDraftComplete, user?.uid, room?.hostUid, roomId, autoPickPool]);
@@ -1361,17 +1471,15 @@ useEffect(() => {
                     )}
                   </div>
 
-                  <h3 className="font-semibold mt-4 mb-2">📋 Draft Order (Round 1)</h3>
-                  <ol className="text-sm space-y-1 list-decimal list-inside">
-                    {roundOrder(room.members || [], 0).map((m, idx) => (
-                      <li key={m.uid} className="rounded border border-line/60 bg-pitch/70 px-2 py-1">
-                        #{idx + 1} — {displayNameForMember(m)}
-                      </li>
-                    ))}
-                  </ol>
-                  <p className="text-xs opacity-90 mt-2">
-                    Order locks when the host starts.
-                  </p>
+                  <div className="mt-4 rounded border border-line/60 bg-pitch/70 px-3 py-3">
+                    <h3 className="font-semibold mb-1">🎲 Draft Order</h3>
+                    <p className="text-sm opacity-90">
+                      Draft order will be randomly generated when the draft starts. Managers will pick in a "snake" order: 1→10, then 10→1, then 1→10, etc.
+                    </p>
+                    <p className="text-xs opacity-75 mt-1">
+                      Once the draft begins, the official order will appear and stay locked.
+                    </p>
+                  </div>
                 </CardContent>
               </Card>
 
@@ -1679,6 +1787,8 @@ useEffect(() => {
                 user={user}
                 isHost={user?.uid === room?.hostUid}
                 players={poolPlayers}
+                playersLoaded={poolPlayersLoaded}
+                picks={picks}
               />
             </div>
           )}
@@ -1848,12 +1958,18 @@ function LeagueSelector({ roomId, room, isHost, poolCount, setSeedingPlayers }) 
   const [searching, setSearching] = useState(false);
   const [locking, setLocking] = useState(false);
   const [countdown, setCountdown] = useState(0);
+  const [worldCupPhaseChoice, setWorldCupPhaseChoice] = useState("");
+  const [lockingWorldCupPhase, setLockingWorldCupPhase] = useState(false);
+  const [worldCupPhaseCountdown, setWorldCupPhaseCountdown] = useState(0);
   const [error, setError] = useState("");
 
   const locked =
     !!room?.competitionLocked ||
+    room?.status === "waiting_world_cup_phase" ||
     room?.status === "seeding_players" ||
     room?.status === "ready_to_draft" ||
+    !!getRoomWorldCupPhase(room) ||
+    !!room?.engineType ||
     !!room?.started;
 
   // Show what's already locked in (for everyone)
@@ -1871,6 +1987,13 @@ function LeagueSelector({ roomId, room, isHost, poolCount, setSeedingPlayers }) 
     });
     setSeason(String(c.season || ""));
   }, [room?.competition?.league, room?.competition?.season, room?.competitionMeta?.name]);
+
+  useEffect(() => {
+    const phase = getRoomWorldCupPhase(room);
+    if (phase === "group" || phase === "knockout") {
+      setWorldCupPhaseChoice(phase);
+    }
+  }, [room?.worldCupPhase, room?.worldCup?.phase]);
 
   // Debounced API search
   useEffect(() => {
@@ -1910,6 +2033,17 @@ function LeagueSelector({ roomId, room, isHost, poolCount, setSeedingPlayers }) 
     return () => clearTimeout(t);
   }, [locking, countdown]);
 
+  useEffect(() => {
+    if (!lockingWorldCupPhase) return;
+    if (worldCupPhaseCountdown <= 0) return;
+
+    const t = setTimeout(
+      () => setWorldCupPhaseCountdown((value) => value - 1),
+      1000
+    );
+    return () => clearTimeout(t);
+  }, [lockingWorldCupPhase, worldCupPhaseCountdown]);
+
   async function doLockAndSeed() {
     if (!isHost || locked) return;
     if (!selected?.leagueId) return;
@@ -1923,10 +2057,38 @@ function LeagueSelector({ roomId, room, isHost, poolCount, setSeedingPlayers }) 
       ? DRAFT_SIZE_CUP
       : draftSizeForCompetitionType(selected.type);
     try {
-      setSeedingPlayers(true);
       setError("");
 
-      // Mark as locked + seeding
+      if (isWorldCup) {
+        setSeedingPlayers(false);
+        await updateDoc(doc(db, "rooms", roomId), {
+          competition: {
+            provider: "api-football",
+            league: leagueIdNum,
+            season: seasonNum,
+            timezone,
+          },
+          competitionMeta: {
+            name: selected.name,
+            country: selected.country,
+            type: selected.type,
+            logo: selected.logo,
+          },
+          competitionLocked: true,
+          status: "waiting_world_cup_phase",
+          seasonKey: `worldcup-${seasonNum}`,
+          competitionKey: "worldcup",
+          competitionType: "worldCup",
+          totalRounds: totalRoundsForComp,
+          playerCount: 0,
+          worldCupPhaseLocked: false,
+          updatedAt: serverTimestamp(),
+        });
+        setWorldCupPhaseChoice("");
+        return;
+      }
+
+      setSeedingPlayers(true);
       await updateDoc(doc(db, "rooms", roomId), {
         competition: { provider: "api-football", league: leagueIdNum, season: seasonNum, timezone },
         competitionMeta: {
@@ -1939,21 +2101,11 @@ function LeagueSelector({ roomId, room, isHost, poolCount, setSeedingPlayers }) 
         status: "seeding_players",
         totalRounds: totalRoundsForComp,
         playerCount: 0,
-        ...(isWorldCup
-          ? {
-              seasonKey: `worldcup-${seasonNum}`,
-              competitionKey: "worldcup",
-              competitionType: "worldCup",
-            }
-          : {}),
         updatedAt: serverTimestamp(),
       });
 
       // Seed players (league paging mode)
-      const seedFn = httpsCallable(
-        functions,
-        isWorldCup ? "seedWorldCupRoom" : "seedPlayersFromCompetition"
-      );
+      const seedFn = httpsCallable(functions, "seedPlayersFromCompetition");
       const seedPayload = {
         roomId,
         league: leagueIdNum,
@@ -1962,15 +2114,10 @@ function LeagueSelector({ roomId, room, isHost, poolCount, setSeedingPlayers }) 
         competitionName: selected.name,
         competitionCountry: selected.country,
         competitionLogo: selected.logo,
-        competitionType: isWorldCup ? "worldCup" : selected.type,
+        competitionType: selected.type,
         maxPages: 250, // adjust higher if you want a bigger pool
         maxPlayers: 1500,
       };
-
-      if (isWorldCup) {
-        seedPayload.competitionKey = "worldcup";
-        seedPayload.seasonKey = `worldcup-${seasonNum}`;
-      }
 
       const res = await seedFn(seedPayload);
       alert(`Successfully loaded ${res.data?.written ?? 0} players.`);
@@ -1985,6 +2132,11 @@ function LeagueSelector({ roomId, room, isHost, poolCount, setSeedingPlayers }) 
       });
     } catch (e) {
       console.error(e);
+      if (isWorldCup) {
+        setError(e?.message || "Failed to lock the World Cup competition.");
+        return;
+      }
+
       const playersSnap = await getDocs(collection(db, "rooms", roomId, "players")).catch(() => null);
       const loadedCount = playersSnap?.size || 0;
 
@@ -2009,10 +2161,107 @@ function LeagueSelector({ roomId, room, isHost, poolCount, setSeedingPlayers }) 
     }
   }
 
+  async function doLockWorldCupPhase() {
+    if (!isHost) return;
+    if (room?.status !== "waiting_world_cup_phase") return;
+    if (getRoomWorldCupPhase(room) || room?.engineType) return;
+    if (!["group", "knockout"].includes(worldCupPhaseChoice)) {
+      setError("Choose Group Stage or Knockout Stage first.");
+      return;
+    }
+
+    const competition = room?.competition || {};
+    const competitionMeta = room?.competitionMeta || {};
+    const leagueIdNum = Number(competition.league);
+    const seasonNum = Number(competition.season);
+    const timezone = String(competition.timezone || "America/Los_Angeles");
+
+    if (!Number.isFinite(leagueIdNum) || !Number.isFinite(seasonNum)) {
+      setError("World Cup competition metadata is incomplete.");
+      return;
+    }
+
+    try {
+      setSeedingPlayers(true);
+      setError("");
+
+      await updateDoc(doc(db, "rooms", roomId), {
+        status: "seeding_players",
+        updatedAt: serverTimestamp(),
+      });
+
+      const seedFn = httpsCallable(functions, "seedWorldCupRoom");
+      const res = await seedFn({
+        roomId,
+        league: leagueIdNum,
+        season: seasonNum,
+        timezone,
+        competitionName: competitionMeta.name || "World Cup",
+        competitionCountry: competitionMeta.country || "",
+        competitionLogo: competitionMeta.logo || "",
+        competitionType: "worldCup",
+        competitionKey: "worldcup",
+        seasonKey: `worldcup-${seasonNum}`,
+        requestedWorldCupPhase: worldCupPhaseChoice,
+        maxPages: 250,
+        worldCupMaxPlayers: 5000,
+      });
+
+      const written = Number(res.data?.written || 0);
+      await updateDoc(doc(db, "rooms", roomId), {
+        competitionLocked: true,
+        worldCupPhaseLocked: true,
+        status: "ready_to_draft",
+        playerCount: written,
+        updatedAt: serverTimestamp(),
+      });
+
+      alert(`Successfully loaded ${written} players.`);
+    } catch (e) {
+      console.error(e);
+      const [playersSnap, freshRoomSnap] = await Promise.all([
+        getDocs(collection(db, "rooms", roomId, "players")).catch(() => null),
+        getDoc(doc(db, "rooms", roomId)).catch(() => null),
+      ]);
+      const loadedCount = playersSnap?.size || 0;
+      const freshRoom = freshRoomSnap?.exists?.() ? freshRoomSnap.data() || {} : {};
+
+      if (loadedCount > 0 && getRoomWorldCupPhase(freshRoom)) {
+        await updateDoc(doc(db, "rooms", roomId), {
+          competitionLocked: true,
+          worldCupPhaseLocked: true,
+          status: "ready_to_draft",
+          playerCount: loadedCount,
+          updatedAt: serverTimestamp(),
+        }).catch(() => {});
+        setError("Players loaded, but the backend returned a non-critical error. Room is ready to draft.");
+      } else {
+        await updateDoc(doc(db, "rooms", roomId), {
+          competitionLocked: true,
+          status: "waiting_world_cup_phase",
+          updatedAt: serverTimestamp(),
+        }).catch(() => {});
+        setError(e?.message || "Failed to seed the World Cup room.");
+      }
+    } finally {
+      setSeedingPlayers(false);
+    }
+  }
+
   function startLockCountdown() {
     if (!selected?.leagueId) return;
     setLocking(true);
     setCountdown(3);
+    setError("");
+  }
+
+  function startWorldCupPhaseLockCountdown() {
+    if (!["group", "knockout"].includes(worldCupPhaseChoice)) {
+      setError("Choose Group Stage or Knockout Stage first.");
+      return;
+    }
+    setLockingWorldCupPhase(true);
+    setWorldCupPhaseCountdown(3);
     setError("");
   }
 
@@ -2026,8 +2275,29 @@ function LeagueSelector({ roomId, room, isHost, poolCount, setSeedingPlayers }) 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [locking, countdown]);
 
+  useEffect(() => {
+    if (!lockingWorldCupPhase) return;
+    if (worldCupPhaseCountdown > 0) return;
+
+    setLockingWorldCupPhase(false);
+    doLockWorldCupPhase();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lockingWorldCupPhase, worldCupPhaseCountdown]);
+
+  const lockedWorldCupPhase = getRoomWorldCupPhase(room);
+  const isLockedWorldCup =
+    isWorldCupSelection(selected) ||
+    isWorldCupSelection({ name: room?.competitionMeta?.name });
+  const needsWorldCupPhaseChoice =
+    isLockedWorldCup &&
+    room?.status === "waiting_world_cup_phase" &&
+    !lockedWorldCupPhase &&
+    !room?.engineType;
+
   const statusLabel =
-    room?.status === "seeding_players"
+    room?.status === "waiting_world_cup_phase"
+      ? "Waiting for World Cup format"
+      : room?.status === "seeding_players"
       ? "Loading players…"
       : room?.status === "ready_to_draft"
       ? "Ready to draft ✅"
@@ -2044,6 +2314,11 @@ function LeagueSelector({ roomId, room, isHost, poolCount, setSeedingPlayers }) 
         <div className="text-xs text-gray-400 mt-2">
           Status: <b>{statusLabel}</b> • Players loaded: <b>{poolCount}</b>
         </div>
+        {needsWorldCupPhaseChoice ? (
+          <div className="mt-3 rounded border border-amber-400/40 bg-amber-400/10 px-3 py-2 text-sm text-amber-100">
+            Host is choosing World Cup format.
+          </div>
+        ) : null}
       </div>
     );
   }
@@ -2064,6 +2339,56 @@ function LeagueSelector({ roomId, room, isHost, poolCount, setSeedingPlayers }) 
           <div className="text-xs text-gray-400 mt-2">
             Status: <b>{statusLabel}</b> • Players Loaded: <b>{poolCount}</b> • Player Count: <b>{room?.playerCount ?? 0}</b>
           </div>
+          {needsWorldCupPhaseChoice ? (
+            <div className="mt-4 rounded-xl border border-sky-400/35 bg-sky-950/45 p-4">
+              <div className="text-base font-black text-white">Choose World Cup Format</div>
+              <p className="mt-1 text-sm text-sky-100/80">
+                This decides what part of the World Cup you want to compete in. Group Stage June 11th- June 27Th or Knock Out Stage June 28th - July 19th. Create a new room to play both!
+              </p>
+
+              <label className="mt-4 block text-xs font-bold uppercase tracking-wide text-sky-200">
+                Tournament format
+              </label>
+              <select
+                className="mt-2 w-full rounded-lg border border-sky-300/30 bg-slate-950 px-3 py-3 text-sm font-bold text-white"
+                value={worldCupPhaseChoice}
+                onChange={(event) => setWorldCupPhaseChoice(event.target.value)}
+                disabled={lockingWorldCupPhase}
+              >
+                <option value="">Select World Cup format</option>
+                <option value="group">Group Stage Draft &mdash; June 11 to June 27</option>
+                <option value="knockout">Knockout Stage Draft &mdash; June 28 to July 19</option>
+              </select>
+
+              <div className="mt-3 flex flex-wrap gap-2">
+                <button
+                  className="rounded-lg bg-sky-500 px-4 py-2 text-sm font-black text-slate-950 hover:bg-sky-400 disabled:cursor-not-allowed disabled:opacity-50"
+                  onClick={startWorldCupPhaseLockCountdown}
+                  disabled={!worldCupPhaseChoice || lockingWorldCupPhase}
+                >
+                  Lock World Cup Format
+                </button>
+                {lockingWorldCupPhase ? (
+                  <button
+                    className="rounded-lg bg-gray-700 px-4 py-2 text-sm font-bold text-white hover:bg-gray-600"
+                    onClick={() => {
+                      setLockingWorldCupPhase(false);
+                      setWorldCupPhaseCountdown(0);
+                    }}
+                  >
+                    Cancel
+                  </button>
+                ) : null}
+              </div>
+
+              {lockingWorldCupPhase ? (
+                <div className="mt-3 text-sm font-bold text-amber-300">
+                  Locking World Cup format in {worldCupPhaseCountdown}...
+                </div>
+              ) : null}
+              {error ? <div className="mt-3 text-xs text-red-300">{error}</div> : null}
+            </div>
+          ) : null}
         </>
       ) : (
         <>

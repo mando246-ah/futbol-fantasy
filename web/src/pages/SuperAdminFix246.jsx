@@ -1,7 +1,20 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { httpsCallable } from "firebase/functions";
-import { functions } from "../firebase";
+import {
+  collection,
+  doc,
+  getDocs,
+  limit,
+  onSnapshot,
+  orderBy,
+  query,
+  serverTimestamp,
+  updateDoc,
+} from "firebase/firestore";
+import { auth, db, functions } from "../firebase";
 import "./SuperAdminFix246.css";
+
+const OWNER_UIDS = new Set(["WspA06q2KlQr7KUq2PP58FMyIJk2"]);
 
 function formatWhen(ms) {
   const n = Number(ms);
@@ -494,7 +507,380 @@ function renderActionResult(resultWrapper) {
   );
 }
 
+function OwnerErrorCenter() {
+  const [errors, setErrors] = useState([]);
+  const [loadError, setLoadError] = useState("");
+  const [loadingErrors, setLoadingErrors] = useState(false);
+  const [liveWatchOn, setLiveWatchOn] = useState(false);
+  const [busyId, setBusyId] = useState("");
+  const [statusFilter, setStatusFilter] = useState("new");
+  const [sourceFilter, setSourceFilter] = useState("all");
+  const [severityFilter, setSeverityFilter] = useState("all");
+  const [areaFilter, setAreaFilter] = useState("all");
+  const [roomSearch, setRoomSearch] = useState("");
+  const liveUnsubscribeRef = useRef(null);
+
+  useEffect(() => {
+    return () => {
+      liveUnsubscribeRef.current?.();
+      liveUnsubscribeRef.current = null;
+    };
+  }, []);
+
+  function buildErrorsQuery() {
+    return query(
+      collection(db, "adminErrors"),
+      orderBy("createdAtMs", "desc"),
+      limit(50)
+    );
+  }
+
+  function rowsFromSnapshot(snap) {
+    return snap.docs.map((errorDoc) => ({
+      id: errorDoc.id,
+      ...(errorDoc.data() || {}),
+    }));
+  }
+
+  async function loadErrors() {
+    setLoadingErrors(true);
+    setLoadError("");
+    try {
+      const snap = await getDocs(buildErrorsQuery());
+      setErrors(rowsFromSnapshot(snap));
+    } catch (error) {
+      setLoadError(error?.message || "Could not load Admin Error Center.");
+    } finally {
+      setLoadingErrors(false);
+    }
+  }
+
+  function stopLiveWatch() {
+    liveUnsubscribeRef.current?.();
+    liveUnsubscribeRef.current = null;
+    setLiveWatchOn(false);
+  }
+
+  function startLiveWatch() {
+    if (liveUnsubscribeRef.current) return;
+
+    setLoadError("");
+    setLiveWatchOn(true);
+    liveUnsubscribeRef.current = onSnapshot(
+      buildErrorsQuery(),
+      (snap) => {
+        setLoadError("");
+        setErrors(rowsFromSnapshot(snap));
+      },
+      (error) => {
+        liveUnsubscribeRef.current = null;
+        setLiveWatchOn(false);
+        setLoadError(error?.message || "Could not watch Admin Error Center.");
+      }
+    );
+  }
+
+  const areas = useMemo(
+    () =>
+      Array.from(
+        new Set(errors.map((item) => String(item.area || "").trim()).filter(Boolean))
+      ).sort((a, b) => a.localeCompare(b)),
+    [errors]
+  );
+
+  const visibleErrors = useMemo(() => {
+    const search = roomSearch.trim().toLowerCase();
+    return errors
+      .filter((item) => statusFilter === "all" || item.status === statusFilter)
+      .filter((item) => sourceFilter === "all" || item.source === sourceFilter)
+      .filter(
+        (item) =>
+          severityFilter === "all" || item.severity === severityFilter
+      )
+      .filter((item) => areaFilter === "all" || item.area === areaFilter)
+      .filter(
+        (item) =>
+          !search || String(item.roomId || "").toLowerCase().includes(search)
+      )
+      .sort((a, b) => {
+        const aNew = a.status === "new" ? 1 : 0;
+        const bNew = b.status === "new" ? 1 : 0;
+        return bNew - aNew || Number(b.createdAtMs || 0) - Number(a.createdAtMs || 0);
+      });
+  }, [
+    areaFilter,
+    errors,
+    roomSearch,
+    severityFilter,
+    sourceFilter,
+    statusFilter,
+  ]);
+
+  async function markError(errorId, status) {
+    const uid = auth.currentUser?.uid;
+    if (!uid || !errorId) return;
+
+    const nowMs = Date.now();
+    const statusFields =
+      status === "resolved"
+        ? {
+            resolvedAt: serverTimestamp(),
+            resolvedAtMs: nowMs,
+            resolvedByUid: uid,
+          }
+        : {
+            ignoredAt: serverTimestamp(),
+            ignoredAtMs: nowMs,
+            ignoredByUid: uid,
+          };
+    const localStatusFields =
+      status === "resolved"
+        ? {
+            resolvedAtMs: nowMs,
+            resolvedByUid: uid,
+          }
+        : {
+            ignoredAtMs: nowMs,
+            ignoredByUid: uid,
+          };
+
+    setBusyId(errorId);
+    setLoadError("");
+    try {
+      await updateDoc(doc(db, "adminErrors", errorId), {
+        status,
+        ...statusFields,
+      });
+      setErrors((current) =>
+        current.map((item) =>
+          item.id === errorId
+            ? { ...item, status, ...localStatusFields }
+            : item
+        )
+      );
+    } catch (error) {
+      setLoadError(error?.message || `Could not mark error ${status}.`);
+    } finally {
+      setBusyId("");
+    }
+  }
+
+  async function copyText(value) {
+    try {
+      await navigator.clipboard.writeText(String(value || ""));
+    } catch (error) {
+      setLoadError(error?.message || "Could not copy error details.");
+    }
+  }
+
+  function errorDetails(item) {
+    return JSON.stringify(
+      {
+        id: item.id,
+        severity: item.severity,
+        source: item.source,
+        area: item.area,
+        action: item.action,
+        roomId: item.roomId,
+        uid: item.uid,
+        email: item.email,
+        displayName: item.displayName,
+        message: item.message,
+        code: item.code,
+        stack: item.stack,
+        userMessage: item.userMessage,
+        url: item.url,
+        path: item.path,
+        userAgent: item.userAgent,
+        extra: item.extra,
+        status: item.status,
+        createdAtMs: item.createdAtMs,
+      },
+      null,
+      2
+    );
+  }
+
+  return (
+    <section className="ownerErrorCenter" aria-labelledby="ownerErrorCenterTitle">
+      <header className="ownerErrorCenterHeader">
+        <div>
+          <p className="ownerErrorCenterEyebrow">Production diagnostics</p>
+          <h2 id="ownerErrorCenterTitle">Error Center</h2>
+          <p>Latest 50 sanitized client reports. New errors are shown first.</p>
+        </div>
+        <div className="ownerErrorCenterControls">
+          <span
+            className={`ownerErrorMode ${
+              liveWatchOn ? "ownerErrorMode--live" : ""
+            }`}
+          >
+            {liveWatchOn ? "Live watch on" : "Manual mode"}
+          </span>
+          <span className="ownerErrorCenterCount">{visibleErrors.length} shown</span>
+          <button
+            type="button"
+            className="ownerErrorControlBtn"
+            disabled={loadingErrors}
+            onClick={loadErrors}
+          >
+            {loadingErrors ? "Refreshing..." : "Refresh Errors"}
+          </button>
+          {liveWatchOn ? (
+            <button
+              type="button"
+              className="ownerErrorControlBtn ownerErrorControlBtn--stop"
+              onClick={stopLiveWatch}
+            >
+              Stop Live Watch
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="ownerErrorControlBtn"
+              onClick={startLiveWatch}
+            >
+              Start Live Watch
+            </button>
+          )}
+        </div>
+      </header>
+
+      <div className="ownerErrorFilters">
+        <label>
+          Status
+          <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}>
+            <option value="new">New</option>
+            <option value="resolved">Resolved</option>
+            <option value="ignored">Ignored</option>
+            <option value="all">All</option>
+          </select>
+        </label>
+        <label>
+          Source
+          <select value={sourceFilter} onChange={(event) => setSourceFilter(event.target.value)}>
+            <option value="all">All</option>
+            <option value="client">Client</option>
+            <option value="server">Server</option>
+          </select>
+        </label>
+        <label>
+          Severity
+          <select value={severityFilter} onChange={(event) => setSeverityFilter(event.target.value)}>
+            <option value="all">All</option>
+            <option value="critical">Critical</option>
+            <option value="error">Error</option>
+            <option value="warning">Warning</option>
+            <option value="info">Info</option>
+          </select>
+        </label>
+        <label>
+          Area
+          <select value={areaFilter} onChange={(event) => setAreaFilter(event.target.value)}>
+            <option value="all">All</option>
+            {areas.map((area) => (
+              <option value={area} key={area}>{area}</option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Room ID
+          <input
+            value={roomSearch}
+            onChange={(event) => setRoomSearch(event.target.value)}
+            placeholder="Search room"
+          />
+        </label>
+      </div>
+
+      {loadError ? <div className="ownerError">{loadError}</div> : null}
+
+      <div className="ownerErrorList">
+        {visibleErrors.map((item) => (
+          <article className="ownerErrorCard" key={item.id}>
+            <div className="ownerErrorCardTop">
+              <div className="ownerErrorPills">
+                <span className={`ownerErrorPill ownerErrorPill--${item.severity || "error"}`}>
+                  {item.severity || "error"}
+                </span>
+                <span className="ownerErrorPill">{item.source || "client"}</span>
+                <span className={`ownerErrorPill ownerErrorPill--status-${item.status || "new"}`}>
+                  {item.status || "new"}
+                </span>
+              </div>
+              <time>{formatWhen(item.createdAtMs)}</time>
+            </div>
+
+            <div className="ownerErrorCardGrid">
+              <span><b>Area:</b> {item.area || "Unknown"}</span>
+              <span><b>Action:</b> {item.action || "Unknown"}</span>
+              <span><b>Room:</b> {item.roomId || "Not set"}</span>
+              <span><b>User:</b> {item.displayName || item.email || item.uid || "Unknown"}</span>
+            </div>
+
+            <p className="ownerErrorTechnical">{item.message || "No technical message provided."}</p>
+            {item.userMessage ? (
+              <p className="ownerErrorUserMessage">
+                <b>User saw:</b> {item.userMessage}
+              </p>
+            ) : null}
+
+            <details className="ownerErrorDetails">
+              <summary>Technical details</summary>
+              <div className="ownerErrorDetailsGrid">
+                <span><b>Code:</b> {item.code || "Not set"}</span>
+                <span><b>UID:</b> {item.uid || "Not set"}</span>
+                <span><b>Email:</b> {item.email || "Not set"}</span>
+                <span><b>URL:</b> {item.url || item.path || "Not set"}</span>
+              </div>
+              {item.stack ? <pre>{item.stack}</pre> : null}
+              {item.extra && Object.keys(item.extra).length ? (
+                <pre>{JSON.stringify(item.extra, null, 2)}</pre>
+              ) : null}
+              {item.userAgent ? <p className="ownerErrorAgent">{item.userAgent}</p> : null}
+            </details>
+
+            <div className="ownerErrorActions">
+              <button
+                type="button"
+                disabled={busyId === item.id || item.status === "resolved"}
+                onClick={() => markError(item.id, "resolved")}
+              >
+                Mark Resolved
+              </button>
+              <button
+                type="button"
+                disabled={busyId === item.id || item.status === "ignored"}
+                onClick={() => markError(item.id, "ignored")}
+              >
+                Mark Ignored
+              </button>
+              <button
+                type="button"
+                disabled={!item.roomId}
+                onClick={() => copyText(item.roomId)}
+              >
+                Copy Room ID
+              </button>
+              <button type="button" onClick={() => copyText(errorDetails(item))}>
+                Copy Error Details
+              </button>
+            </div>
+          </article>
+        ))}
+
+        {!visibleErrors.length && !loadError ? (
+          <div className="ownerErrorEmpty">No errors match these filters.</div>
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
 export default function SuperAdminFix246() {
+  const isOwner = Boolean(
+    auth.currentUser?.uid && OWNER_UIDS.has(auth.currentUser.uid)
+  );
   const [status, setStatus] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -521,8 +907,13 @@ export default function SuperAdminFix246() {
   }
 
   useEffect(() => {
-    loadStatus();
-  }, []);
+    if (isOwner) {
+      loadStatus();
+    } else {
+      setLoading(false);
+      setError("Owner only.");
+    }
+  }, [isOwner]);
 
   const groups = useMemo(() => status?.groups || [], [status]);
 
@@ -638,6 +1029,14 @@ export default function SuperAdminFix246() {
     );
   }
 
+  if (!isOwner) {
+    return (
+      <main className="ownerStatusPage">
+        <div className="ownerError" role="alert">Owner only.</div>
+      </main>
+    );
+  }
+
   return (
     <main className="ownerStatusPage">
       <section className="ownerHero">
@@ -660,6 +1059,8 @@ export default function SuperAdminFix246() {
       )}
 
       {loading && !status && <div className="ownerLoading">Loading owner status...</div>}
+
+      <OwnerErrorCenter />
 
       {status && (
         <>

@@ -27,6 +27,56 @@ function isTrueCupFinalLabel(label) {
   return s === "final" || s.startsWith("final ") || s.endsWith(" final");
 }
 
+function isWorldCupKnockoutRoom(room = {}) {
+  const competitionKey = String(room?.competitionKey || "").toLowerCase();
+  const competitionName = String(
+    room?.competitionMeta?.name || room?.competition?.name || ""
+  ).toLowerCase();
+  const phase = String(
+    room?.worldCupPhase ||
+    room?.worldCup?.phase ||
+    room?.worldCup?.requestedPhase ||
+    ""
+  ).toLowerCase();
+  const isWorldCup =
+    competitionKey.includes("worldcup") ||
+    competitionKey.includes("world-cup") ||
+    (competitionName.includes("world cup") && !competitionName.includes("club world cup"));
+
+  return isWorldCup && phase === "knockout";
+}
+
+function isWorldCupKnockoutRoundLabel(label) {
+  const value = String(label || "").toLowerCase().trim();
+  if (!value) return false;
+  if (
+    value.includes("club world cup") ||
+    value.includes("group stage") ||
+    /\bgroup\s+[a-z0-9]+\b/.test(value) ||
+    value.includes("qualification") ||
+    value.includes("qualifying")
+  ) {
+    return false;
+  }
+
+  return (
+    value.includes("round of 32") ||
+    value.includes("16th finals") ||
+    value.includes("round of 16") ||
+    value.includes("8th finals") ||
+    value.includes("eighth finals") ||
+    value.includes("quarter-final") ||
+    value.includes("quarter final") ||
+    value.includes("semi-final") ||
+    value.includes("semi final") ||
+    value === "final" ||
+    value.startsWith("final ") ||
+    value.endsWith(" final") ||
+    value.includes("third place") ||
+    value.includes("3rd place")
+  );
+}
+
 function normalizeCupWindowFixtures(fixtures = [], currentIds = []) {
   const byId = new Map();
 
@@ -836,6 +886,7 @@ async function writeCupFinalResults({ db, roomId, standings, nowMs }) {
 async function armNextCupWindow({
   db,
   roomId,
+  room,
   roomRef,
   roomCompetitionState,
   cupRef,
@@ -850,7 +901,18 @@ async function armNextCupWindow({
 }) {
 
   const PRE_MS = 20 * 60 * 1000;
-  const candidates = await discoverFixtures({ apiFootballGet, apiKey, league, season, timezone });
+  const discoveredCandidates = await discoverFixtures({
+    apiFootballGet,
+    apiKey,
+    league,
+    season,
+    timezone,
+  });
+  const candidates = isWorldCupKnockoutRoom(room)
+    ? discoveredCandidates.filter((fixture) =>
+        isWorldCupKnockoutRoundLabel(fixture?.round)
+      )
+    : discoveredCandidates;
   const nextWindow = pickCupWindow(candidates, { nowMs, gapHours: 36, afterMs, excludeFixtureIds });
 
   if (!nextWindow || !Array.isArray(nextWindow.fixtureIds) || !nextWindow.fixtureIds.length) {
@@ -1041,6 +1103,7 @@ async function runCupEngine({
       const armed = await armNextCupWindow({
         db,
         roomId,
+        room,
         roomRef,
         roomCompetitionState,
         cupRef,
@@ -1054,10 +1117,21 @@ async function runCupEngine({
 
       if (!armed) {
         const nextCupPollAtMs = nowMs + (60 * 60 * 1000);
-        await cupRef.set({ status: "scheduled", updatedAtMs: nowMs }, { merge: true });
+        const waitingLabel = isWorldCupKnockoutRoom(room)
+          ? "Waiting for knockout fixtures"
+          : undefined;
+        await cupRef.set(
+          {
+            status: "scheduled",
+            updatedAtMs: nowMs,
+            ...(waitingLabel ? { currentWindowLabel: waitingLabel } : {}),
+          },
+          { merge: true }
+        );
         roomCompetitionState = await setCompetitionState(
           roomRef,
           buildCupCompetitionStatePatch({
+            currentLabel: waitingLabel,
             weekStatus: "scheduled",
             nextCupPollAtMs,
             nowMs,
@@ -1169,6 +1243,7 @@ async function runCupEngine({
       const armed = await armNextCupWindow({
         db,
         roomId,
+        room,
         roomRef,
         roomCompetitionState,
         cupRef,
@@ -1744,6 +1819,7 @@ async function runCupEngine({
       const armed = await armNextCupWindow({
         db,
         roomId,
+        room,
         roomRef,
         roomCompetitionState,
         cupRef,

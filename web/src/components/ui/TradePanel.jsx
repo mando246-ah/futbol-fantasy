@@ -1,9 +1,20 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { auth, db } from "../../firebase";
 import { createTradeOffer, respondToTradeOffer, applyAcceptedTrade } from "../../firebase";
-import { collection, onSnapshot, orderBy, query } from "firebase/firestore";
+import {
+  collection,
+  limit,
+  onSnapshot,
+  orderBy,
+  query,
+} from "firebase/firestore";
 import useUserProfiles from "../../lib/useUserProfiles";
 import "./TradePanel.css";
+import {
+  friendlyErrorMessage,
+  reportClientError,
+} from "../../utils/errorReporter";
+import { devError, devLog } from "../../utils/devLogger";
 
 function statusLabel(s) {
   if (s === "pending") return "Offer Pending";
@@ -18,9 +29,76 @@ function statusClass(s) {
   return `tradeStatus tradeStatus--${s || "unknown"}`;
 }
 
+function pickOwnerUid(p = {}) {
+  return String(
+    p.uid ||
+    p.ownerUid ||
+    p.userId ||
+    p.managerUid ||
+    p.pickedByUid ||
+    p.pickedBy ||
+    p.owner?.uid ||
+    p.owner?.id ||
+    ""
+  ).trim();
+}
+
+function pickPlayerId(p = {}, fallback = "") {
+  return String(
+    p.playerId ||
+    p.pid ||
+    p.apiPlayerId ||
+    p.player?.id ||
+    p.id ||
+    fallback ||
+    ""
+  ).trim();
+}
+
+function pickDisplayName(p = {}) {
+  return (
+    p.name ||
+    p.playerName ||
+    p.fullName ||
+    p.displayName ||
+    p.player?.name ||
+    "Unknown"
+  );
+}
+
+function pickDocumentId(p = {}) {
+  return String(p.pickDocId || p.docId || p.id || "").trim();
+}
+
+function normalizeRosterPick(p = {}) {
+  const id = pickDocumentId(p);
+  return {
+    ...p,
+    id,
+    playerId: pickPlayerId(p, p.id),
+    playerName: pickDisplayName(p),
+  };
+}
+
+function pickSortValue(p = {}) {
+  const direct = Number(
+    p.turn ??
+    p.pickIndex ??
+    p.overallPick ??
+    p.pickNumber ??
+    p.createdAtMs
+  );
+  if (Number.isFinite(direct)) return direct;
+  if (typeof p.createdAt?.toMillis === "function") return p.createdAt.toMillis();
+  if (Number.isFinite(Number(p.createdAt?.seconds))) {
+    return Number(p.createdAt.seconds) * 1000;
+  }
+  return Number.MAX_SAFE_INTEGER;
+}
+
 function fmtSide(arr) {
   if (!arr?.length) return "—";
-  return arr.map(p => `${p.playerName} (${p.position || "SUB"})`).join(", ");
+  return arr.map(p => `${pickDisplayName(p)} (${p.position || "SUB"})`).join(", ");
 }
 
 function memberUidOf(member) {
@@ -31,7 +109,7 @@ function memberUidOf(member) {
   ).trim();
 }
 
-export default function TradePanel({ roomId, tradeRoomPath, room, picks }) {
+export default function TradePanel({ tradeRoomPath, room, picks }) {
   const myUid = auth.currentUser?.uid || null;
   const isHost = !!myUid && room?.hostUid === myUid;
 
@@ -42,14 +120,25 @@ export default function TradePanel({ roomId, tradeRoomPath, room, picks }) {
   const [givePickIds, setGivePickIds] = useState(["", ""]);
   const [recvPickIds, setRecvPickIds] = useState(["", ""]);
 
-  // Listen to trades
+  // This listener exists only while TradePanel is mounted.
   useEffect(() => {
     if (!tradeRoomPath) return;
     const ref = collection(db, "rooms", tradeRoomPath, "trades");
-    const qy = query(ref, orderBy("createdAt", "desc"));
-    return onSnapshot(qy, (snap) => {
-      setTrades(snap.docs.map(d => ({ id: d.id, ...d.data() })));
-    });
+    const qy = query(ref, orderBy("createdAt", "desc"), limit(50));
+    return onSnapshot(
+      qy,
+      (snap) => {
+        setTrades(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+        devLog("[TradePanel] trades snapshot", {
+          roomId: tradeRoomPath,
+          tradeDocsRead: snap.size,
+        });
+      },
+      (error) => {
+        devError("[TradePanel] trades listener failed", error);
+        setTradeMsg("Could not load trades. Please refresh and try again.");
+      }
+    );
   }, [tradeRoomPath]);
 
   // Host auto-applies accepted trades
@@ -63,13 +152,31 @@ export default function TradePanel({ roomId, tradeRoomPath, room, picks }) {
       applyingRef.current.add(t.id);
 
       applyAcceptedTrade({ roomId: tradeRoomPath, tradeId: t.id })
-        .catch((e) => console.error("applyAcceptedTrade failed:", e))
+        .catch(async (e) => {
+          const userMessage = friendlyErrorMessage(
+            e,
+            "Could not complete the accepted trade. Please try again."
+          );
+          await reportClientError({
+            roomId: tradeRoomPath,
+            area: "TradePanel",
+            action: "applyAcceptedTrade",
+            error: e,
+            userMessage,
+            extra: { tradeId: t.id },
+          });
+          devError("[TradePanel] applyAcceptedTrade failed", e);
+          setTradeMsg(userMessage);
+        })
         .finally(() => applyingRef.current.delete(t.id));
     }
   }, [tradeRoomPath, isHost, trades]);
 
   // Members + names
-  const members = Array.isArray(room?.members) ? room.members : [];
+  const members = useMemo(
+    () => (Array.isArray(room?.members) ? room.members : []),
+    [room?.members]
+  );
   const managerUids = useMemo(() => {
     const ids = new Set();
 
@@ -79,7 +186,7 @@ export default function TradePanel({ roomId, tradeRoomPath, room, picks }) {
     }
 
     for (const pick of Array.isArray(picks) ? picks : []) {
-      const uid = String(pick?.uid || pick?.ownerUid || "").trim();
+      const uid = pickOwnerUid(pick);
       if (uid) ids.add(uid);
     }
 
@@ -91,49 +198,85 @@ export default function TradePanel({ roomId, tradeRoomPath, room, picks }) {
     return Array.from(ids);
   }, [members, picks, trades]);
   const profilesByUid = useUserProfiles(managerUids);
-  const managerName = (uid, fallback = "Manager") => {
+  const managerName = useCallback((uid, fallback = "Manager") => {
     const profile = profilesByUid?.[String(uid || "")] || {};
     return profile?.displayName || profile?.name || fallback || "Manager";
-  };
+  }, [profilesByUid]);
   const nameByUid = useMemo(() => {
     const m = new Map();
     for (const mem of members) {
       const uid = memberUidOf(mem);
       if (uid) m.set(uid, managerName(uid, mem?.displayName || uid));
     }
+    for (const pick of Array.isArray(picks) ? picks : []) {
+      const uid = pickOwnerUid(pick);
+      if (uid && !m.has(uid)) {
+        m.set(uid, managerName(uid, pick?.displayName || pick?.managerName || uid));
+      }
+    }
     return m;
-  }, [members, profilesByUid]);
+  }, [managerName, members, picks]);
+
+  const normalizedPicks = useMemo(
+    () =>
+      (Array.isArray(picks) ? picks : [])
+        .map(normalizeRosterPick)
+        .filter((pick) => pick.id),
+    [picks]
+  );
 
   // Group picks by uid
   const picksByUid = useMemo(() => {
     const map = new Map();
-    for (const p of (picks || [])) {
-      if (!p?.uid) continue;
-      if (!map.has(p.uid)) map.set(p.uid, []);
-      map.get(p.uid).push(p);
+    for (const p of normalizedPicks) {
+      const uid = pickOwnerUid(p);
+      if (!uid) continue;
+      if (!map.has(uid)) map.set(uid, []);
+      map.get(uid).push(p);
     }
     for (const arr of map.values()) {
-      arr.sort((a, b) => (a.turn ?? 0) - (b.turn ?? 0));
+      arr.sort((a, b) =>
+        pickSortValue(a) - pickSortValue(b) ||
+        pickDisplayName(a).localeCompare(pickDisplayName(b))
+      );
     }
     return map;
-  }, [picks]);
+  }, [normalizedPicks]);
 
-  const myRoster = picksByUid.get(myUid) || [];
-  const partnerRoster = picksByUid.get(partnerUid) || [];
+  const myRoster = picksByUid.get(String(myUid || "")) || [];
+  const partnerRoster = picksByUid.get(String(partnerUid || "")) || [];
 
   const partnerOptions = useMemo(() => {
-    return members
-      .map((m) => ({ uid: memberUidOf(m), member: m }))
-      .filter(({ uid }) => uid && uid !== myUid)
-      .map(({ uid, member }) => ({ uid, name: managerName(uid, member?.displayName || uid) }));
-  }, [members, myUid, profilesByUid]);
+    const memberByUid = new Map(
+      members
+        .map((member) => [memberUidOf(member), member])
+        .filter(([uid]) => Boolean(uid))
+    );
+
+    return managerUids
+      .filter((uid) => uid && uid !== myUid)
+      .map((uid) => {
+        const member = memberByUid.get(uid);
+        return {
+          uid,
+          name: managerName(
+            uid,
+            member?.displayName || nameByUid.get(uid) || uid
+          ),
+        };
+      })
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }, [managerName, managerUids, members, myUid, nameByUid]);
 
   function pickById(pickId) {
-    return (picks || []).find(p => p.id === pickId) || null;
+    const id = String(pickId || "");
+    return normalizedPicks.find((p) => p.id === id) || null;
   }
 
   function normalizeSelected(arr) {
-    return arr.filter(Boolean).slice(0, 2);
+    return Array.from(
+      new Set((arr || []).map((id) => String(id || "").trim()).filter(Boolean))
+    ).slice(0, 2);
   }
 
   function updateTwo(setter, idx, val) {
@@ -154,29 +297,40 @@ export default function TradePanel({ roomId, tradeRoomPath, room, picks }) {
     const giveIds = normalizeSelected(givePickIds);
     const recvIds = normalizeSelected(recvPickIds);
 
+    if (giveIds.length < 1 && recvIds.length < 1) {
+      return setTradeMsg("Select at least one player to give or receive.");
+    }
     if (giveIds.length < 1 || recvIds.length < 1) {
       return setTradeMsg("Pick at least 1 player on each side.");
     }
     if (giveIds.length !== recvIds.length) {
       return setTradeMsg("Must be 1-for-1 or 2-for-2.");
     }
-
-    const give = giveIds.map(id => pickById(id)).filter(Boolean).map(p => ({
-      playerId: String(p.playerId),
-      playerName: p.playerName,
-      position: p.position || "SUB",
-    }));
-    const receive = recvIds.map(id => pickById(id)).filter(Boolean).map(p => ({
-      playerId: String(p.playerId),
-      playerName: p.playerName,
-      position: p.position || "SUB",
-    }));
+    if (giveIds.some((id) => recvIds.includes(id))) {
+      return setTradeMsg("The same pick cannot appear on both sides of a trade.");
+    }
 
     // Defensive: ensure they belong to the correct rosters
-    const myIds = new Set(myRoster.map(p => p.id));
-    const partnerIds = new Set(partnerRoster.map(p => p.id));
+    const myIds = new Set(myRoster.map((p) => String(p.id)));
+    const partnerIds = new Set(partnerRoster.map((p) => String(p.id)));
     if (giveIds.some(id => !myIds.has(id))) return setTradeMsg("One of your 'give' picks is not on your roster.");
     if (recvIds.some(id => !partnerIds.has(id))) return setTradeMsg("One of your 'receive' picks is not on the partner roster.");
+
+    const normalizeTradePick = (p) => ({
+      pickId: String(p.id),
+      playerId: pickPlayerId(p, p.id),
+      playerName: pickDisplayName(p),
+      position: p.position || "SUB",
+      teamName: p.teamName || "",
+      teamLogo: p.teamLogo || "",
+      nationality: p.nationality || "",
+    });
+    const give = giveIds.map(id => pickById(id)).filter(Boolean).map(normalizeTradePick);
+    const receive = recvIds.map(id => pickById(id)).filter(Boolean).map(normalizeTradePick);
+
+    if (give.length !== giveIds.length || receive.length !== recvIds.length) {
+      return setTradeMsg("One or more selected players could not be resolved.");
+    }
 
     try {
       await createTradeOffer({ roomId: tradeRoomPath, toUid: partnerUid, give, receive });
@@ -184,8 +338,24 @@ export default function TradePanel({ roomId, tradeRoomPath, room, picks }) {
       setGivePickIds(["", ""]);
       setRecvPickIds(["", ""]);
     } catch (e) {
-      console.error(e);
-      setTradeMsg(e?.message || "Failed to send offer.");
+      const userMessage = friendlyErrorMessage(
+        e,
+        "Could not send the trade offer. Please try again."
+      );
+      await reportClientError({
+        roomId: tradeRoomPath,
+        area: "TradePanel",
+        action: "createTradeOffer",
+        error: e,
+        userMessage,
+        extra: {
+          partnerUid,
+          giveCount: give.length,
+          receiveCount: receive.length,
+        },
+      });
+      devError("[TradePanel] createTradeOffer failed", e);
+      setTradeMsg(userMessage);
     }
   }
 
@@ -194,8 +364,20 @@ export default function TradePanel({ roomId, tradeRoomPath, room, picks }) {
     try {
       await respondToTradeOffer({ roomId: tradeRoomPath, tradeId, action });
     } catch (e) {
-      console.error(e);
-      setTradeMsg(e?.message || "Action failed.");
+      const userMessage = friendlyErrorMessage(
+        e,
+        "Could not update this trade. Please refresh and try again."
+      );
+      await reportClientError({
+        roomId: tradeRoomPath,
+        area: "TradePanel",
+        action: "respondToTradeOffer",
+        error: e,
+        userMessage,
+        extra: { tradeId, responseAction: action },
+      });
+      devError("[TradePanel] respondToTradeOffer failed", e);
+      setTradeMsg(userMessage);
     }
   }
 
@@ -250,8 +432,8 @@ export default function TradePanel({ roomId, tradeRoomPath, room, picks }) {
                 >
                   <option value="">— Select your player —</option>
                   {myRoster.map(p => (
-                    <option key={p.id} value={p.id}>
-                      {p.playerName} ({p.position})
+                    <option key={pickDocumentId(p)} value={pickDocumentId(p)}>
+                      {pickDisplayName(p)} ({p.position || p.pos || "SUB"})
                     </option>
                   ))}
                 </select>
@@ -270,8 +452,8 @@ export default function TradePanel({ roomId, tradeRoomPath, room, picks }) {
                 >
                   <option value="">— Select their player —</option>
                   {partnerRoster.map(p => (
-                    <option key={p.id} value={p.id}>
-                      {p.playerName} ({p.position})
+                    <option key={pickDocumentId(p)} value={pickDocumentId(p)}>
+                      {pickDisplayName(p)} ({p.position || p.pos || "SUB"})
                     </option>
                   ))}
                 </select>
@@ -368,7 +550,7 @@ export default function TradePanel({ roomId, tradeRoomPath, room, picks }) {
 
       {isHost && (
         <div className="tradeHostNote">
-          Host mode: accepted offers will be applied automatically.
+
         </div>
       )}
     </div>

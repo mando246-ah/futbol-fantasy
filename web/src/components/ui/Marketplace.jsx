@@ -1,21 +1,66 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import "./Marketplace.css";
 import { db } from "../../firebase";
-import { orderBy, query} from "firebase/firestore";
 import {
    marketSaveInterest
 } from "../../firebase";
 import {
-  collection, getDocs, onSnapshot, doc
+  collection,
+  doc,
+  getDocs,
+  limit,
+  onSnapshot,
+  orderBy,
+  query,
 } from "firebase/firestore";
-import { where } from "firebase/firestore";
 import { getFunctions, httpsCallable } from "firebase/functions";
 import {app} from "../../firebase";
 import FlagIcon from "../FlagIcon";
+import {
+  friendlyErrorMessage,
+  reportClientError,
+} from "../../utils/errorReporter";
+import { devError, devLog } from "../../utils/devLogger";
 
 const functions = getFunctions(app, "us-west2");
 const fnScheduleMarket = httpsCallable(functions, "scheduleMarket");
-const fnResolveMarketNow = httpsCallable(functions, "resolveMarketNow");
+
+function pickOwnerUid(p = {}) {
+  return String(
+    p.uid ||
+    p.ownerUid ||
+    p.userId ||
+    p.managerUid ||
+    p.pickedByUid ||
+    p.pickedBy ||
+    p.owner?.uid ||
+    p.owner?.id ||
+    ""
+  ).trim();
+}
+
+function pickPlayerId(p = {}, fallback = "") {
+  return String(
+    p.playerId ||
+    p.pid ||
+    p.apiPlayerId ||
+    p.player?.id ||
+    p.id ||
+    fallback ||
+    ""
+  ).trim();
+}
+
+function pickDisplayName(p = {}) {
+  return (
+    p.name ||
+    p.playerName ||
+    p.fullName ||
+    p.displayName ||
+    p.player?.name ||
+    "Unknown"
+  );
+}
 
 function formatMs(ms) {
   const total = Math.max(0, Math.floor(ms / 1000));
@@ -88,7 +133,7 @@ function friendlyMarketReason(code) {
 }
 
 function getPlayerName(p = {}) {
-  return p.name || p.playerName || p.fullName || p.displayName || "Unknown";
+  return pickDisplayName(p);
 }
 
 function getPlayerTeam(p = {}) {
@@ -181,7 +226,7 @@ const AcquireSearch = React.memo(function AcquireSearch({
     q.length < 2
       ? []
       : (pool || [])
-          .filter((p) => (p?.name || "").toLowerCase().includes(q))
+          .filter((p) => pickDisplayName(p).toLowerCase().includes(q))
           .slice(0, 20);
 
   const selected =
@@ -190,18 +235,19 @@ const AcquireSearch = React.memo(function AcquireSearch({
       : null;
 
   return (
-    <div className="w-full">
+    <div className="w-full max-w-full min-w-0 overflow-x-hidden box-border">
       <input
-        className="marketInput"
+        className="marketInput w-full max-w-full min-w-0 box-border"
         value={search}
         onChange={(e) => setSearch(e.target.value)}
-        placeholder={`Search player to acquire (${label})…`}
+        placeholder="Search players"
+        aria-label={`Search player to acquire (${label})`}
         disabled={disabled}
       />
 
       {selected && (
         <div className="marketHint">
-          Selected: <b>{selected.name}</b> ({selected.position})
+          Selected: <b>{pickDisplayName(selected)}</b> ({selected.position})
           <button
             type="button"
             className="marketLinkBtn"
@@ -216,23 +262,23 @@ const AcquireSearch = React.memo(function AcquireSearch({
       )}
 
       {!selected && results.length > 0 && (
-        <div className="marketResults">
+        <div className="marketResults w-full max-w-full overflow-y-auto overflow-x-hidden box-border">
           {results.map((p) => {
             const taken = pickedSet?.has(String(p.id));
             return (
               <button
                 type="button"
                 key={p.id}
-                className="marketResultItem"
+                className="marketResultItem w-full max-w-full min-w-0 box-border"
                 disabled={taken}
                 onClick={() => {
                   setState({ ...state, wantId: p.id });
-                  setSearch(p.name);
+                  setSearch(pickDisplayName(p));
                 }}
                 title={taken ? "Already drafted" : disabled ? "Click Edit to change" : "Select"}
               >
-                <div className="font-medium">
-                  {p.name} {taken ? " (taken)" : ""}
+                <div className="font-medium min-w-0 break-words">
+                  {pickDisplayName(p)} {taken ? " (taken)" : ""}
                 </div>
                 <div className="text-xs opacity-70">{p.position}</div>
               </button>
@@ -249,115 +295,238 @@ const AcquireSearch = React.memo(function AcquireSearch({
 });
 
 
-export default function Marketplace({ roomId, user, isHost, players= [] }) {
+export default function Marketplace({
+  roomId,
+  user,
+  isHost,
+  players,
+  picks,
+  playersLoaded = false,
+}) {
   const [market, setMarket] = useState(null);
-  const [room, setRoom] = useState(null);
-  const [undrafted, setUndrafted] = useState([]);
-  const [myRoster, setMyRoster] = useState([]);
+  const [fallbackPlayers, setFallbackPlayers] = useState([]);
+  const [fallbackPicks, setFallbackPicks] = useState([]);
   const [choiceA, setChoiceA] = useState({ wantId: "", swapOutId: "" });
   const [choiceB, setChoiceB] = useState({ wantId: "", swapOutId: "" });
   const [dur, setDur] = useState({ days: 0, hours: 0, minutes: 10 });
   const [startISO, setStartISO] = useState("");
-  const [searchA, setSearchA] = useState("");
-  const [searchB, setSearchB] = useState("");
-  const [pickedSet, setPickedSet] = useState(new Set());
   const [isEditing, setIsEditing] = useState(true); // default: editable
   const [saveStatus, setSaveStatus] = useState(""); 
+  const [marketError, setMarketError] = useState("");
   const [ marketResults, setMarketResults ] = useState([]);
+  const [marketResultsLoading, setMarketResultsLoading] = useState(false);
+  const [marketResultsError, setMarketResultsError] = useState("");
+  const [marketResultsLoadedRoomId, setMarketResultsLoadedRoomId] = useState("");
   const [availableLimit, setAvailableLimit] = useState(30); // how many "Available Players" cards to show
   const [availableSearch, setAvailableSearch] = useState("");
+  const hasParentPlayers = Array.isArray(players);
+  const hasParentPicks = Array.isArray(picks);
 
-  //Display Results After Market Closes
-  useEffect(() => {
-  if (!roomId) return;
-
-  // If market has never resolved yet, don't show anything
-  if (!market?.closesAt) {
-    setMarketResults([]);
-    return;
-  }
-
-  const closeMs = toMillis(market?.closesAt);
-  if (!closeMs) {
-    setMarketResults([]);
-    return;
-  }
-
-  const fromMs = Number(closeMs || 0) - 5 * 60 * 1000;
-
-  const qy = query(
-    collection(db, "rooms", roomId, "marketResults"),
-    where("resolvedAtMs", ">=", fromMs),
-    orderBy("resolvedAtMs", "desc")
+  const parentPlayers = useMemo(
+    () =>
+      (Array.isArray(players) ? players : [])
+        .map((player) => {
+          const id = pickPlayerId(player);
+          return id ? { ...player, id } : null;
+        })
+        .filter(Boolean),
+    [players]
   );
 
-  const unsub = onSnapshot(qy, (snap) => {
-    setMarketResults(snap.docs.map(d => ({ id: d.id, ...d.data() })));
-  });
+  const allPlayers =
+    hasParentPlayers && parentPlayers.length > 0
+      ? parentPlayers
+      : fallbackPlayers;
 
-  return () => unsub();
-}, [roomId, market?.closesAt]);
+  const ownershipPicks = hasParentPicks ? picks : fallbackPicks;
+
+  const { pickedSet, myRoster } = useMemo(() => {
+    const picked = new Set();
+    const mine = [];
+
+    for (const rawPick of Array.isArray(ownershipPicks) ? ownershipPicks : []) {
+      const data = rawPick || {};
+      const pickDocId = String(data.pickDocId || data.docId || data.id || "");
+      const playerId = pickPlayerId(data, pickDocId);
+      if (playerId) picked.add(playerId);
+
+      if (pickOwnerUid(data) === String(user?.uid || "")) {
+        mine.push({
+          ...data,
+          id: pickDocId || playerId,
+          pickDocId: pickDocId || playerId,
+          playerId,
+          playerName: pickDisplayName(data),
+        });
+      }
+    }
+
+    return { pickedSet: picked, myRoster: mine };
+  }, [ownershipPicks, user?.uid]);
+
+  const loadMarketResults = useCallback(async () => {
+    if (!roomId) {
+      setMarketResults([]);
+      return;
+    }
+
+    setMarketResultsLoading(true);
+    setMarketResultsError("");
+    try {
+      const resultsRef = collection(db, "rooms", roomId, "marketResults");
+      let snap = await getDocs(
+        query(resultsRef, orderBy("resolvedAtMs", "desc"), limit(20))
+      );
+
+      // Older result docs may only have resolvedAt.
+      if (snap.empty) {
+        snap = await getDocs(
+          query(resultsRef, orderBy("resolvedAt", "desc"), limit(20))
+        );
+      }
+
+      const rows = snap.docs
+        .map((resultDoc) => ({ id: resultDoc.id, ...(resultDoc.data() || {}) }))
+        .sort((a, b) => {
+          const aMs = toMillis(a.resolvedAtMs ?? a.resolvedAt) || 0;
+          const bMs = toMillis(b.resolvedAtMs ?? b.resolvedAt) || 0;
+          return bMs - aMs;
+        })
+        .slice(0, 20);
+      setMarketResults(rows);
+      setMarketResultsLoadedRoomId(roomId);
+      devLog("[Marketplace] market results read", {
+        roomId,
+        resultDocsRead: snap.size,
+      });
+    } catch (error) {
+      devError("[Marketplace] market results read failed", error);
+      setMarketResultsError("Could not load market results.");
+    } finally {
+      setMarketResultsLoading(false);
+    }
+  }, [roomId]);
+
+  useEffect(() => {
+    setMarketResults([]);
+    setMarketResultsError("");
+    setMarketResultsLoadedRoomId("");
+  }, [roomId]);
+
+  useEffect(() => {
+    if (
+      market?.status === "resolved" &&
+      marketResultsLoadedRoomId !== roomId
+    ) {
+      loadMarketResults();
+    }
+  }, [
+    loadMarketResults,
+    market?.status,
+    marketResultsLoadedRoomId,
+    roomId,
+  ]);
 
 
   useEffect(() => {
     if (!roomId) return;
 
-    const roomRef = doc(db, "rooms", roomId);
     const marketRef = doc(db, "rooms", roomId, "market", "current");
-
-    const unsubRoom = onSnapshot(roomRef, (snap) => {
-      setRoom(snap.exists() ? snap.data() : null);
-    });
 
     const unsubMarket = onSnapshot(marketRef, (snap) => {
       setMarket(snap.exists() ? snap.data() : { status: "closed" });
     });
 
-    return () => {
-      unsubRoom();
-      unsubMarket();
-    };
+    return () => unsubMarket();
   }, [roomId]);
 
-  // Load undrafted & my roster
+  // Draft normally provides the full player pool. Only use Firestore as a fallback.
   useEffect(() => {
-    async function load() {
-      const picksSnap = await getDocs(collection(db, "rooms", roomId, "picks"));
+    let cancelled = false;
 
-      // who is already drafted
-      const picked = new Set();
-      picksSnap.forEach(d => picked.add(String(d.data().playerId)));
-      setPickedSet(picked);
-
-      // 1) Prefer passed-in players (MOCK_PLAYERS)
-      let all = (players || []).map(p => ({
-        ...p,
-        id: String(p.id),
-      }));
-
-      // 2) Fallback: if none passed, load from Firestore players collection
-      if (all.length === 0) {
-        const playersSnap = await getDocs(collection(db, "rooms", roomId, "players"));
-        all = playersSnap.docs.map(d => {
-          const data = d.data();
-          return { ...data, id: String(data.id ?? d.id) };
-        });
-      }
-
-      setUndrafted(all.filter(p => !picked.has(String(p.id))));
-
-      // my roster from picks
-      const mine = [];
-      picksSnap.forEach(d => {
-        const p = d.data();
-        if (p.uid === user?.uid) mine.push(p);
-      });
-      setMyRoster(mine);
+    if (!roomId) {
+      setFallbackPlayers([]);
+      return () => {
+        cancelled = true;
+      };
     }
 
-    if (roomId) load();
-  }, [roomId, user?.uid, market?.status, players]);
+    if (hasParentPlayers && (!playersLoaded || parentPlayers.length > 0)) {
+      setFallbackPlayers([]);
+      return () => {
+        cancelled = true;
+      };
+    }
 
+    (async () => {
+      try {
+        const snap = await getDocs(collection(db, "rooms", roomId, "players"));
+        if (cancelled) return;
+
+        const roomPlayerRows = snap.docs
+          .map((playerDoc) => {
+            const data = playerDoc.data() || {};
+            const id = pickPlayerId(data, playerDoc.id);
+            return id ? { ...data, id } : null;
+          })
+          .filter(Boolean);
+
+        setFallbackPlayers(roomPlayerRows);
+        devLog("[Marketplace] fallback room players read once", {
+          roomId,
+          playerDocsRead: snap.size,
+        });
+      } catch (error) {
+        devError("[Marketplace] room players read failed", error);
+        if (!cancelled) setFallbackPlayers([]);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    hasParentPlayers,
+    parentPlayers.length,
+    playersLoaded,
+    roomId,
+  ]);
+
+  // Draft normally provides live picks. Only open a picks listener as a fallback.
+  useEffect(() => {
+    if (!roomId) {
+      setFallbackPicks([]);
+      return;
+    }
+
+    if (hasParentPicks) {
+      setFallbackPicks([]);
+      return;
+    }
+
+    const picksRef = collection(db, "rooms", roomId, "picks");
+    return onSnapshot(picksRef, (snap) => {
+      setFallbackPicks(
+        snap.docs.map((pickDoc) => ({
+          id: pickDoc.id,
+          pickDocId: pickDoc.id,
+          ...(pickDoc.data() || {}),
+        }))
+      );
+      devLog("[Marketplace] fallback picks snapshot", {
+        roomId,
+        pickDocsRead: snap.size,
+      });
+    });
+  }, [hasParentPicks, roomId]);
+
+  const undrafted = useMemo(
+    () =>
+      allPlayers.filter(
+        (player) => !pickedSet.has(String(pickPlayerId(player)))
+      ),
+    [allPlayers, pickedSet]
+  );
 
 
   // Limit how many Available Players are rendered (less scrolling / faster)
@@ -400,9 +569,6 @@ export default function Marketplace({ roomId, user, isHost, players= [] }) {
   useEffect(() => {
     if (!roomId || !user?.uid) return;
 
-    const nameFromPool = (id) =>
-    (players || []).find(p => String(p.id) === String(id))?.name || "";
-
     const ref = doc(db, "rooms", roomId, "marketInterest", user.uid);
     const unsub = onSnapshot(ref, (snap) => {
       const data = snap.exists() ? snap.data() : null;
@@ -413,11 +579,6 @@ export default function Marketplace({ roomId, user, isHost, players= [] }) {
 
       setChoiceA({ wantId: a.wantId || "", swapOutId: a.swapOutId || "" });
       setChoiceB({ wantId: b.wantId || "", swapOutId: b.swapOutId || "" });
-
-      // Optional: set search inputs to selected player names
-      // (only if you kept searchA/searchB)
-      setSearchA( nameFromPool(a.wantId) || "" );
-      setSearchB( nameFromPool(b.wantId) || "" );
     });
 
     return () => unsub();
@@ -458,7 +619,7 @@ function getSelectedPlayer(wantId) {
 
   return (
     (undrafted || []).find((p) => String(p.id) === String(wantId)) ||
-    (players || []).find((p) => String(p.id) === String(wantId)) ||
+    allPlayers.find((p) => String(p.id) === String(wantId)) ||
     null
   );
 }
@@ -472,26 +633,20 @@ function chooseTransferTarget(player) {
 
   if (!choiceA.wantId || String(choiceA.wantId) === id) {
     setChoiceA((prev) => ({ ...prev, wantId: id }));
-    setSearchA(getPlayerName(player));
     return;
   }
 
   if (!choiceB.wantId || String(choiceB.wantId) === id) {
     setChoiceB((prev) => ({ ...prev, wantId: id }));
-    setSearchB(getPlayerName(player));
     return;
   }
 
   // If both choices are full, replace Choice A.
   setChoiceA((prev) => ({ ...prev, wantId: id }));
-  setSearchA(getPlayerName(player));
 }
 
 function clearChoice(label, state, setState) {
   setState({ ...state, wantId: "" });
-
-  if (label === "Choice A") setSearchA("");
-  if (label === "Choice B") setSearchB("");
 
   setSaveStatus("");
 }
@@ -501,6 +656,7 @@ function clearChoice(label, state, setState) {
 
     try {
       setSaveStatus("saving");
+      setMarketError("");
 
       const choices = [];
       if (choiceA.wantId && choiceA.swapOutId) choices.push(choiceA);
@@ -511,16 +667,29 @@ function clearChoice(label, state, setState) {
       setSaveStatus("saved");
       setIsEditing(false); // lock inputs after save
     } catch (e) {
-      console.error(e);
+      const userMessage = friendlyErrorMessage(
+        e,
+        "Could not save your transfer interest. Please try again."
+      );
+      await reportClientError({
+        roomId,
+        area: "Marketplace",
+        action: "marketSaveInterest",
+        error: e,
+        userMessage,
+        extra: {
+          marketStatus: market?.status || "",
+          choiceCount: [choiceA, choiceB].filter(
+            (choice) => choice.wantId && choice.swapOutId
+          ).length,
+        },
+      });
+      devError("[Marketplace] marketSaveInterest failed", e);
+      setMarketError(userMessage);
       setSaveStatus("error");
     }
   }
 
-
-  async function onStartNow() {
-    if (!durationMs) return alert("Please set a duration.");
-    await marketOpenNow({ roomId, durationMs });
-  }
 
      async function onSchedule() {
     if (!durationMs || !startISO) return alert("Start time + duration required.");
@@ -529,7 +698,8 @@ function clearChoice(label, state, setState) {
     if (!Number.isFinite(whenMillis)) return alert("Invalid start time.");
 
     try {
-      console.log("Scheduling market debug:", {
+      setMarketError("");
+      devLog("Scheduling market debug:", {
         startISO,
         whenMillis,
         whenLocal: new Date(whenMillis).toString(),
@@ -541,33 +711,31 @@ function clearChoice(label, state, setState) {
         durationMs,
       });
 
-      console.log("scheduleMarket ok:", res?.data ?? res);
+      devLog("scheduleMarket ok:", res?.data ?? res);
     } catch (e) {
-      console.error("scheduleMarket failed:", {
-        code: e?.code,
-        message: e?.message,
-        details: e?.details,
-        raw: e,
+      const userMessage = friendlyErrorMessage(
+        e,
+        "Could not schedule the market. Please refresh and try again."
+      );
+      await reportClientError({
+        roomId,
+        area: "Marketplace",
+        action: "scheduleMarket",
+        error: e,
+        userMessage,
+        extra: {
+          scheduledAtMs: whenMillis,
+          durationMs,
+        },
       });
-      alert(`scheduleMarket failed: ${e?.message ?? e}`);
-    }
-  }
-
-  async function onResolve() {
-    try {
-      const res = await fnResolveMarketNow({ roomId });
-      const data = res?.data || {};
-
-      console.log("resolveMarketNow()", data);
-      alert(`Market resolved. Trades: ${data?.resolvedCount ?? 0}`);
-    } catch (e) {
-      console.error("resolveMarketNow failed:", e);
-      alert(e?.message || "Failed to resolve market.");
+      devError("[Marketplace] scheduleMarket failed", e);
+      setMarketError(userMessage);
+      alert(userMessage);
     }
   }
 
   return (
-    <div className="marketCard">
+    <div className="marketCard w-full max-w-full overflow-hidden box-border">
       <div className="marketHeader">
         <h2 className="text-xl font-bold">Transfer Market</h2>
         <div className="text-sm">
@@ -661,9 +829,9 @@ function clearChoice(label, state, setState) {
 
       {/* Available players */}
       {/* Transfer suggestions */}
-      <div className="mt-4">
+      <div className="mt-4 w-full max-w-full min-w-0 overflow-x-hidden box-border">
         <div className="marketSuggestionHeader">
-          <div>
+          <div className="min-w-0 max-w-full">
             <div className="font-semibold">Transfer Suggestions</div>
             <div className="marketSubText">
               Search by player, club, country, or position.
@@ -682,57 +850,66 @@ function clearChoice(label, state, setState) {
         </div>
 
         <input
-          className="marketInput marketSearchInput"
+          className="marketInput marketSearchInput w-full max-w-full min-w-0 box-border"
           value={availableSearch}
           onChange={(e) => setAvailableSearch(e.target.value)}
-          placeholder="Search available players, team, nation, or position..."
+          placeholder="Search players"
         />
 
-        <div className="grid gap-2 md:grid-cols-3 marketAvailableList">
-          {visibleUndrafted.map((p) => {
-            const alreadyChoice =
-              String(choiceA.wantId) === String(p.id) ||
-              String(choiceB.wantId) === String(p.id);
+        <div className="w-full max-w-full min-w-0 overflow-x-hidden box-border">
+          <div className="grid gap-2 md:grid-cols-3 marketAvailableList w-full max-w-full min-w-0 overflow-y-auto overflow-x-hidden box-border">
+            {visibleUndrafted.map((p) => {
+              const alreadyChoice =
+                String(choiceA.wantId) === String(p.id) ||
+                String(choiceB.wantId) === String(p.id);
 
-            const canPick = market?.status === "open" && isEditing;
+              const canPick = market?.status === "open" && isEditing;
 
-            return (
-              <div key={p.id} className={`marketPlayerCard ${alreadyChoice ? "marketPlayerCardSelected" : ""}`}>
-                <div className="marketPlayerCardTop">
-                  <div className="marketPlayerInfo">
-                    <div className="font-medium">{getPlayerName(p)}</div>
-                    <PlayerMetaLine player={p} />
+              return (
+                <div
+                  key={p.id}
+                  className={`marketPlayerCard w-full max-w-full min-w-0 box-border ${
+                    alreadyChoice ? "marketPlayerCardSelected" : ""
+                  }`}
+                >
+                  <div className="marketPlayerCardTop w-full max-w-full min-w-0">
+                    <div className="marketPlayerInfo min-w-0 max-w-full">
+                      <div className="font-medium min-w-0 break-words">
+                        {getPlayerName(p)}
+                      </div>
+                      <PlayerMetaLine player={p} />
+                    </div>
+
+                    <button
+                      type="button"
+                      className="marketTransferMiniBtn"
+                      disabled={!canPick}
+                      onClick={() => chooseTransferTarget(p)}
+                      title={
+                        market?.status !== "open"
+                          ? "Market must be open"
+                          : !isEditing
+                          ? "Click Edit choices first"
+                          : "Add to your transfer choices"
+                      }
+                    >
+                      {alreadyChoice ? "Selected" : "Transfer"}
+                    </button>
                   </div>
-
-                  <button
-                    type="button"
-                    className="marketTransferMiniBtn"
-                    disabled={!canPick}
-                    onClick={() => chooseTransferTarget(p)}
-                    title={
-                      market?.status !== "open"
-                        ? "Market must be open"
-                        : !isEditing
-                        ? "Click Edit choices first"
-                        : "Add to your transfer choices"
-                    }
-                  >
-                    {alreadyChoice ? "Selected" : "Transfer"}
-                  </button>
                 </div>
-              </div>
-            );
-          })}
+              );
+            })}
 
-          {filteredUndrafted.length === 0 && (
-            <div className="opacity-60 text-sm">
-              No available players match your search.
-            </div>
-          )}
+            {filteredUndrafted.length === 0 && (
+              <div className="opacity-60 text-sm min-w-0 break-words">
+                No available players match your search.
+              </div>
+            )}
+          </div>
         </div>
 
         {filteredUndrafted.length > 0 && (
-          <div className="mt-3 flex items-center gap-2">
+          <div className="mt-3 flex flex-wrap items-center gap-2 min-w-0 max-w-full">
             <div className="text-xs opacity-60">
               Showing {Math.min(availableLimit, filteredUndrafted.length)} of {filteredUndrafted.length}
             </div>
@@ -761,12 +938,12 @@ function clearChoice(label, state, setState) {
       </div>
 
       {/* My interest (private to me) */}
-      <div className="mt-6">
+      <div className="mt-6 w-full max-w-full min-w-0 overflow-x-hidden box-border">
         <div className="font-semibold mb-2">Your Interest (private)</div>
-        <div className="grid md:grid-cols-2 gap-3">
+        <div className="grid md:grid-cols-2 gap-3 w-full max-w-full min-w-0">
           {[{label:"Choice A", state: choiceA, set: setChoiceA},
             {label:"Choice B", state: choiceB, set: setChoiceB}].map(({label, state, set}) => (
-            <div key={label} className="marketPanel">
+            <div key={label} className="marketPanel w-full max-w-full min-w-0 box-border">
               <div className="text-sm font-medium mb-2">{label}</div>
               <div className="marketChoiceRow">
                 <div className="marketSelectedTarget">
@@ -797,7 +974,14 @@ function clearChoice(label, state, setState) {
                 <span className="marketChoiceFor">for</span>
                 <select disabled={!isEditing} className="marketSelect" value={state.swapOutId} onChange={e=>set({...state, swapOutId:e.target.value})}>
                   <option value="">— Select your player to release —</option>
-                  {myRoster.map(p => <option key={p.playerId} value={p.playerId}>{p.playerName} ({p.position})</option>)}
+                  {myRoster.map((p) => {
+                    const playerId = pickPlayerId(p);
+                    return (
+                      <option key={p.id || playerId} value={playerId}>
+                        {pickDisplayName(p)} ({p.position || p.pos || "SUB"})
+                      </option>
+                    );
+                  })}
                 </select>
               </div>
             </div>
@@ -834,36 +1018,50 @@ function clearChoice(label, state, setState) {
           )}
           {saveStatus === "error" && (
             <span className="marketTextError">
-              Failed to save interest. Please try again.
+              {marketError || "Failed to save interest. Please try again."}
             </span>
           )}
         </div>
 
           {market?.status === "resolved" && (
             <div className="marketResultsPanel">
-              <div className="marketResultsTitle">Market Results</div>
+              <div className="marketResultsHeader">
+                <div className="marketResultsTitle">Market Results</div>
+                <button
+                  type="button"
+                  className="marketBtn marketBtnOutline"
+                  disabled={marketResultsLoading}
+                  onClick={loadMarketResults}
+                >
+                  {marketResultsLoading ? "Refreshing..." : "Refresh Results"}
+                </button>
+              </div>
 
-              {marketResults.length === 0 ? (
+              {marketResultsError ? (
+                <div className="marketTextError">{marketResultsError}</div>
+              ) : marketResults.length === 0 ? (
                 <div className="marketResultsEmpty">No market results recorded yet.</div>
               ) : (
                 <div className="marketResultsList">
                   {marketResults.map((r) => {
                     const who = r.displayName || r.uid;
+                    const wantedPlayer = allPlayers.find(
+                      (p) => String(p.id) === String(r.wantId)
+                    );
+                    const releasedPick = (myRoster || []).find(
+                      (p) => pickPlayerId(p) === String(r.swapOutId)
+                    );
                     const wantName =
-                      (players || []).find((p) => String(p.id) === String(r.wantId))?.name ||
-                      (undrafted || []).find((p) => String(p.id) === String(r.wantId))?.name ||
+                      (wantedPlayer ? pickDisplayName(wantedPlayer) : "") ||
                       r.wantId;
 
                     const swapOutName =
-                      (players || []).find((p) => String(p.id) === String(r.swapOutId))?.name ||
-                      (myRoster || []).find((p) => String(p.playerId) === String(r.swapOutId))?.playerName ||
+                      (releasedPick ? pickDisplayName(releasedPick) : "") ||
                       r.swapOutId;
 
                     const ok = r.ok === true || r.result === "won";
-                    const normalizedReleasedId = r.releasedId || r.swapOutId;
-                    const normalizedGotId = r.gotId || r.wantId;
-                    if (normalizedReleasedId && r.releasedId == null) r.releasedId = normalizedReleasedId;
-                    if (normalizedGotId && r.gotId == null) r.gotId = normalizedGotId;
+                    const releasedId = r.releasedId || r.swapOutId;
+                    const gotId = r.gotId || r.wantId;
                     const fallbackReason =
                       r.reason
                         ? friendlyMarketReason(r.reason)
@@ -882,7 +1080,7 @@ function clearChoice(label, state, setState) {
 
                         {ok ? (
                           <div className="marketResultSwap">
-                            Dropped <b>{r.releasedName || r.releasedId}</b> → Added <b>{r.gotName || r.gotId}</b>
+                            Dropped <b>{r.releasedName || releasedId}</b> → Added <b>{r.gotName || gotId}</b>
                           </div>
                         ) : (
                           <>

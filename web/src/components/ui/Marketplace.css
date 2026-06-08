@@ -1,4 +1,9 @@
 .marketCard {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  box-sizing: border-box;
   padding: 16px;
   border-radius: 18px;
   background: rgba(255, 255, 255, 0.06);
@@ -11,6 +16,10 @@
 
 .marketHeader {
   display: flex;
+  flex-wrap: wrap;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
@@ -79,6 +88,9 @@
 .marketSelect,
 .marketNum {
   width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
   background: rgba(0, 0, 0, 0.35);
   border: 1px solid rgba(255, 255, 255, 0.16);
   color: rgba(255, 255, 255, 0.92);
@@ -172,6 +184,10 @@
 
 /* Available player cards */
 .marketPlayerCard {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
   border-radius: 14px;
   border: 1px solid rgba(255,255,255,0.12);
   background: rgba(0,0,0,0.22);
@@ -180,6 +196,10 @@
 
 /* Interest panels */
 .marketPanel {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
   border-radius: 16px;
   border: 1px solid rgba(255,255,255,0.12);
   background: rgba(0,0,0,0.18);
@@ -209,9 +229,13 @@
 
 /* Search dropdown */
 .marketResults {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
   margin-top: 10px;
   max-height: 14rem;
-  overflow: auto;
+  overflow-y: auto;
+  overflow-x: hidden;
   border-radius: 14px;
   border: 1px solid rgba(255,255,255,0.14);
   background: rgba(0,0,0,0.45);
@@ -219,6 +243,10 @@
 
 .marketResultItem {
   width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  overflow-wrap: anywhere;
   text-align: left;
   border: 0;
   background: transparent;
@@ -275,6 +303,19 @@
 .marketResultsTitle {
   font-weight: 800;
   margin-bottom: 8px;
+}
+
+.marketResultsHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.marketResultsHeader .marketResultsTitle {
+  margin-bottom: 0;
 }
 
 .marketResultsEmpty {
@@ -347,7 +388,17 @@
 
 .marketAvailableList{
   display: grid;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr);
   gap: 10px;
+  overflow-x: hidden;
+}
+
+.marketAvailableList > * {
+  min-width: 0;
+  max-width: 100%;
 }
 
 /* Mobile: make it scroll instead of endless */
@@ -355,6 +406,7 @@
   .marketAvailableList{
     max-height: min(52vh, 360px);
     overflow-y: auto;
+    overflow-x: hidden;
     padding-right: 6px;
     overscroll-behavior: contain;
     -webkit-overflow-scrolling: touch;
@@ -446,6 +498,9 @@
 }
 .marketSuggestionHeader{
   display:flex;
+  width:100%;
+  max-width:100%;
+  min-width:0;
   align-items:flex-end;
   justify-content:space-between;
   gap:12px;
@@ -460,6 +515,9 @@
 
 .marketSearchInput{
   width:100%;
+  max-width:100%;
+  min-width:0;
+  box-sizing:border-box;
   margin-bottom:12px;
 }
 
@@ -493,24 +551,33 @@
 
 .marketPlayerCardTop{
   display:flex;
+  width:100%;
+  max-width:100%;
+  min-width:0;
   align-items:center;
   justify-content:space-between;
   gap:10px;
 }
 
 .marketPlayerInfo{
+  flex:1 1 auto;
   min-width:0;
+  max-width:100%;
+  overflow:hidden;
 }
 
 .marketPlayerInfo .font-medium{
-  overflow:hidden;
-  text-overflow:ellipsis;
-  white-space:nowrap;
+  min-width:0;
+  max-width:100%;
+  overflow-wrap:anywhere;
+  word-break:break-word;
 }
 
 .marketPlayerMeta{
   display:flex;
   flex-wrap:wrap;
+  min-width:0;
+  max-width:100%;
   gap:5px;
   margin-top:3px;
   font-size:.74rem;
@@ -518,8 +585,17 @@
   color:rgba(255,255,255,.62);
 }
 
+.marketPlayerMeta > * {
+  min-width:0;
+  max-width:100%;
+  overflow-wrap:anywhere;
+}
+
 .marketTransferMiniBtn{
   flex:0 0 auto;
+  max-width:100%;
+  min-width:0;
+  box-sizing:border-box;
   border:1px solid rgba(34,211,238,.35);
   background:rgba(34,211,238,.10);
   color:rgba(255,255,255,.92);
@@ -587,6 +663,8 @@
 
   .marketTransferMiniBtn{
     width:100%;
+    max-width:100%;
+    min-width:0;
   }
 
   .marketSelectedTarget{

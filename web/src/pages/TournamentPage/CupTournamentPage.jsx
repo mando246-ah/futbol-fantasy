@@ -572,13 +572,20 @@ function timerStatusOf(stats = {}) {
   ).toUpperCase();
 }
 
+function formatClockSeconds(totalSeconds) {
+  const safe = Math.max(0, Math.floor(Number(totalSeconds) || 0));
+  const mins = Math.floor(safe / 60);
+  const secs = safe % 60;
+  return `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+}
+
 function getLiveTimerDisplay(stats, nowMs) {
   const status = timerStatusOf(stats);
 
   if (!status || status === "NS" || status === "TBD") return null;
 
   if (FINISHED_TIMER_STATUSES.has(status)) {
-    return { main: "FINAL SCORE", extra: "", kind: "final" };
+    return { main: status, extra: "", kind: "final" };
   }
 
   if (status === "HT") {
@@ -599,24 +606,51 @@ function getLiveTimerDisplay(stats, nowMs) {
     stats?.matchElapsed
   );
   const apiExtra = Number(stats?.extra ?? stats?.stoppageTime ?? 0);
-  const safeExtra =
-    Number.isFinite(apiExtra) && apiExtra > 0 && apiExtra <= MAX_DISPLAY_EXTRA_MINUTES
-      ? Math.floor(apiExtra)
-      : 0;
+  const updatedAtMs = Number(
+    stats?.statusUpdatedAtMs ??
+    stats?.timerUpdatedAtMs ??
+    stats?.updatedAtMs
+  );
 
-  let baseMinute = Number.isFinite(apiElapsed) && apiElapsed > 0
-    ? Math.floor(apiElapsed)
-    : null;
+  if (!Number.isFinite(apiElapsed) || apiElapsed <= 0) return null;
 
-  if (status === "1H" && baseMinute != null) baseMinute = Math.min(baseMinute, 45);
-  if (status === "2H" && baseMinute != null) baseMinute = Math.min(baseMinute, 90);
-  if (status === "ET" && baseMinute != null) baseMinute = Math.min(baseMinute, 120);
+  let seconds = Math.floor(apiElapsed * 60);
 
-  if (baseMinute == null) return null;
+  if (
+    LIVE_TIMER_STATUSES.has(status) &&
+    Number.isFinite(updatedAtMs) &&
+    updatedAtMs > 0 &&
+    nowMs > updatedAtMs
+  ) {
+    seconds += Math.floor((nowMs - updatedAtMs) / 1000);
+  }
+
+  let capSeconds = null;
+  if (status === "1H") capSeconds = 45 * 60;
+  if (status === "2H") capSeconds = 90 * 60;
+  if (status === "ET") capSeconds = 120 * 60;
+
+  let extra = "";
+
+  if (capSeconds && seconds > capSeconds) {
+    const computedExtra = Math.min(
+      MAX_DISPLAY_EXTRA_MINUTES,
+      Math.ceil((seconds - capSeconds) / 60)
+    );
+    const safeApiExtra =
+      Number.isFinite(apiExtra) && apiExtra > 0 && apiExtra <= MAX_DISPLAY_EXTRA_MINUTES
+        ? Math.floor(apiExtra)
+        : 0;
+
+    extra = `+${Math.max(computedExtra, safeApiExtra)}`;
+    seconds = capSeconds;
+  } else if (Number.isFinite(apiExtra) && apiExtra > 0 && apiExtra <= MAX_DISPLAY_EXTRA_MINUTES) {
+    extra = `+${Math.floor(apiExtra)}`;
+  }
 
   return {
-    main: `${baseMinute}:00`,
-    extra: safeExtra ? `+${safeExtra}` : "",
+    main: formatClockSeconds(seconds),
+    extra,
     kind: "live",
   };
 }
@@ -631,6 +665,8 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
   useEffect(() => {
     if (!LIVE_TIMER_STATUSES.has(timerStatus)) return;
 
+    setTimerNowMs(Date.now());
+
     const id = window.setInterval(() => {
       setTimerNowMs(Date.now());
     }, 1000);
@@ -641,6 +677,8 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
     stats?.elapsed,
     stats?.extra,
     stats?.statusUpdatedAtMs,
+    stats?.timerUpdatedAtMs,
+    stats?.updatedAtMs,
   ]);
   
   const homeTeamName = firstText(stats?.homeTeamName, stats?.homeName);

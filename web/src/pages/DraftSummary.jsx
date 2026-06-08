@@ -16,6 +16,11 @@ import { doc, setDoc, serverTimestamp } from "firebase/firestore";
 import { httpsCallable } from "firebase/functions";
 import "./DraftSummary.css";
 import FlagIcon from "@/components/FlagIcon";
+import {
+  friendlyErrorMessage,
+  reportClientError,
+} from "../utils/errorReporter";
+import { devError } from "../utils/devLogger";
 
 
 const DEFAULT_DRAFT_PLAN = ["ATT", "ATT", "MID", "MID", "DEF", "DEF", "GK", "SUB", "SUB"];
@@ -26,6 +31,11 @@ const STARTER_RULES = {
   MID: { min: 3, max: 5 },
   ATT: { min: 1, max: 3 },
 };
+const SUBS_LOCK_PRE_MS = 20 * 60 * 1000;
+const SUBS_LOCK_PREGAME_POLL_MS = 3 * 60 * 1000;
+const SUBS_LOCK_LIVE_POLL_MS = 60 * 1000;
+const SUBS_LOCK_IDLE_POLL_MS = 15 * 60 * 1000;
+const SUBS_LOCK_POST_MS = 3 * 60 * 60 * 1000;
 
 
 function memberUidOf(member) {
@@ -118,8 +128,42 @@ function RosterPlayerRow({
 }
 
 
+function roomNextKickoffMs(room = {}) {
+  const candidates = [
+    room?.competitionState?.nextKickoffMs,
+    room?.nextKickoffMs,
+    room?.worldCup?.currentDayStartAtMs,
+    room?.cup?.currentWindowStartAtMs,
+  ];
+
+  for (const value of candidates) {
+    const n = Number(value);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+
+  return null;
+}
+
+function getSubsLockPollDelay({ nextKickoffMs, roomActive, locked, nowMs }) {
+  if (locked || roomActive) return SUBS_LOCK_LIVE_POLL_MS;
+  if (!Number.isFinite(nextKickoffMs) || nextKickoffMs <= 0) {
+    return SUBS_LOCK_IDLE_POLL_MS;
+  }
+
+  if (nowMs < nextKickoffMs - SUBS_LOCK_PRE_MS) {
+    return Math.min(
+      SUBS_LOCK_IDLE_POLL_MS,
+      Math.max(SUBS_LOCK_LIVE_POLL_MS, nextKickoffMs - SUBS_LOCK_PRE_MS - nowMs)
+    );
+  }
+
+  if (nowMs < nextKickoffMs) return SUBS_LOCK_PREGAME_POLL_MS;
+  if (nowMs <= nextKickoffMs + SUBS_LOCK_POST_MS) return SUBS_LOCK_LIVE_POLL_MS;
+  return SUBS_LOCK_IDLE_POLL_MS;
+}
+
 //Subs locked
-function useSubsLock(roomId, enabled) {
+function useSubsLock(roomId, { enabled, nextKickoffMs, roomActive }) {
   const [locked, setLocked] = useState(false);
   const [livePlayers, setLivePlayers] = useState([]);
 
@@ -131,30 +175,79 @@ function useSubsLock(roomId, enabled) {
     }
 
     let cancelled = false;
+    let timerId = null;
+    let inFlight = false;
     const fn = httpsCallable(functions, "getUserLockStatus");
 
+    function schedule(delayMs) {
+      if (cancelled) return;
+      window.clearTimeout(timerId);
+      timerId = window.setTimeout(run, Math.max(SUBS_LOCK_LIVE_POLL_MS, delayMs));
+    }
+
     async function run() {
+      if (cancelled || inFlight) return;
+      if (document.hidden) {
+        schedule(SUBS_LOCK_IDLE_POLL_MS);
+        return;
+      }
+
+      inFlight = true;
       try {
         const res = await fn({ roomId });
         if (cancelled) return;
-        setLocked(!!res.data.locked);
+        const nextLocked = Boolean(res.data.locked);
+        setLocked(nextLocked);
         setLivePlayers(res.data.livePlayers || []);
+        schedule(
+          getSubsLockPollDelay({
+            nextKickoffMs,
+            roomActive,
+            locked: nextLocked,
+            nowMs: Date.now(),
+          })
+        );
       } catch (e) {
         // If the function errors, fail open (don’t lock)
         if (!cancelled) {
           setLocked(false);
           setLivePlayers([]);
+          schedule(SUBS_LOCK_IDLE_POLL_MS);
         }
+      } finally {
+        inFlight = false;
       }
     }
 
-    run();
-    const id = setInterval(run, 30000); // poll every 30s
+    function handleVisibilityChange() {
+      window.clearTimeout(timerId);
+      if (document.hidden) {
+        schedule(SUBS_LOCK_IDLE_POLL_MS);
+      } else {
+        run();
+      }
+    }
+
+    const initialDelay = getSubsLockPollDelay({
+      nextKickoffMs,
+      roomActive,
+      locked: false,
+      nowMs: Date.now(),
+    });
+
+    if (roomActive || initialDelay <= SUBS_LOCK_PREGAME_POLL_MS) {
+      run();
+    } else {
+      schedule(initialDelay);
+    }
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
     return () => {
       cancelled = true;
-      clearInterval(id);
+      window.clearTimeout(timerId);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, [roomId, enabled]);
+  }, [roomId, enabled, nextKickoffMs, roomActive]);
 
   return { locked, livePlayers };
 }
@@ -173,9 +266,10 @@ export default function DraftSummary() {
   //Use team name
   const teamNamesByUid = useTeamNames(roomId);
   const myUid = auth.currentUser?.uid;
- //Trade: user to user
+  //Trade: user to user
   const [room, setRoom] = useState(null);
   const [picks, setPicks] = useState([]);
+  const [tradePanelOpen, setTradePanelOpen] = useState(false);
   const tradeRoomPath = room?.code && room.code !== roomId ? room.code : roomId;
   const [sortMode, setSortMode] = useState("order"); // 'order' | 'alpha'
 
@@ -188,7 +282,7 @@ export default function DraftSummary() {
     );
 
     return onSnapshot(q, (snap) => {
-      setPicks(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+      setPicks(snap.docs.map((d) => ({ ...d.data(), id: d.id, pickDocId: d.id })));
     });
   }, [tradeRoomPath]);
  
@@ -198,52 +292,14 @@ export default function DraftSummary() {
     if(roomId) setLastRoomId(roomId);
   }, [roomId]);
 
+  useEffect(() => setTradePanelOpen(false), [roomId]);
+
   // Live room doc (by current roomId)
   useEffect(() => {
     if (!roomId) return;
     const unsub = watchRoom(roomId, (data) => setRoom(data || null));
     return () => unsub && unsub();
   }, [roomId]);
-
-  /**
-   * Picks stream
-   * Some projects created rooms with a doc ID different from the visible room "code".
-   * This listener will:
-   *   1) Start listening at rooms/{roomId}/picks
-   *   2) If the loaded room contains a different .code, it will rewire to rooms/{room.code}/picks
-   */
-  useEffect(() => {
-    let unsub = null;
-
-    function attach() {
-      if (!tradeRoomPath) return;
-      const picksRef = collection(db, "rooms", tradeRoomPath, "picks");
-      const q = query(picksRef, orderBy("turn", "asc"));
-      unsub = onSnapshot(q, (snap) => {
-        setPicks(snap.docs.map((d) => ({id: d.id, ...d.data()}))); // expects {playerId, playerName, position, uid, displayName, turn, round}
-      });
-    }
-
-    // 1) start with roomId immediately
-    attach(roomId);
-
-    return () => {
-      if (unsub) unsub();
-    };
-  }, [roomId]);
-
-  // If the loaded room has a different .code than roomId, prefer that path for picks
-  useEffect(() => {
-    if (!room?.code || room?.code === roomId) return;
-
-    // Swap listener to the room.code path
-    const picksRef = collection(db, "rooms", tradeRoomPath, "picks");
-    const q = query(picksRef, orderBy("turn", "asc"));
-    const unsub = onSnapshot(q, (snap) => {
-      setPicks(snap.docs.map((d) => ({id: d.id, ...d.data()})));
-    });
-    return () => unsub();
-  }, [room?.code, roomId]);
 
   const members = useMemo(() => (Array.isArray(room?.members) ? room.members : []), [room?.members]);
   const draftOrder = useMemo(
@@ -534,12 +590,24 @@ export default function DraftSummary() {
         </div>
       )}
 
-      <TradePanel
-        roomId={roomId}
-        tradeRoomPath={tradeRoomPath}
-        room={room}
-        picks={picks}
-      />
+      <section className="dsTradeSection">
+        <button
+          type="button"
+          className="dsTradeToggle"
+          aria-expanded={tradePanelOpen}
+          onClick={() => setTradePanelOpen((open) => !open)}
+        >
+          {tradePanelOpen ? "Close Trade Center" : "Open Trade Center"}
+        </button>
+
+        {tradePanelOpen ? (
+          <TradePanel
+            tradeRoomPath={tradeRoomPath}
+            room={room}
+            picks={picks}
+          />
+        ) : null}
+      </section>
     </div>
   );
 }
@@ -562,8 +630,6 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, displayName,
     !!room?.lineupsLocked ||             
     (room?.lineupLockAt && Date.now() >= Number(room.lineupLockAt));
 
-  const { locked: liveLocked, livePlayers } = useSubsLock(lineupRoomId, isMe);
-  const lockedNow = lineupLocked || liveLocked;
   const [editing, setEditing] = useState(false);
   const [input, setInput] = useState(teamName || "");
 
@@ -609,6 +675,16 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, displayName,
     const ref = doc(db, "rooms", lineupRoomId, "lineups", manager.uid);
     return onSnapshot(ref, (snap) => setLineupDoc(snap.exists() ? snap.data() : null));
   }, [lineupRoomId, manager?.uid]);
+
+  const roomActive = ["live", "resolving"].includes(
+    String(room?.competitionState?.weekStatus || "").toLowerCase()
+  );
+  const { locked: liveLocked, livePlayers } = useSubsLock(lineupRoomId, {
+    enabled: Boolean(isMe && room?.started && lineupDoc),
+    nextKickoffMs: roomNextKickoffMs(room),
+    roomActive,
+  });
+  const lockedNow = lineupLocked || liveLocked;
 
   //Helpers for starters useMemo
   // --- Starter formation rules (GK 1, DEF 3–5, MID 3–5, ATT 1–3) ---
@@ -813,16 +889,24 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, displayName,
         { merge: true }
       );
     } catch (e) {
-      console.error("[substitution] failed", {
+      const userMessage = friendlyErrorMessage(
+        e,
+        "Could not save the lineup. Please refresh and try again."
+      );
+      await reportClientError({
         roomId: lineupRoomId,
-        authUid,
-        targetUid,
-        lineupPath: `rooms/${lineupRoomId}/lineups/${targetUid}`,
-        errorCode: e?.code,
-        errorMessage: e?.message,
+        area: "Lineup",
+        action: "saveLineup",
         error: e,
+        userMessage,
+        extra: {
+          targetUid,
+          starterCount: clean.length,
+          benchCount: benchKeys.length,
+        },
       });
-      alert("Substitution failed. Check console for details.");
+      devError("[Lineup] save failed", e);
+      alert(userMessage);
     }
   }
 
@@ -857,16 +941,24 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, displayName,
         benchInId,
       });
     } catch (e) {
-      console.error("[substitution] failed", {
+      const userMessage = friendlyErrorMessage(
+        e,
+        "Could not save that substitution. Please refresh and try again."
+      );
+      await reportClientError({
         roomId: lineupRoomId,
-        authUid,
-        targetUid,
-        lineupPath: `rooms/${lineupRoomId}/lineups/${targetUid}`,
-        errorCode: e?.code,
-        errorMessage: e?.message,
+        area: "Lineup",
+        action: "saveLineupSubstitution",
         error: e,
+        userMessage,
+        extra: {
+          targetUid,
+          starterOutId,
+          benchInId,
+        },
       });
-      alert("Substitution failed. Check console for details.");
+      devError("[Lineup] substitution failed", e);
+      alert(userMessage);
       throw e;
     }
   }

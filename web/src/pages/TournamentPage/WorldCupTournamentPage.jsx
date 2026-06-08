@@ -729,6 +729,48 @@ function isFinalStatusCode(value) {
   return FINAL_STATUS_CODES.has(String(value || "").trim().toUpperCase());
 }
 
+function worldCupResultHasInPlayFixture(dayResult = {}) {
+  if (dayResult?.anyInPlay === true) return true;
+
+  const fixtureStatuses = [
+    ...Object.values(dayResult?.fixtureStatusById || {}),
+    ...(Array.isArray(dayResult?.fixtureCoverage)
+      ? dayResult.fixtureCoverage.map((fixture) =>
+          fixture?.statusShort ||
+          fixture?.fixtureStatus ||
+          fixture?.matchStatus ||
+          ""
+        )
+      : []),
+  ];
+
+  return fixtureStatuses.some(isLiveStatusCode);
+}
+
+function getWorldCupGroupDisplayStatus(dayResult = null, room = {}) {
+  const resultStatus = String(dayResult?.status || "").trim().toLowerCase();
+  const resultWeekStatus = String(dayResult?.weekStatus || "").trim().toLowerCase();
+
+  if (resultStatus === "live") return "live";
+  if (resultStatus === "resolving") return "resolving";
+  if (worldCupResultHasInPlayFixture(dayResult || {})) return "live";
+  if (["final", "complete", "completed"].includes(resultStatus)) return "final";
+  if (resultStatus) return resultStatus;
+  if (resultWeekStatus === "live") return "live";
+  if (resultWeekStatus === "resolving") return "resolving";
+  if (["final", "complete", "completed"].includes(resultWeekStatus)) return "final";
+  if (resultWeekStatus) return resultWeekStatus;
+
+  return String(
+    room?.worldCup?.weekStatus ||
+    room?.worldCup?.status ||
+    room?.competitionState?.weekStatus ||
+    room?.["competitionState.weekStatus"] ||
+    room?.status ||
+    "scheduled"
+  ).trim().toLowerCase();
+}
+
 function isPlayerLiveFromStats(stats = {}) {
   const status =
     stats?.statusShort ||
@@ -865,13 +907,20 @@ function timerStatusOf(stats = {}) {
   ).toUpperCase();
 }
 
+function formatClockSeconds(totalSeconds) {
+  const safe = Math.max(0, Math.floor(Number(totalSeconds) || 0));
+  const mins = Math.floor(safe / 60);
+  const secs = safe % 60;
+  return `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+}
+
 function getLiveTimerDisplay(stats, nowMs) {
   const status = timerStatusOf(stats);
 
   if (!status || status === "NS" || status === "TBD") return null;
 
   if (FINISHED_TIMER_STATUSES.has(status)) {
-    return { main: "FINAL SCORE", extra: "", kind: "final" };
+    return { main: status, extra: "", kind: "final" };
   }
 
   if (status === "HT") {
@@ -892,24 +941,51 @@ function getLiveTimerDisplay(stats, nowMs) {
     stats?.matchElapsed
   );
   const apiExtra = Number(stats?.extra ?? stats?.stoppageTime ?? 0);
-  const safeExtra =
-    Number.isFinite(apiExtra) && apiExtra > 0 && apiExtra <= MAX_DISPLAY_EXTRA_MINUTES
-      ? Math.floor(apiExtra)
-      : 0;
+  const updatedAtMs = Number(
+    stats?.statusUpdatedAtMs ??
+    stats?.timerUpdatedAtMs ??
+    stats?.updatedAtMs
+  );
 
-  let baseMinute = Number.isFinite(apiElapsed) && apiElapsed > 0
-    ? Math.floor(apiElapsed)
-    : null;
+  if (!Number.isFinite(apiElapsed) || apiElapsed <= 0) return null;
 
-  if (status === "1H" && baseMinute != null) baseMinute = Math.min(baseMinute, 45);
-  if (status === "2H" && baseMinute != null) baseMinute = Math.min(baseMinute, 90);
-  if (status === "ET" && baseMinute != null) baseMinute = Math.min(baseMinute, 120);
+  let seconds = Math.floor(apiElapsed * 60);
 
-  if (baseMinute == null) return null;
+  if (
+    LIVE_TIMER_STATUSES.has(status) &&
+    Number.isFinite(updatedAtMs) &&
+    updatedAtMs > 0 &&
+    nowMs > updatedAtMs
+  ) {
+    seconds += Math.floor((nowMs - updatedAtMs) / 1000);
+  }
+
+  let capSeconds = null;
+  if (status === "1H") capSeconds = 45 * 60;
+  if (status === "2H") capSeconds = 90 * 60;
+  if (status === "ET") capSeconds = 120 * 60;
+
+  let extra = "";
+
+  if (capSeconds && seconds > capSeconds) {
+    const computedExtra = Math.min(
+      MAX_DISPLAY_EXTRA_MINUTES,
+      Math.ceil((seconds - capSeconds) / 60)
+    );
+    const safeApiExtra =
+      Number.isFinite(apiExtra) && apiExtra > 0 && apiExtra <= MAX_DISPLAY_EXTRA_MINUTES
+        ? Math.floor(apiExtra)
+        : 0;
+
+    extra = `+${Math.max(computedExtra, safeApiExtra)}`;
+    seconds = capSeconds;
+  } else if (Number.isFinite(apiExtra) && apiExtra > 0 && apiExtra <= MAX_DISPLAY_EXTRA_MINUTES) {
+    extra = `+${Math.floor(apiExtra)}`;
+  }
 
   return {
-    main: `${baseMinute}:00`,
-    extra: safeExtra ? `+${safeExtra}` : "",
+    main: formatClockSeconds(seconds),
+    extra,
     kind: "live",
   };
 }
@@ -924,6 +1000,8 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
   useEffect(() => {
     if (!LIVE_TIMER_STATUSES.has(timerStatus)) return;
 
+    setTimerNowMs(Date.now());
+
     const id = window.setInterval(() => {
       setTimerNowMs(Date.now());
     }, 1000);
@@ -934,6 +1012,8 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
     stats?.elapsed,
     stats?.extra,
     stats?.statusUpdatedAtMs,
+    stats?.timerUpdatedAtMs,
+    stats?.updatedAtMs,
   ]);
   
   const homeTeamName = firstText(stats?.homeTeamName, stats?.homeName);
@@ -1647,13 +1727,28 @@ export default function WorldCupTournamentPage() {
               ) || null
             : null)
         : null;
+    const activeDayResult = isWorldCupGroupRoom
+      ? normalizedWorldCupDisplayDayResults.find((dayResult) => {
+          const resultStatus = String(
+            dayResult?.status || dayResult?.weekStatus || ""
+          ).trim().toLowerCase();
+
+          return (
+            resultStatus === "live" ||
+            resultStatus === "resolving" ||
+            worldCupResultHasInPlayFixture(dayResult)
+          );
+        }) || null
+      : null;
+
     const statusRaw =
       isWorldCupGroupRoom
-        ? (
-            room?.competitionState?.weekStatus ||
-            currentDayResult?.status ||
-            latestDayResult?.status ||
-            "scheduled"
+        ? getWorldCupGroupDisplayStatus(
+            activeDayResult ||
+              normalizedCurrentDayResult ||
+              currentDayResult ||
+              latestDayResult,
+            room
           )
         : (
             cupDoc?.status ||
@@ -1661,17 +1756,17 @@ export default function WorldCupTournamentPage() {
             room?.["competitionState.weekStatus"] ||
             "scheduled"
           );
+    
 
     const statusLowerRaw = String(statusRaw).toLowerCase();
 
-    // UI rule:
-    // Backend "scheduled" means the engine is sleeping/waiting.
-    // User-facing label should match regular season and show IDLE.
-    const statusLower = statusLowerRaw === "scheduled" ? "idle" : statusLowerRaw;
+    const statusLower = statusLowerRaw;
 
     const isLive = statusLower === "live";
     const isResolving = statusLower === "resolving";
     const isError = statusLower === "error";
+    const isFinalStatus = statusLower === "final";
+    const isScheduled = statusLower === "scheduled";
 
     const statusClass = isLive
       ? "live"
@@ -1679,6 +1774,8 @@ export default function WorldCupTournamentPage() {
       ? "resolving"
       : isError
       ? "error"
+      : isScheduled
+      ? "scheduled"
       : "idle";
 
     const statusLabel = isLive
@@ -1687,6 +1784,10 @@ export default function WorldCupTournamentPage() {
       ? "RESOLVING"
       : isError
       ? "ERROR"
+      : isFinalStatus
+      ? "FINAL"
+      : isScheduled
+      ? "SCHEDULED"
       : "IDLE";
 
     // --- Live-style header timing (match TournamentPage feel) ---

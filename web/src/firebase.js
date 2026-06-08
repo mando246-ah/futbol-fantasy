@@ -26,7 +26,7 @@ import {
   updateDoc,
   onSnapshot,
 } from "firebase/firestore";
-import { collection, getDocs, query, where, addDoc } from "firebase/firestore";
+import { collection, getDocs } from "firebase/firestore";
 import { writeBatch } from "firebase/firestore";
 import { getFunctions } from "firebase/functions";
 import { getStorage, ref, uploadBytes, getDownloadURL } from "firebase/storage";
@@ -1340,18 +1340,91 @@ async function getDisplayNameFallback(tx, uid) {
 // Trades (user-to-user)
 // -------------------------
 
+function tradePickOwnerUid(p = {}) {
+  return String(
+    p.uid ||
+    p.ownerUid ||
+    p.userId ||
+    p.managerUid ||
+    p.pickedByUid ||
+    p.pickedBy ||
+    p.owner?.uid ||
+    p.owner?.id ||
+    ""
+  ).trim();
+}
+
+function tradePickPlayerId(p = {}, fallback = "") {
+  return String(
+    p.playerId ||
+    p.pid ||
+    p.apiPlayerId ||
+    p.player?.id ||
+    p.id ||
+    fallback ||
+    ""
+  ).trim();
+}
+
+function tradePickDisplayName(p = {}) {
+  return (
+    p.name ||
+    p.playerName ||
+    p.fullName ||
+    p.displayName ||
+    p.player?.name ||
+    "Unknown"
+  );
+}
+
+function normalizeTradeSideEntry(p = {}) {
+  return {
+    pickId: String(p.pickId || p.pickDocId || p.docId || "").trim(),
+    playerId: tradePickPlayerId(p),
+    playerName: tradePickDisplayName(p),
+    name: tradePickDisplayName(p),
+    position: p.position || p.pos || "SUB",
+    teamName: p.teamName || p.team?.name || "",
+    teamLogo: p.teamLogo || p.team?.logo || "",
+    nationality: p.nationality || p.country || "",
+  };
+}
+
 export async function createTradeOffer({ roomId, toUid, give, receive }) {
   const user = auth.currentUser;
   if (!user) throw new Error("Not signed in");
   if (!roomId || !toUid) throw new Error("Missing roomId/toUid");
+  if (String(toUid) === String(user.uid)) throw new Error("Choose another manager");
 
   // up to 2 each side, must be equal count (keeps roster sizes consistent)
-  const giveArr = Array.isArray(give) ? give.filter(Boolean).slice(0, 2) : [];
-  const recvArr = Array.isArray(receive) ? receive.filter(Boolean).slice(0, 2) : [];
+  const giveArr = Array.isArray(give)
+    ? give.filter(Boolean).slice(0, 2).map(normalizeTradeSideEntry)
+    : [];
+  const recvArr = Array.isArray(receive)
+    ? receive.filter(Boolean).slice(0, 2).map(normalizeTradeSideEntry)
+    : [];
 
   if (giveArr.length < 1) throw new Error("Select at least 1 player you give");
   if (recvArr.length < 1) throw new Error("Select at least 1 player you receive");
   if (giveArr.length !== recvArr.length) throw new Error("Trade must be 1-for-1 or 2-for-2");
+  if (giveArr.some((p) => !p.pickId || !p.playerId)) {
+    throw new Error("Could not resolve one of your selected picks");
+  }
+  if (recvArr.some((p) => !p.pickId || !p.playerId)) {
+    throw new Error("Could not resolve one of the requested picks");
+  }
+  if (new Set(giveArr.map((p) => p.pickId)).size !== giveArr.length) {
+    throw new Error("The same give pick cannot be selected twice");
+  }
+  if (new Set(recvArr.map((p) => p.pickId)).size !== recvArr.length) {
+    throw new Error("The same receive pick cannot be selected twice");
+  }
+  if (
+    new Set([...giveArr, ...recvArr].map((p) => p.pickId)).size !==
+    giveArr.length + recvArr.length
+  ) {
+    throw new Error("A pick cannot appear on both sides of a trade");
+  }
 
   // Resolve names (nice UX)
   const roomRef = doc(db, "rooms", roomId);
@@ -1359,30 +1432,72 @@ export async function createTradeOffer({ roomId, toUid, give, receive }) {
   if (!roomSnap.exists()) throw new Error("Room not found");
   const room = roomSnap.data();
   const members = Array.isArray(room.members) ? room.members : [];
-  const nameByUid = new Map(members.map(m => [m.uid, m.displayName]));
+  const nameByUid = new Map(
+    members
+      .map((member) => {
+        const uid = String(
+          typeof member === "string"
+            ? member
+            : member?.uid || member?.userId || member?.id || ""
+        ).trim();
+        return [uid, typeof member === "string" ? member : member?.displayName || member?.name || uid];
+      })
+      .filter(([uid]) => Boolean(uid))
+  );
 
   const profile = await getUserProfile(user.uid).catch(() => null);
   const fromName = profile?.displayName || nameByUid.get(user.uid) || user.displayName || user.email || "Manager";
   const toName = nameByUid.get(toUid) || "Manager";
 
   const tradesRef = collection(db, "rooms", roomId, "trades");
-  const docRef = await addDoc(tradesRef, {
-    fromUid: user.uid,
-    fromName,
-    toUid,
-    toName,
+  const tradeRef = doc(tradesRef);
+  const giveRefs = giveArr.map((p) => doc(db, "rooms", roomId, "picks", p.pickId));
+  const receiveRefs = recvArr.map((p) => doc(db, "rooms", roomId, "picks", p.pickId));
 
-    give: giveArr.map(p => ({ playerId: String(p.playerId), playerName: p.playerName, position: p.position || "SUB" })),
-    receive: recvArr.map(p => ({ playerId: String(p.playerId), playerName: p.playerName, position: p.position || "SUB" })),
+  await runTransaction(db, async (tx) => {
+    const pickSnaps = await Promise.all(
+      [...giveRefs, ...receiveRefs].map((pickRef) => tx.get(pickRef))
+    );
+    const giveSnaps = pickSnaps.slice(0, giveRefs.length);
+    const receiveSnaps = pickSnaps.slice(giveRefs.length);
 
-    status: "pending",           // pending | accepted | rejected | canceled | completed
-    createdAt: serverTimestamp(),
-    updatedAt: serverTimestamp(),
-    respondedAt: null,
-    appliedAt: null,
+    giveSnaps.forEach((snap, index) => {
+      const data = snap.exists() ? snap.data() || {} : {};
+      if (
+        !snap.exists() ||
+        tradePickOwnerUid(data) !== String(user.uid) ||
+        tradePickPlayerId(data, snap.id) !== giveArr[index].playerId
+      ) {
+        throw new Error("You no longer own one of the offered players");
+      }
+    });
+    receiveSnaps.forEach((snap, index) => {
+      const data = snap.exists() ? snap.data() || {} : {};
+      if (
+        !snap.exists() ||
+        tradePickOwnerUid(data) !== String(toUid) ||
+        tradePickPlayerId(data, snap.id) !== recvArr[index].playerId
+      ) {
+        throw new Error("The selected manager no longer owns one of the requested players");
+      }
+    });
+
+    tx.set(tradeRef, {
+      fromUid: user.uid,
+      fromName,
+      toUid: String(toUid),
+      toName,
+      give: giveArr,
+      receive: recvArr,
+      status: "pending",
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+      respondedAt: null,
+      appliedAt: null,
+    });
   });
 
-  return { ok: true, tradeId: docRef.id };
+  return { ok: true, tradeId: tradeRef.id };
 }
 
 export async function respondToTradeOffer({ roomId, tradeId, action }) {
@@ -1390,32 +1505,36 @@ export async function respondToTradeOffer({ roomId, tradeId, action }) {
   if (!user) throw new Error("Not signed in");
 
   const tradeRef = doc(db, "rooms", roomId, "trades", tradeId);
-  const snap = await getDoc(tradeRef);
-  if (!snap.exists()) throw new Error("Trade not found");
-  const t = snap.data();
+  return runTransaction(db, async (tx) => {
+    const snap = await tx.get(tradeRef);
+    if (!snap.exists()) throw new Error("Trade not found");
+    const trade = snap.data() || {};
 
-  if (t.status !== "pending") return { ok: true, status: t.status };
+    if (trade.status !== "pending") {
+      return { ok: true, status: trade.status };
+    }
 
-  if (action === "cancel") {
-    if (user.uid !== t.fromUid) throw new Error("Only the sender can cancel");
-    await updateDoc(tradeRef, { status: "canceled", updatedAt: serverTimestamp(), respondedAt: serverTimestamp() });
-    return { ok: true, status: "canceled" };
-  }
+    let nextStatus = "";
+    if (action === "cancel") {
+      if (user.uid !== trade.fromUid) throw new Error("Only the sender can cancel");
+      nextStatus = "canceled";
+    } else if (action === "reject") {
+      if (user.uid !== trade.toUid) throw new Error("Only the recipient can reject");
+      nextStatus = "rejected";
+    } else if (action === "accept") {
+      if (user.uid !== trade.toUid) throw new Error("Only the recipient can accept");
+      nextStatus = "accepted";
+    } else {
+      throw new Error("Unknown action");
+    }
 
-  if (action === "reject") {
-    if (user.uid !== t.toUid) throw new Error("Only the recipient can reject");
-    await updateDoc(tradeRef, { status: "rejected", updatedAt: serverTimestamp(), respondedAt: serverTimestamp() });
-    return { ok: true, status: "rejected" };
-  }
-
-  if (action === "accept") {
-    if (user.uid !== t.toUid) throw new Error("Only the recipient can accept");
-    // Host will apply the swap and mark completed
-    await updateDoc(tradeRef, { status: "accepted", updatedAt: serverTimestamp(), respondedAt: serverTimestamp() });
-    return { ok: true, status: "accepted" };
-  }
-
-  throw new Error("Unknown action");
+    tx.update(tradeRef, {
+      status: nextStatus,
+      updatedAt: serverTimestamp(),
+      respondedAt: serverTimestamp(),
+    });
+    return { ok: true, status: nextStatus };
+  });
 }
 
 // Host-only: apply an accepted trade by swapping pick docs
@@ -1424,41 +1543,42 @@ export async function applyAcceptedTrade({ roomId, tradeId }) {
   if (!user) throw new Error("Not signed in");
 
   const roomRef = doc(db, "rooms", roomId);
-  const roomSnap = await getDoc(roomRef);
-  if (!roomSnap.exists()) throw new Error("Room not found");
-  const room = roomSnap.data();
-  if (room.hostUid !== user.uid) throw new Error("Only host can apply trades");
-
   const tradeRef = doc(db, "rooms", roomId, "trades", tradeId);
   const tradeSnap = await getDoc(tradeRef);
   if (!tradeSnap.exists()) throw new Error("Trade not found");
-  const t = tradeSnap.data();
+  const trade = tradeSnap.data() || {};
 
-  if (t.status !== "accepted") return { ok: true, status: t.status };
-  if (t.appliedAt) return { ok: true, status: "completed" };
+  if (trade.status !== "accepted") return { ok: true, status: trade.status };
+  if (trade.appliedAt) return { ok: true, status: "completed" };
 
-  const give = Array.isArray(t.give) ? t.give : [];
-  const receive = Array.isArray(t.receive) ? t.receive : [];
+  const give = Array.isArray(trade.give) ? trade.give.map(normalizeTradeSideEntry) : [];
+  const receive = Array.isArray(trade.receive) ? trade.receive.map(normalizeTradeSideEntry) : [];
   if (give.length < 1 || give.length > 2) throw new Error("Invalid give length");
   if (receive.length !== give.length) throw new Error("Trade must be 1-for-1 or 2-for-2");
 
   const picksRef = collection(db, "rooms", roomId, "picks");
-
-  // Fetch rosters by uid (single equality filter = easy, no index headaches)
-  const [fromRosterSnap, toRosterSnap] = await Promise.all([
-    getDocs(query(picksRef, where("uid", "==", t.fromUid))),
-    getDocs(query(picksRef, where("uid", "==", t.toUid))),
-  ]);
-
-  const fromDocs = fromRosterSnap.docs.map(d => ({ id: d.id, ref: d.ref, ...d.data() }));
-  const toDocs = toRosterSnap.docs.map(d => ({ id: d.id, ref: d.ref, ...d.data() }));
-
-  // Find pick docs that currently hold the players being traded
-  const fromPickRefs = give.map(g =>
-    fromDocs.find(p => String(p.playerId) === String(g.playerId))
+  const picksSnap = await getDocs(picksRef);
+  const pickDocs = picksSnap.docs.map((pickDoc) => ({
+    id: pickDoc.id,
+    ref: pickDoc.ref,
+    ...(pickDoc.data() || {}),
+  }));
+  const findTradePick = (entry, expectedOwnerUid) => {
+    if (entry.pickId) {
+      const exact = pickDocs.find((pick) => pick.id === entry.pickId);
+      if (exact) return exact;
+    }
+    return pickDocs.find(
+      (pick) =>
+        tradePickOwnerUid(pick) === String(expectedOwnerUid) &&
+        tradePickPlayerId(pick, pick.id) === String(entry.playerId)
+    );
+  };
+  const fromPickRefs = give.map((entry) =>
+    findTradePick(entry, trade.fromUid)
   );
-  const toPickRefs = receive.map(r =>
-    toDocs.find(p => String(p.playerId) === String(r.playerId))
+  const toPickRefs = receive.map((entry) =>
+    findTradePick(entry, trade.toUid)
   );
 
   if (fromPickRefs.some(x => !x) || toPickRefs.some(x => !x)) {
@@ -1468,28 +1588,71 @@ export async function applyAcceptedTrade({ roomId, tradeId }) {
   }
 
   await runTransaction(db, async (tx) => {
-    const freshTrade = await tx.get(tradeRef);
+    const refs = [
+      roomRef,
+      tradeRef,
+      ...fromPickRefs.map((pick) => pick.ref),
+      ...toPickRefs.map((pick) => pick.ref),
+    ];
+    const snapshots = await Promise.all(refs.map((ref) => tx.get(ref)));
+    const freshRoom = snapshots[0];
+    const freshTrade = snapshots[1];
+    const freshFromPicks = snapshots.slice(2, 2 + fromPickRefs.length);
+    const freshToPicks = snapshots.slice(2 + fromPickRefs.length);
+
+    if (!freshRoom.exists()) throw new Error("Room not found");
+    if (freshRoom.data()?.hostUid !== user.uid) {
+      throw new Error("Only host can apply trades");
+    }
     if (!freshTrade.exists()) throw new Error("Trade missing");
-    const ft = freshTrade.data();
-    if (ft.status !== "accepted" || ft.appliedAt) return;
+    const freshTradeData = freshTrade.data() || {};
+    if (freshTradeData.status !== "accepted" || freshTradeData.appliedAt) return;
+
+    freshFromPicks.forEach((snap, index) => {
+      const data = snap.exists() ? snap.data() || {} : {};
+      if (
+        !snap.exists() ||
+        tradePickOwnerUid(data) !== String(freshTradeData.fromUid) ||
+        tradePickPlayerId(data, snap.id) !== String(give[index].playerId)
+      ) {
+        throw new Error("Sender no longer owns an offered player");
+      }
+    });
+    freshToPicks.forEach((snap, index) => {
+      const data = snap.exists() ? snap.data() || {} : {};
+      if (
+        !snap.exists() ||
+        tradePickOwnerUid(data) !== String(freshTradeData.toUid) ||
+        tradePickPlayerId(data, snap.id) !== String(receive[index].playerId)
+      ) {
+        throw new Error("Receiver no longer owns a requested player");
+      }
+    });
 
     // Pairwise swap: give[i] <-> receive[i]
     for (let i = 0; i < give.length; i++) {
       const fromPick = fromPickRefs[i];
       const toPick = toPickRefs[i];
 
-      // swap fields
       tx.update(fromPick.ref, {
         playerId: String(receive[i].playerId),
-        playerName: receive[i].playerName,
+        name: tradePickDisplayName(receive[i]),
+        playerName: tradePickDisplayName(receive[i]),
         position: receive[i].position || "SUB",
+        teamName: receive[i].teamName || "",
+        teamLogo: receive[i].teamLogo || "",
+        nationality: receive[i].nationality || "",
         updatedAt: serverTimestamp(),
       });
 
       tx.update(toPick.ref, {
         playerId: String(give[i].playerId),
-        playerName: give[i].playerName,
+        name: tradePickDisplayName(give[i]),
+        playerName: tradePickDisplayName(give[i]),
         position: give[i].position || "SUB",
+        teamName: give[i].teamName || "",
+        teamLogo: give[i].teamLogo || "",
+        nationality: give[i].nationality || "",
         updatedAt: serverTimestamp(),
       });
     }

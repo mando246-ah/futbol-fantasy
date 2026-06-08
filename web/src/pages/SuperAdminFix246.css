@@ -120,6 +120,315 @@
   font-weight: 800;
 }
 
+.ownerErrorCenter {
+  margin-bottom: 22px;
+  padding: 20px;
+  border: 1px solid rgba(248, 113, 113, 0.24);
+  border-radius: 24px;
+  background:
+    radial-gradient(circle at 100% 0%, rgba(248, 113, 113, 0.1), transparent 34%),
+    rgba(15, 23, 42, 0.76);
+  box-shadow: 0 22px 60px rgba(0, 0, 0, 0.24);
+}
+
+.ownerErrorCenterHeader,
+.ownerErrorCardTop,
+.ownerErrorActions,
+.ownerErrorPills,
+.ownerErrorCenterControls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.ownerErrorCenterHeader,
+.ownerErrorCardTop {
+  justify-content: space-between;
+}
+
+.ownerErrorCenterHeader h2 {
+  margin: 0;
+  font-size: clamp(1.5rem, 3vw, 2.2rem);
+}
+
+.ownerErrorCenterHeader p {
+  margin: 5px 0 0;
+  color: rgba(226, 232, 240, 0.66);
+}
+
+.ownerErrorCenterEyebrow {
+  color: #fca5a5 !important;
+  font-size: 0.72rem;
+  font-weight: 900;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.ownerErrorCenterCount {
+  flex: 0 0 auto;
+  padding: 7px 11px;
+  border: 1px solid rgba(248, 113, 113, 0.28);
+  border-radius: 999px;
+  color: #fecaca;
+  background: rgba(127, 29, 29, 0.24);
+  font-size: 0.78rem;
+  font-weight: 900;
+}
+
+.ownerErrorCenterControls {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.ownerErrorMode,
+.ownerErrorControlBtn {
+  padding: 7px 11px;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 900;
+}
+
+.ownerErrorMode {
+  color: #cbd5e1;
+  background: rgba(51, 65, 85, 0.48);
+}
+
+.ownerErrorMode--live {
+  border-color: rgba(74, 222, 128, 0.36);
+  color: #bbf7d0;
+  background: rgba(20, 83, 45, 0.34);
+}
+
+.ownerErrorControlBtn {
+  color: rgba(255, 255, 255, 0.9);
+  background: rgba(30, 41, 59, 0.78);
+  cursor: pointer;
+}
+
+.ownerErrorControlBtn--stop {
+  border-color: rgba(248, 113, 113, 0.36);
+  color: #fecaca;
+  background: rgba(127, 29, 29, 0.32);
+}
+
+.ownerErrorControlBtn:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+
+.ownerErrorFilters {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+  margin: 18px 0;
+}
+
+.ownerErrorFilters label {
+  min-width: 0;
+  color: rgba(226, 232, 240, 0.68);
+  font-size: 0.72rem;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.ownerErrorFilters select,
+.ownerErrorFilters input {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  margin-top: 5px;
+  padding: 9px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 11px;
+  color: rgba(255, 255, 255, 0.9);
+  background: rgba(2, 6, 23, 0.72);
+  box-sizing: border-box;
+}
+
+.ownerErrorList {
+  display: grid;
+  gap: 12px;
+}
+
+.ownerErrorCard {
+  min-width: 0;
+  padding: 15px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 17px;
+  background: rgba(2, 6, 23, 0.5);
+}
+
+.ownerErrorCardTop {
+  flex-wrap: wrap;
+}
+
+.ownerErrorCardTop time {
+  color: rgba(226, 232, 240, 0.58);
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+.ownerErrorPills,
+.ownerErrorActions {
+  flex-wrap: wrap;
+}
+
+.ownerErrorPill {
+  padding: 5px 8px;
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  border-radius: 999px;
+  color: #cbd5e1;
+  background: rgba(51, 65, 85, 0.48);
+  font-size: 0.68rem;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.ownerErrorPill--critical,
+.ownerErrorPill--error {
+  border-color: rgba(248, 113, 113, 0.4);
+  color: #fecaca;
+  background: rgba(127, 29, 29, 0.38);
+}
+
+.ownerErrorPill--warning {
+  border-color: rgba(251, 191, 36, 0.4);
+  color: #fde68a;
+  background: rgba(120, 53, 15, 0.34);
+}
+
+.ownerErrorPill--info {
+  border-color: rgba(56, 189, 248, 0.38);
+  color: #bae6fd;
+  background: rgba(7, 89, 133, 0.28);
+}
+
+.ownerErrorPill--status-resolved {
+  border-color: rgba(74, 222, 128, 0.35);
+  color: #bbf7d0;
+  background: rgba(20, 83, 45, 0.3);
+}
+
+.ownerErrorPill--status-ignored {
+  opacity: 0.62;
+}
+
+.ownerErrorCardGrid,
+.ownerErrorDetailsGrid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px 14px;
+  margin-top: 12px;
+  color: rgba(226, 232, 240, 0.7);
+  font-size: 0.78rem;
+}
+
+.ownerErrorTechnical,
+.ownerErrorUserMessage {
+  overflow-wrap: anywhere;
+}
+
+.ownerErrorTechnical {
+  margin: 12px 0 0;
+  color: #fecaca;
+  font-weight: 800;
+}
+
+.ownerErrorUserMessage {
+  margin: 7px 0 0;
+  color: rgba(226, 232, 240, 0.76);
+  font-size: 0.84rem;
+}
+
+.ownerErrorDetails {
+  margin-top: 12px;
+  color: rgba(226, 232, 240, 0.75);
+}
+
+.ownerErrorDetails summary {
+  cursor: pointer;
+  font-weight: 900;
+}
+
+.ownerErrorDetails pre {
+  max-width: 100%;
+  max-height: 260px;
+  margin: 10px 0 0;
+  padding: 11px;
+  overflow: auto;
+  border-radius: 12px;
+  color: #dbeafe;
+  background: rgba(0, 0, 0, 0.35);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.ownerErrorAgent {
+  overflow-wrap: anywhere;
+  font-size: 0.72rem;
+  opacity: 0.62;
+}
+
+.ownerErrorActions {
+  margin-top: 13px;
+}
+
+.ownerErrorActions button {
+  padding: 8px 11px;
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  border-radius: 10px;
+  color: rgba(255, 255, 255, 0.88);
+  background: rgba(30, 41, 59, 0.72);
+  cursor: pointer;
+  font-size: 0.75rem;
+  font-weight: 900;
+}
+
+.ownerErrorActions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.ownerErrorEmpty {
+  padding: 22px;
+  border: 1px dashed rgba(148, 163, 184, 0.24);
+  border-radius: 15px;
+  color: rgba(226, 232, 240, 0.58);
+  text-align: center;
+}
+
+@media (max-width: 900px) {
+  .ownerErrorFilters {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 560px) {
+  .ownerErrorCenter {
+    padding: 14px;
+  }
+
+  .ownerErrorCenterHeader {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .ownerErrorCenterControls {
+    justify-content: flex-start;
+  }
+
+  .ownerErrorFilters {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .ownerErrorActions button {
+    flex: 1 1 140px;
+  }
+}
+
 .ownerGroups {
   display: grid;
   gap: 16px;

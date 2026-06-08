@@ -208,6 +208,25 @@
   color: rgba(255,255,255,0.55);
 }
 
+.vrPage .dsTradeSection {
+  margin-top: 20px;
+}
+
+.vrPage .dsTradeToggle {
+  width: 100%;
+  border: 1px solid rgba(56, 189, 248, 0.34);
+  border-radius: 14px;
+  padding: 11px 16px;
+  background: rgba(14, 116, 144, 0.18);
+  color: #e0f2fe;
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.vrPage .dsTradeToggle:hover {
+  background: rgba(14, 116, 144, 0.28);
+}
+
 /* ===== Roster polish ===== */
 .vrPage .rosterManagersGrid {
   display: grid;

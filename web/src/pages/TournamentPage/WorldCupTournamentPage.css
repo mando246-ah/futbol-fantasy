@@ -190,3 +190,62 @@
     height: 21px;
   }
 }
+/* World Cup leaderboard column alignment */
+.worldcup-page .tpBoard {
+  width: 100%;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.worldcup-page .tpBoardHead,
+.worldcup-page .tpBoardRow {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) minmax(64px, 88px);
+  align-items: center;
+  column-gap: 10px;
+  width: 100%;
+  max-width: 100%;
+}
+
+.worldcup-page .tpBoardHead span:nth-child(3),
+.worldcup-page .tpBoardRow span:nth-child(3) {
+  justify-self: end;
+  text-align: right;
+}
+
+.worldcup-page .tpBoardHead span:nth-child(2),
+.worldcup-page .tpBoardRow span:nth-child(2) {
+  min-width: 0;
+}
+
+.worldcup-page .tpBoardRow .tpUserChip {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.worldcup-page .tpBoardRow .tpUserText {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.worldcup-page .tpBoardRow .tpUserName,
+.worldcup-page .tpBoardRow .tpUserTeam {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Slightly tighter on phones */
+@media (max-width: 640px) {
+  .worldcup-page .tpBoardHead,
+  .worldcup-page .tpBoardRow {
+    grid-template-columns: 26px minmax(0, 1fr) minmax(54px, 72px);
+    column-gap: 8px;
+  }
+
+  .worldcup-page .tpBoardHead span:nth-child(3) {
+    font-size: 0.68rem;
+    line-height: 1.15;
+  }
+}

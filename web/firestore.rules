@@ -4,6 +4,9 @@ service cloud.firestore {
 
     /* Helpers */
     function authed() { return request.auth != null; }
+    function isOwner() {
+      return authed() && request.auth.uid == "WspA06q2KlQr7KUq2PP58FMyIJk2";
+    }
     function roomDoc(roomId) { return get(/databases/$(database)/documents/rooms/$(roomId)); }
     function isHostUid(roomId) {
       return authed() && roomDoc(roomId).data.hostUid == request.auth.uid;
@@ -52,6 +55,11 @@ service cloud.firestore {
       allow read: if false;
       allow create, update: if request.auth != null && request.auth.uid == uid;
       allow delete: if request.auth != null && request.auth.uid == uid;
+    }
+
+    match /adminErrors/{errorId} {
+      allow read, update: if isOwner();
+      allow create, delete: if false;
     }
 
     /*user changing team name*/
