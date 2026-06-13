@@ -32,6 +32,29 @@
 
 .tradeCardTitle{ font-weight: 900; margin-bottom: 10px; }
 
+.tradeHistoryHeader{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.tradeHistoryHeader .tradeCardTitle{ margin-bottom: 0; }
+
+.tradeHistoryHelp{
+  margin-top: 8px;
+  color: rgba(226, 232, 240, 0.66);
+  font-size: 12px;
+}
+
+.tradeHistoryError{
+  margin-top: 10px;
+  color: rgba(254, 202, 202, 0.95);
+  font-size: 12px;
+  font-weight: 700;
+}
+
 .tradeLabel{ display: block; font-size: 12px; opacity: 0.75; margin: 8px 0 6px; }
 
 .tradeSelect{
@@ -131,6 +154,7 @@
 .tradeStatus--accepted{ border-color: rgba(59,130,246,0.40); background: rgba(59,130,246,0.14); }
 .tradeStatus--rejected{ border-color: rgba(239,68,68,0.40); background: rgba(239,68,68,0.14); }
 .tradeStatus--canceled{ border-color: rgba(148,163,184,0.35); background: rgba(148,163,184,0.14); }
+.tradeStatus--cancelled{ border-color: rgba(148,163,184,0.35); background: rgba(148,163,184,0.14); }
 .tradeStatus--completed{ border-color: rgba(34,197,94,0.40); background: rgba(34,197,94,0.14); }
 
 .tradeHostNote{ margin-top: 10px; font-size: 12px; opacity: 0.75; }

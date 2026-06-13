@@ -1,0 +1,327 @@
+.roomChatRoot {
+  position: fixed;
+  right: 22px;
+  bottom: 22px;
+  z-index: 1200;
+  pointer-events: none;
+}
+
+.roomChatBubble,
+.roomChatPanel {
+  pointer-events: auto;
+}
+
+.roomChatBubble {
+  display: grid;
+  place-items: center;
+  width: 54px;
+  height: 54px;
+  margin-left: auto;
+  border: 1px solid rgba(116, 255, 159, 0.55);
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at 32% 24%, rgba(95, 255, 151, 0.28), transparent 42%),
+    linear-gradient(145deg, #123f2d, #071d18);
+  color: #eafff1;
+  box-shadow:
+    0 16px 36px rgba(0, 0, 0, 0.38),
+    0 0 0 5px rgba(46, 213, 115, 0.08);
+  cursor: pointer;
+  transition: transform 160ms ease, border-color 160ms ease;
+}
+
+.roomChatBubble:hover {
+  transform: translateY(-2px);
+  border-color: rgba(116, 255, 159, 0.9);
+}
+
+.roomChatBubble--open {
+  background: #17342a;
+}
+
+.roomChatPanel {
+  display: flex;
+  flex-direction: column;
+  width: min(360px, calc(100vw - 32px));
+  height: min(590px, calc(100vh - 120px));
+  margin-bottom: 12px;
+  overflow: hidden;
+  border: 1px solid rgba(132, 165, 151, 0.28);
+  border-radius: 20px;
+  background:
+    linear-gradient(180deg, rgba(15, 39, 31, 0.99), rgba(7, 20, 17, 0.995));
+  color: #f4fff7;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.48);
+}
+
+.roomChatHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 15px;
+  border-bottom: 1px solid rgba(148, 180, 165, 0.17);
+  background: rgba(29, 75, 55, 0.35);
+}
+
+.roomChatHeader strong,
+.roomChatHeader span {
+  display: block;
+}
+
+.roomChatHeader strong {
+  font-size: 1rem;
+  letter-spacing: 0.02em;
+}
+
+.roomChatHeader span {
+  margin-top: 2px;
+  color: rgba(224, 244, 232, 0.6);
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+
+.roomChatIconButton,
+.roomChatPreviewRemove {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  border: 0;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.08);
+  color: #f4fff7;
+  cursor: pointer;
+}
+
+.roomChatIconButton {
+  width: 34px;
+  height: 34px;
+}
+
+.roomChatMessages {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 14px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.roomChatEmpty {
+  display: grid;
+  min-height: 120px;
+  place-items: center;
+  padding: 18px;
+  color: rgba(224, 244, 232, 0.58);
+  text-align: center;
+  font-size: 0.84rem;
+}
+
+.roomChatMessage {
+  width: fit-content;
+  max-width: 88%;
+  margin: 0 0 10px;
+  padding: 9px 11px;
+  overflow: hidden;
+  border: 1px solid rgba(148, 180, 165, 0.16);
+  border-radius: 13px 13px 13px 4px;
+  background: rgba(255, 255, 255, 0.065);
+}
+
+.roomChatMessage--mine {
+  margin-left: auto;
+  border-color: rgba(91, 230, 137, 0.22);
+  border-radius: 13px 13px 4px 13px;
+  background: rgba(35, 126, 82, 0.3);
+}
+
+.roomChatMessageMeta {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+  margin-bottom: 4px;
+}
+
+.roomChatMessageMeta strong {
+  min-width: 0;
+  overflow: hidden;
+  color: #9af3b8;
+  font-size: 0.72rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.roomChatMessageMeta time {
+  flex: 0 0 auto;
+  color: rgba(224, 244, 232, 0.48);
+  font-size: 0.65rem;
+}
+
+.roomChatMessageText {
+  overflow-wrap: anywhere;
+  color: rgba(248, 255, 250, 0.94);
+  font-size: 0.86rem;
+  line-height: 1.4;
+  white-space: pre-wrap;
+}
+
+.roomChatMedia {
+  display: block;
+  width: 100%;
+  max-height: 280px;
+  margin-top: 7px;
+  border-radius: 9px;
+  object-fit: contain;
+  background: rgba(0, 0, 0, 0.24);
+}
+
+.roomChatComposer {
+  flex: 0 0 auto;
+  padding: 11px;
+  border-top: 1px solid rgba(148, 180, 165, 0.17);
+  background: rgba(3, 14, 11, 0.62);
+}
+
+.roomChatPreview {
+  position: relative;
+  width: 74px;
+  height: 60px;
+  margin-bottom: 8px;
+}
+
+.roomChatPreview img {
+  width: 100%;
+  height: 100%;
+  border: 1px solid rgba(148, 180, 165, 0.24);
+  border-radius: 9px;
+  object-fit: cover;
+}
+
+.roomChatPreviewRemove {
+  position: absolute;
+  top: -7px;
+  right: -7px;
+  width: 24px;
+  height: 24px;
+  background: #8f2f3e;
+}
+
+.roomChatInput {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  min-height: 54px;
+  max-height: 110px;
+  box-sizing: border-box;
+  resize: vertical;
+  border: 1px solid rgba(148, 180, 165, 0.24);
+  border-radius: 11px;
+  outline: none;
+  background: rgba(255, 255, 255, 0.07);
+  color: #f4fff7;
+  padding: 9px 10px;
+  font: inherit;
+  font-size: 16px;
+}
+
+.roomChatInput:focus {
+  border-color: rgba(91, 230, 137, 0.58);
+  box-shadow: 0 0 0 3px rgba(46, 213, 115, 0.09);
+}
+
+.roomChatInput::placeholder {
+  color: rgba(224, 244, 232, 0.4);
+}
+
+.roomChatComposerActions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  margin-top: 8px;
+}
+
+.roomChatAttachButton,
+.roomChatSendButton {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 34px;
+  border-radius: 9px;
+  font-size: 0.75rem;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.roomChatAttachButton {
+  padding: 0 9px;
+  border: 1px solid rgba(148, 180, 165, 0.22);
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(244, 255, 247, 0.86);
+}
+
+.roomChatAttachButton input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.roomChatCount {
+  margin-left: auto;
+  color: rgba(224, 244, 232, 0.42);
+  font-size: 0.66rem;
+}
+
+.roomChatSendButton {
+  padding: 0 11px;
+  border: 1px solid rgba(93, 236, 143, 0.4);
+  background: linear-gradient(135deg, #238152, #185e40);
+  color: #f5fff8;
+}
+
+.roomChatSendButton:disabled,
+.roomChatAttachButton:has(input:disabled) {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.roomChatError {
+  margin-bottom: 7px;
+  padding: 7px 8px;
+  border: 1px solid rgba(255, 107, 129, 0.35);
+  border-radius: 8px;
+  background: rgba(118, 31, 46, 0.28);
+  color: #ffd2da;
+  overflow-wrap: anywhere;
+  font-size: 0.72rem;
+}
+
+@media (max-width: 720px) {
+  .roomChatRoot {
+    right: 12px;
+    bottom: 76px;
+  }
+
+  .roomChatPanel {
+    width: calc(100vw - 24px);
+    max-width: calc(100vw - 24px);
+    height: min(68vh, 570px);
+    max-height: calc(100vh - 150px);
+  }
+
+  .roomChatMessage {
+    max-width: 92%;
+  }
+}
+
+@media (max-height: 620px) {
+  .roomChatPanel {
+    height: calc(100vh - 112px);
+  }
+}

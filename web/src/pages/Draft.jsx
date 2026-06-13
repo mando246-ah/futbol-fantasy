@@ -45,10 +45,15 @@ import {
   reportClientError,
 } from "../utils/errorReporter";
 import { devError, devWarn } from "../utils/devLogger";
+import {
+  matchesNormalizedSearch,
+  matchesPlayerSearch,
+  normalizeSearchText,
+} from "../utils/playerSearch";
 
 
 // ----- Config -----
-const TURN_SECONDS = 45;
+const TURN_SECONDS = 60;
 // TODO: enforce this in backend/Firebase rules too before public launch.
 const MAX_ROOM_MANAGERS = 10;
 
@@ -193,12 +198,14 @@ function isUserRoomMember(room, uid) {
 
 function formatWhen(ms) {
   if (!ms) return "";
-  return new Date(ms).toLocaleString([], {
+
+  return new Date(ms).toLocaleString("en-US", {
     weekday: "short",
     month: "short",
     day: "numeric",
     hour: "numeric",
     minute: "2-digit",
+    hour12: true,
   });
 }
 
@@ -209,10 +216,29 @@ function secondsUntil(ms, nowMs) {
 
 function countdownStr(sec) {
   if (sec == null) return "";
-  const s = Math.max(0, sec);
-  const m = Math.floor(s / 60);
-  const r = s % 60;
-  return `${m}:${String(r).padStart(2, "0")}`;
+
+  const totalSeconds = Math.max(0, Math.floor(Number(sec || 0)));
+
+  const days = Math.floor(totalSeconds / 86400);
+  const hours = Math.floor((totalSeconds % 86400) / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  const pad = (n) => String(n).padStart(2, "0");
+
+  if (days > 0) {
+    return `${days}d ${pad(hours)}h ${pad(minutes)}m ${pad(seconds)}s`;
+  }
+
+  if (hours > 0) {
+    return `${pad(hours)}h ${pad(minutes)}m ${pad(seconds)}s`;
+  }
+
+  if (minutes > 0) {
+    return `${minutes}m ${pad(seconds)}s`;
+  }
+
+  return `${pad(seconds)}s`;
 }
 
 // --- All Picks: stable manager colors ---
@@ -401,6 +427,36 @@ export default function DraftWithPresence() {
     [room?.totalRounds, room?.members, room?.turnSeconds, members]
   );
   const roomIsFull = managerCount >= MAX_ROOM_MANAGERS;
+  const draftManagerCount =
+    (Array.isArray(room?.draftOrder) && room.draftOrder.length) ||
+    managerCount;
+  const draftTotalRounds = Number(room?.totalRounds ?? DRAFT_SIZE_LEAGUE);
+  const draftTotalPicks =
+    draftManagerCount > 0 && Number.isFinite(draftTotalRounds)
+      ? draftManagerCount * draftTotalRounds
+      : 0;
+  const currentTurnIndex = Number.isFinite(Number(room?.turnIndex))
+    ? Number(room.turnIndex)
+    : 0;
+  const isDraftComplete =
+    room?.draftComplete === true ||
+    room?.draftCompleted === true ||
+    String(room?.status || "").toLowerCase() === "draft_complete" ||
+    String(room?.draftStatus || "").toLowerCase() === "complete" ||
+    (draftTotalPicks > 0 && currentTurnIndex >= draftTotalPicks);
+  const isDraftActivelyRunning = Boolean(room?.started) && !isDraftComplete;
+  const rawCurrentRound =
+    draftManagerCount > 0
+      ? Math.floor(currentTurnIndex / draftManagerCount) + 1
+      : 1;
+  const displayCurrentRound =
+    draftTotalRounds > 0
+      ? Math.min(rawCurrentRound, draftTotalRounds)
+      : rawCurrentRound;
+  const displayRoundOrderIndex =
+    draftTotalRounds > 0
+      ? Math.max(0, Math.min(rawCurrentRound - 1, draftTotalRounds - 1))
+      : Math.max(0, rawCurrentRound - 1);
 
   const memberUids = useMemo(() => {
     const ids = new Set();
@@ -544,9 +600,31 @@ useEffect(() => {
 
   //Clock tick
   useEffect(() => {
-    const id = setInterval(() => setClockNow(Date.now()), 1000);
-    return () => clearInterval(id);
-  }, []);
+    const shouldRunScheduledClock =
+      Boolean(room?.startAt || room?.scheduledStartAtMs) &&
+      !room?.started &&
+      !isDraftComplete;
+
+    if (!shouldRunScheduledClock) return undefined;
+
+    const tick = () => {
+      const next = Date.now();
+      setClockNow((previous) =>
+        Math.floor(previous / 1000) === Math.floor(next / 1000)
+          ? previous
+          : next
+      );
+    };
+
+    tick();
+    const id = window.setInterval(tick, 1000);
+    return () => window.clearInterval(id);
+  }, [
+    room?.startAt,
+    room?.scheduledStartAtMs,
+    room?.started,
+    isDraftComplete,
+  ]);
 
   // Watch room doc (members live in the room doc's `members` array)
   useEffect(() => {
@@ -921,7 +999,9 @@ useEffect(() => {
 
   // Flip to started when scheduled time arrives
   useEffect(() => {
-    if (!room?.startAt || room.started || !roomId) return;
+    if (!room?.startAt || room.started || !roomId || isDraftComplete) {
+      return undefined;
+    }
     const targetMillis =
       typeof room.startAt === "number"
         ? room.startAt
@@ -945,7 +1025,14 @@ useEffect(() => {
       }
     }, 1000);
     return () => clearInterval(tid);
-  }, [room?.startAt, room?.started, roomId]);
+  }, [
+    room?.startAt,
+    room?.started,
+    room?.hostUid,
+    roomId,
+    user?.uid,
+    isDraftComplete,
+  ]);
 
   //Drafted players
   const draftedByPlayerId = useMemo(() => {
@@ -1003,11 +1090,6 @@ useEffect(() => {
   }, [room]);
 
 
-  const currentRoundIdx = useMemo(() => {
-    const n = room?.draftOrder?.length || room?.members?.length || 1;
-    return Math.floor((room?.turnIndex ?? 0) / n);
-  }, [room?.turnIndex, room?.members?.length, room?.draftOrder?.length]);
-
   const requiredSlot = null;
 
   const [posFilterState, searchState] = [posFilter, search]; // just to keep deps short
@@ -1016,33 +1098,64 @@ useEffect(() => {
 
   // All Picks filtering + suggestions (player OR manager)
   const filteredPicks = useMemo(() => {
-    const q = allPicksQuery.trim().toLowerCase();
+    const q = allPicksQuery.trim();
 
     return (picks || []).filter((p) => {
       if (allPicksPos !== "ALL" && p.position !== allPicksPos) return false;
       if (!q) return true;
 
-      const player = String(p.playerName || "").toLowerCase();
-      const manager = String(managerLabel(p.uid, p.displayName || "")).toLowerCase();
-      const team = String(p.teamName || "").toLowerCase();
-      const country = String(p.nationality || "").toLowerCase();
+      const pickedPlayer =
+        p?.player && typeof p.player === "object"
+          ? {
+              ...p,
+              ...p.player,
+              playerName:
+                p.playerName || p.player?.playerName || p.player?.name || "",
+            }
+          : p;
+      const managerSearchText = [
+        managerLabel(p.uid, p.displayName || ""),
+        p.managerName,
+        p.ownerName,
+        p.fantasyTeamName,
+      ]
+        .filter(Boolean)
+        .join(" ");
 
-      return player.includes(q) || manager.includes(q) || team.includes(q) || country.includes(q);
+      return (
+        matchesPlayerSearch(pickedPlayer, q) ||
+        matchesNormalizedSearch(managerSearchText, q)
+      );
     });
   }, [picks, allPicksQuery, allPicksPos, profilesByUid, memberLabelByUid]);
 
   const allPicksSuggestions = useMemo(() => {
-    const q = allPicksQuery.trim().toLowerCase();
+    const q = normalizeSearchText(allPicksQuery);
     if (!q) return [];
 
     const set = new Set();
 
     for (const p of picks || []) {
-      const player = String(p.playerName || "");
+      const pickedPlayer =
+        p?.player && typeof p.player === "object"
+          ? {
+              ...p,
+              ...p.player,
+              playerName:
+                p.playerName || p.player?.playerName || p.player?.name || "",
+            }
+          : p;
+      const player = String(
+        p.playerName ||
+          p.player?.playerName ||
+          p.player?.name ||
+          p.name ||
+          ""
+      );
       const manager = String(managerLabel(p.uid, p.displayName || ""));
 
-      if (player.toLowerCase().includes(q)) set.add(player);
-      if (manager.toLowerCase().includes(q)) set.add(manager);
+      if (matchesPlayerSearch(pickedPlayer, q) && player) set.add(player);
+      if (matchesNormalizedSearch(manager, q)) set.add(manager);
       if (set.size >= 10) break; // cap suggestions
     }
 
@@ -1081,16 +1194,21 @@ useEffect(() => {
     return Object.values(myDraftPositionCounts).reduce((sum, n) => sum + Number(n || 0), 0);
   }, [myDraftPositionCounts]);
 
-  // If you have poolPlayers from Firestore, use them; otherwise fall back to MOCK_PLAYERS
-  const ALL_PLAYERS = (poolPlayers?.length ? poolPlayers : MOCK_PLAYERS).map((p) => ({
-    ...p,
-    id: String(p.id),
-    name: p.fullName ?? p.name ?? "",
-    position: normalizeDraftPos(p.position),
-  }));
+  // Marketplace still needs the complete pool after the draft, but normalization
+  // should only rerun when the Firestore player snapshot changes.
+  const ALL_PLAYERS = useMemo(
+    () =>
+      (poolPlayers?.length ? poolPlayers : MOCK_PLAYERS).map((p) => ({
+        ...p,
+        id: String(p.id),
+        name: p.fullName ?? p.name ?? "",
+        position: normalizeDraftPos(p.position),
+      })),
+    [poolPlayers]
+  );
 
   const availablePlayers = useMemo(() => {
-    const q = searchState.trim().toLowerCase();
+    const q = searchState.trim();
 
       // show nothing until user types
       if (!q) return [];
@@ -1098,14 +1216,7 @@ useEffect(() => {
       return ALL_PLAYERS
         .filter((p) => {
           if (posFilterState !== "ALL" && p.position !== posFilterState) return false;
-          
-          // Multi-field search
-          const matchName = (p.name || "").toLowerCase().includes(q);
-          const matchTeam = (p.teamName || "").toLowerCase().includes(q);
-          const matchCountry = (p.nationality || "").toLowerCase().includes(q);
-
-          if (!matchName && !matchTeam && !matchCountry) return false;
-          return true;
+          return matchesPlayerSearch(p, q);
         })
         // push drafted players to the bottom so undrafted show first
         .sort((a, b) => {
@@ -1121,15 +1232,10 @@ useEffect(() => {
   }, [ALL_PLAYERS, posFilterState, searchState, pickedIds]);
 
 
-  const canPickNow = room?.started && currentPicker?.uid === user?.uid;
-
-  const isDraftComplete = useMemo(() => {
-    const n = room?.draftOrder?.length || room?.members?.length || 0;
-    if (!n) return false;
-    const totalRounds = room?.totalRounds ?? DRAFT_SIZE_LEAGUE;
-    const ti = Number.isFinite(room?.turnIndex) ? room.turnIndex : 0;
-    return ti >= totalRounds * n;
-  }, [room]);
+  const currentPickerUid = currentPicker ? memberUidOf(currentPicker) : "";
+  const canPickNow =
+    isDraftActivelyRunning &&
+    currentPickerUid === String(user?.uid || "");
 
   async function pickPlayer(player) {
     if (!canPickNow) return alert(!room?.started ? "Draft not started" : "Not your turn");
@@ -1169,58 +1275,89 @@ useEffect(() => {
 
   // Countdown
   useEffect(() => {
-    triedAutoRef.current = false;
+    if (!isDraftActivelyRunning) {
+      setTimeLeft(draftTurnSeconds);
+      return undefined;
+    }
+
     const deadlineMs = typeof room?.turnDeadlineAt === "number" ? room.turnDeadlineAt : null;
     const tick = () => {
-      if (!deadlineMs) return setTimeLeft(getDraftTurnSeconds(room));
-      setTimeLeft(Math.max(0, Math.ceil((deadlineMs - Date.now()) / 1000)));
+      if (!deadlineMs) return setTimeLeft(draftTurnSeconds);
+      const next = Math.max(0, Math.ceil((deadlineMs - Date.now()) / 1000));
+      setTimeLeft((previous) => (previous === next ? previous : next));
     };
     tick();
-    const id = setInterval(tick, 250);
-    return () => clearInterval(id);
-  }, [room?.turnDeadlineAt, room?.turnIndex, room?.turnSeconds]);
+    const id = window.setInterval(tick, 1000);
+    return () => window.clearInterval(id);
+  }, [
+    isDraftActivelyRunning,
+    room?.turnDeadlineAt,
+    room?.turnIndex,
+    draftTurnSeconds,
+  ]);
 
   const autoPickPool = useMemo(() => {
+    if (!isDraftActivelyRunning) return [];
     return ALL_PLAYERS.filter((p) => !pickedIds.has(p.id));
-  }, [ALL_PLAYERS, pickedIds]);
+  }, [ALL_PLAYERS, pickedIds, isDraftActivelyRunning]);
+
+  const autoPickPoolRef = useRef(autoPickPool);
+  useEffect(() => {
+    autoPickPoolRef.current = autoPickPool;
+  }, [autoPickPool]);
+
+  useEffect(() => {
+    triedAutoRef.current = false;
+  }, [
+    isDraftActivelyRunning,
+    room?.turnIndex,
+    room?.turnDeadlineAt,
+  ]);
 
   // Host auto-pick when timer hits 0
   useEffect(() => {
-    if (!room?.started || isDraftComplete) return;
-
+    if (!roomId || !isDraftActivelyRunning) return undefined;
     if (user?.uid !== room?.hostUid) return;
 
     const deadlineMs = typeof room?.turnDeadlineAt === "number" ? room.turnDeadlineAt : null;
-    if (!deadlineMs) return;
+    if (!Number.isFinite(deadlineMs) || deadlineMs <= 0) return;
 
-    // prevent early fire if host clock is ahead
-    if (Date.now() < deadlineMs) return;
+    let cancelled = false;
+    let retryTimeoutId = null;
 
-    if (triedAutoRef.current) return;
+    const attemptAutoPick = async (allowRetry) => {
+      if (cancelled || triedAutoRef.current) return;
 
-    const candidates = autoPickPool.map((p) => ({
-      id: p.id,
-      name: p.name,
-      position: normalizeDraftPos(p.position),
-      apiPlayerId: p.apiPlayerId ?? p.id,
-      apiTeamId: p.apiTeamId ?? p.teamId,
-      teamName: p.teamName ?? "",
-      nationality: p.nationality ?? "",
-    }));
+      const candidates = autoPickPoolRef.current.map((p) => ({
+        id: p.id,
+        name: p.name,
+        position: normalizeDraftPos(p.position),
+        apiPlayerId: p.apiPlayerId ?? p.id,
+        apiTeamId: p.apiTeamId ?? p.teamId,
+        teamName: p.teamName ?? "",
+        nationality: p.nationality ?? "",
+      }));
 
-    if (!candidates.length) return;
+      if (!candidates.length) return;
 
-    triedAutoRef.current = true;
+      triedAutoRef.current = true;
 
-    (async () => {
       try {
         await callAutoPick({ roomId, candidates });
       } catch (e) {
         if (String(e?.message || "").includes("Deadline not reached")) {
           triedAutoRef.current = false;
           devWarn("[Draft] auto-pick deadline not reached");
+
+          if (allowRetry && !cancelled) {
+            retryTimeoutId = window.setTimeout(
+              () => attemptAutoPick(false),
+              1000
+            );
+          }
           return;
         }
+
         const userMessage = friendlyErrorMessage(
           e,
           "Auto-pick could not complete. The host can refresh and try again."
@@ -1238,8 +1375,29 @@ useEffect(() => {
         });
         devWarn("[Draft] auto-pick failed", e);
       }
-    })();
-  }, [room?.started, room?.turnDeadlineAt, isDraftComplete, user?.uid, room?.hostUid, roomId, autoPickPool]);
+    };
+
+    const delayMs = Math.max(0, deadlineMs - Date.now() + 500);
+    const deadlineTimeoutId = window.setTimeout(
+      () => attemptAutoPick(true),
+      delayMs
+    );
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(deadlineTimeoutId);
+      if (retryTimeoutId != null) {
+        window.clearTimeout(retryTimeoutId);
+      }
+    };
+  }, [
+    isDraftActivelyRunning,
+    room?.turnIndex,
+    room?.turnDeadlineAt,
+    user?.uid,
+    room?.hostUid,
+    roomId,
+  ]);
 
 
   const currentName = currentPicker ? displayNameForMember(currentPicker, "—") : "—";
@@ -1318,6 +1476,8 @@ useEffect(() => {
           </div>
           <div className="flex items-center gap-2">
             <input
+              id="draft-room-key"
+              name="roomKey"
               className="ff-input roomKeyInput"
               placeholder="Enter room key"
               value={roomKeyInput}
@@ -1383,6 +1543,8 @@ useEffect(() => {
                       ) : (
                         <div className="flex items-center gap-2 flex-wrap">
                           <input
+                            id="draft-name"
+                            name="draftName"
                             value={draftNameInput}
                             onChange={(e) => setDraftNameInput(e.target.value)}
                             className="w-56 max-w-full rounded border border-line/60 bg-white px-2 py-1 text-lg  tracking-widest text-slate-900"
@@ -1571,7 +1733,7 @@ useEffect(() => {
               <div className="rounded-2xl border border-slate-200 p-4 bg-white shadow-sm">
                 <div className="font-semibold">{room.name} — {room.code || roomId}</div>
                 <div className="text-sm opacity-70">
-                  Round: <b>{Math.floor((room.turnIndex ?? 0) / (room.members?.length || 1)) + 1}</b> / {room.totalRounds ?? DRAFT_SIZE_LEAGUE}
+                  Round: <b>{displayCurrentRound}</b> / {draftTotalRounds}
                 </div>
                 {competitionLabel ? (
                   <div className="draftCompetitionMeta">
@@ -1632,7 +1794,7 @@ useEffect(() => {
                 )}
               </div>
 
-              {/* Player Pool (only current picker sees it) */}
+              {/* Everyone can browse; only the current picker can draft. */}
               {isDraftComplete ? (
                 <div className="rounded-2xl border border-emerald-300 p-4 bg-emerald-50 shadow-sm md:col-span-1 grid place-items-center">
                   <div className="text-center">
@@ -1640,7 +1802,7 @@ useEffect(() => {
                     <div className="text-sm opacity-70">All rounds are finished.</div>
                   </div>
                 </div>
-              ) : currentPicker?.uid === user?.uid ? (
+              ) : (
                 <PlayerPool
                   availablePlayers={availablePlayers}
                   loadingPlayers={loadingPlayers}
@@ -1650,16 +1812,8 @@ useEffect(() => {
                   setSearch={setSearch}
                   onPick={pickPlayer}
                   requiredSlot={requiredSlot}
+                  canPickNow={canPickNow}
                 />
-              ) : (
-                <div className="rounded-2xl border border-slate-200 p-4 bg-white shadow-sm md:col-span-1 grid place-items-center">
-                  <div className="text-center">
-                    <div className="font-semibold">Waiting for pick…</div>
-                    <div className="text-sm opacity-70">
-                      {displayNameForMember(currentPicker, "Someone")} is on the clock.
-                    </div>
-                  </div>
-                </div>
               )}
 
               {/* Draft Order + Picks */}
@@ -1667,10 +1821,11 @@ useEffect(() => {
                 <div className="font-semibold mb-2">Draft Order (Frozen)</div>
                 <ol className="text-sm space-y-1 list-decimal list-inside">
                   {(room.draftOrder || []).map((m, idx) => {
-                    const isCurrent = currentPicker?.uid === m.uid;
+                    const memberUid = memberUidOf(m);
+                    const isCurrent = currentPickerUid === memberUid;
                     return (
                       <li
-                        key={m.uid}
+                        key={memberUid || idx}
                         className={`border rounded px-2 py-1 ${isCurrent ? "bg-yellow-50 border-yellow-300" : ""}`}
                         title={isCurrent ? "On the clock" : ""}
                       >
@@ -1685,14 +1840,15 @@ useEffect(() => {
 
                 <div className="mt-4">
                   <div className="font-semibold mb-1">
-                    This Round Order (Round {Math.floor((room.turnIndex ?? 0) / (room.members?.length || 1)) + 1})
+                    This Round Order (Round {displayCurrentRound})
                   </div>
                   <ol className="text-sm space-y-1 list-decimal list-inside">
-                    {roundOrder(room.draftOrder || room.members || [], Math.floor((room.turnIndex ?? 0) / (room.members?.length || 1)))
+                    {roundOrder(room.draftOrder || room.members || [], displayRoundOrderIndex)
                       .map((m, idx) => {
-                        const isCurrent = currentPicker?.uid === m.uid;
+                        const memberUid = memberUidOf(m);
+                        const isCurrent = currentPickerUid === memberUid;
                         return (
-                          <li key={m.uid} className={`border rounded px-2 py-1 ${isCurrent ? "bg-green-50 border-green-300" : ""}`}>
+                          <li key={memberUid || idx} className={`border rounded px-2 py-1 ${isCurrent ? "bg-green-50 border-green-300" : ""}`}>
                             #{idx + 1} — {displayNameForMember(m)} {isCurrent ? " • on the clock" : ""}
                           </li>
                         );
@@ -1705,6 +1861,8 @@ useEffect(() => {
 
                   <div className="allPicksControls">
                     <select
+                      id="draft-all-picks-position"
+                      name="allPicksPosition"
                       className="allPicksSelect"
                       value={allPicksPos}
                       onChange={(e) => setAllPicksPos(e.target.value)}
@@ -1717,6 +1875,8 @@ useEffect(() => {
                     </select>
 
                     <input
+                      id="draft-all-picks-search"
+                      name="allPicksSearch"
                       className="allPicksSearch"
                       placeholder="Search player or manager…"
                       value={allPicksQuery}
@@ -1814,6 +1974,8 @@ function HostControls({
   return (
     <div className="flex flex-col sm:flex-row sm:items-center gap-2">
       <input
+        id="draft-scheduled-start"
+        name="draftScheduledStart"
         type="datetime-local"
         className="ff-input draftScheduleInput"
         value={startLocalISO}
@@ -1851,13 +2013,33 @@ function PlayerPool({
   setSearch,
   onPick,
   requiredSlot,
+  canPickNow,
 }) {
   return (
-    <div className="rounded-2xl border border-slate-200 p-4 bg-white shadow-sm md:col-span-1">
+    <div
+      className={`draftPlayerPoolPanel md:col-span-1 ${
+        canPickNow
+          ? "draftPlayerPoolPanel--active"
+          : "draftPlayerPoolPanel--waiting"
+      }`}
+    >
       <div className="font-semibold mb-2">Player Pool</div>
+      <div
+        className={`draftPlayerPoolHelper ${
+          canPickNow
+            ? "draftPlayerPoolHelper--active"
+            : "draftPlayerPoolHelper--waiting"
+        }`}
+      >
+        {canPickNow
+          ? "You're on the clock — make your pick!"
+          : "You can search players now. You can pick when it is your turn."}
+      </div>
 
       <div className="flex flex-wrap items-center gap-2 mb-3">
         <select
+          id="draft-player-position"
+          name="playerPosition"
           className="border px-3 py-2 rounded"
           value={posFilter}
           onChange={(e) => setPosFilter(e.target.value)}
@@ -1870,6 +2052,8 @@ function PlayerPool({
         </select>
 
         <input
+          id="draft-player-search"
+          name="playerSearch"
           className="draftPlayerSearchInput flex-1 min-w-[200px]"
           placeholder="Search player, club, nation, or position…"
           value={search}
@@ -1887,12 +2071,14 @@ function PlayerPool({
               const blocked =
                 requiredSlot && requiredSlot !== "SUB" && pl.position !== requiredSlot;
 
-              const disabled = drafted || blocked;
+              const disabled = drafted || blocked || !canPickNow;
 
               const title = drafted
                 ? "Already drafted"
                 : blocked
                 ? `This round requires ${requiredSlot}`
+                : !canPickNow
+                ? "Wait for your turn"
                 : "Pick";
 
               return (
@@ -1933,7 +2119,7 @@ function PlayerPool({
                     }}
                     title={title}
                   >
-                    {drafted ? "Taken" : "Pick"}
+                    {drafted ? "Taken" : canPickNow ? "Pick" : "Wait for your turn"}
                   </button>
                 </div>
               );
@@ -2350,6 +2536,8 @@ function LeagueSelector({ roomId, room, isHost, poolCount, setSeedingPlayers }) 
                 Tournament format
               </label>
               <select
+                id="draft-world-cup-format"
+                name="worldCupFormat"
                 className="mt-2 w-full rounded-lg border border-sky-300/30 bg-slate-950 px-3 py-3 text-sm font-bold text-white"
                 value={worldCupPhaseChoice}
                 onChange={(event) => setWorldCupPhaseChoice(event.target.value)}
@@ -2393,6 +2581,8 @@ function LeagueSelector({ roomId, room, isHost, poolCount, setSeedingPlayers }) 
       ) : (
         <>
           <input
+            id="draft-competition-search"
+            name="competitionSearch"
             className="draftCompetitionSearchInput"
             placeholder="Search leagues/cups…"
             value={queryText}
@@ -2402,6 +2592,8 @@ function LeagueSelector({ roomId, room, isHost, poolCount, setSeedingPlayers }) 
 
           <div className="mt-2 flex gap-2 items-center">
             <input
+              id="draft-competition-season"
+              name="competitionSeason"
               className="draftSeasonInput"
               value={season}
               onChange={(e) => setSeason(e.target.value)}

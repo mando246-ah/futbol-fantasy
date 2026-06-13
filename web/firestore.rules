@@ -22,6 +22,20 @@ service cloud.firestore {
       return authed() &&
         exists(/databases/$(database)/documents/users/$(request.auth.uid)/rooms/$(roomId));
     }
+    function canReadRoomHistory(roomId) {
+      return authed() && (
+        isHostUid(roomId) ||
+        isRoomMember(roomId) ||
+        inUserRoom(roomId)
+      );
+    }
+    function isWorldCupDailyRoom(roomId) {
+      let room = roomDoc(roomId).data;
+      return room.get('engineType', '') == 'worldCupDaily'
+        || room.get('worldCup', {}).get('engineType', '') == 'worldCupDaily'
+        || room.get('worldCupPhase', '') == 'group'
+        || room.get('competitionState', {}).get('phaseLabel', '') == 'WorldCupGroup';
+    }
 
 
     /* users */
@@ -70,7 +84,11 @@ service cloud.firestore {
     }
     match /rooms/{roomId}/lineups/{uid} {
       allow read: if authed();
-      allow create, update: if authed() && (request.auth.uid == uid || isHostUid(roomId));
+      // World Cup daily lineups must go through callable validation so appearance
+      // locks cannot be bypassed with a direct client write.
+      allow create, update: if authed()
+        && !isWorldCupDailyRoom(roomId)
+        && (request.auth.uid == uid || isHostUid(roomId));
       allow delete: if false;
     }
 
@@ -112,6 +130,19 @@ service cloud.firestore {
           allow read: if authed();
           allow write: if false;
         }
+
+        // World Cup Group Stage daily windows/results.
+        // Written only by Cloud Functions/Admin SDK.
+        match /days/{dayId} {
+          allow read: if canReadRoomHistory(roomId);
+          allow write: if false;
+        }
+
+        match /dayResults/{dayId} {
+          allow read: if canReadRoomHistory(roomId);
+          allow write: if false;
+        }
+
         match /standings/{docId} {
           allow read: if authed();
           allow write: if false;
@@ -175,7 +206,100 @@ service cloud.firestore {
           );
       }
 
-      // players pool — host writes, all read
+      // Temporary room chat: latest messages are client-readable only by members.
+      match /chatMessages/{messageId} {
+        allow read: if isRoomMember(roomId);
+
+        allow create: if isRoomMember(roomId)
+          && request.resource.data.keys().hasAll([
+            'roomId',
+            'uid',
+            'displayName',
+            'text',
+            'mediaType',
+            'mediaUrl',
+            'mediaPath',
+            'mediaMime',
+            'mediaSize',
+            'createdAt',
+            'createdAtMs',
+            'deleted'
+          ])
+          && request.resource.data.keys().hasOnly([
+            'roomId',
+            'uid',
+            'displayName',
+            'text',
+            'mediaType',
+            'mediaUrl',
+            'mediaPath',
+            'mediaMime',
+            'mediaSize',
+            'createdAt',
+            'createdAtMs',
+            'deleted'
+          ])
+          && request.resource.data.roomId == roomId
+          && request.resource.data.uid == request.auth.uid
+          && request.resource.data.displayName is string
+          && request.resource.data.displayName.size() <= 120
+          && request.resource.data.text is string
+          && request.resource.data.text.size() <= 500
+          && (
+              request.resource.data.text.size() > 0 ||
+              request.resource.data.mediaType != null
+            )
+          && (
+            request.resource.data.mediaType == null ||
+            request.resource.data.mediaType == 'image' ||
+            request.resource.data.mediaType == 'gif'
+          )
+          && request.resource.data.mediaUrl is string
+          && request.resource.data.mediaUrl.size() <= 2000
+          && request.resource.data.mediaPath is string
+          && request.resource.data.mediaPath.size() <= 500
+          && request.resource.data.mediaMime is string
+          && request.resource.data.mediaMime.size() <= 40
+          && request.resource.data.mediaSize is int
+          && request.resource.data.mediaSize >= 0
+          && request.resource.data.mediaSize <= 10 * 1024 * 1024
+          && request.resource.data.createdAt is timestamp
+          && request.resource.data.createdAt == request.time
+          && request.resource.data.createdAtMs is int
+          && request.resource.data.createdAtMs >= request.time.toMillis() - 5 * 60 * 1000
+          && request.resource.data.createdAtMs <= request.time.toMillis() + 5 * 60 * 1000
+          && request.resource.data.createdAtMs is number
+          && request.resource.data.createdAtMs > 0
+          && request.resource.data.deleted == false
+          && (
+            request.resource.data.text.size() > 0 ||
+            request.resource.data.mediaType != null
+          )
+          && (
+            (
+              request.resource.data.mediaType == null
+              && request.resource.data.mediaUrl == ''
+              && request.resource.data.mediaPath == ''
+              && request.resource.data.mediaMime == ''
+              && request.resource.data.mediaSize == 0
+            ) ||
+            (
+              request.resource.data.mediaType != null
+              && request.resource.data.mediaUrl.size() > 0
+              && request.resource.data.mediaPath.matches(
+                'rooms/' + roomId + '/chatMedia/' + messageId + '/.*'
+              )
+              && request.resource.data.mediaMime.matches(
+                '^image/(jpeg|png|webp|gif)$'
+              )
+              && request.resource.data.mediaSize > 0
+            )
+          );
+
+        allow update, delete: if false;
+      }
+
+      // Player pool is host-managed and readable by signed-in users.
       match /players/{playerId} {
         allow read: if authed();
         allow create, update, delete: if authed() && isHostUid(roomId);
@@ -196,15 +320,15 @@ service cloud.firestore {
   			allow delete: if authed() && (request.auth.uid == uid || isHostUid(roomId));
       }
 
-      // market results — host writes, all read
+      // Market history is readable by room members; writes remain host-only.
       match /marketResults/{id} {
-        allow read: if authed();
+        allow read: if canReadRoomHistory(roomId);
         allow create, update, delete: if authed() && isHostUid(roomId);
       }
 
-      // trades — user-to-user offers, host applies
+      // Room members can read all offers/history; write permissions stay scoped.
       match /trades/{tradeId} {
-        allow read: if authed();
+        allow read: if canReadRoomHistory(roomId);
 
         // sender creates offer
         allow create: if authed() && request.auth.uid == request.resource.data.fromUid;

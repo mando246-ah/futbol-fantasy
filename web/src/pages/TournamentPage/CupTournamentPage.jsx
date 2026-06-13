@@ -7,6 +7,7 @@ import { useLineupsForUsers, useTournament } from "../../tournament/hooks/useTou
 import { scorePlayerFromCore, toCorePos } from "../../tournament/logic/scoringCoreClient";
 import { auth, db } from "../../firebase";
 import { buildTournamentPlayerResolver } from "./tournamentPlayerResolver";
+import { useTargetedTournamentPlayers } from "./useTargetedTournamentPlayers";
 
 import "./TournamentPage.css";
 import { Avatar, AvatarImage, AvatarFallback } from "../../components/ui/avatar";
@@ -949,7 +950,6 @@ export default function CupTournamentPage() {
   const [historyEnabled, setHistoryEnabled] = useState(false);
   const [historyRounds, setHistoryRounds] = useState([]);
   const [dayResults, setDayResults] = useState([]);
-  const [roomPlayerDocs, setRoomPlayerDocs] = useState([]);
   const [roomPickDocs, setRoomPickDocs] = useState([]);
   const [selectedHistoryId, setSelectedHistoryId] = useState("");
   const [openHistoryBreakdownKey, setOpenHistoryBreakdownKey] = useState(null);
@@ -997,37 +997,31 @@ export default function CupTournamentPage() {
     let cancelled = false;
 
     if (!roomId) {
-      setRoomPlayerDocs([]);
       setRoomPickDocs([]);
       return () => {
         cancelled = true;
       };
     }
 
-    async function loadRoomPlayerMetadata() {
+    async function loadRoomPickMetadata() {
       try {
-        const [playersSnap, picksSnap] = await Promise.all([
-          getDocs(collection(db, "rooms", roomId, "players")).catch(() => null),
-          getDocs(collection(db, "rooms", roomId, "picks")).catch(() => null),
-        ]);
+        const picksSnap = await getDocs(
+          collection(db, "rooms", roomId, "picks")
+        ).catch(() => null);
 
         if (cancelled) return;
 
-        setRoomPlayerDocs(
-          playersSnap?.docs?.map((d) => ({ id: d.id, ...(d.data() || {}) })) || []
-        );
         setRoomPickDocs(
           picksSnap?.docs?.map((d) => ({ id: d.id, _pickDocId: d.id, ...(d.data() || {}) })) || []
         );
       } catch {
         if (!cancelled) {
-          setRoomPlayerDocs([]);
           setRoomPickDocs([]);
         }
       }
     }
 
-    loadRoomPlayerMetadata();
+    loadRoomPickMetadata();
 
     return () => {
       cancelled = true;
@@ -1146,7 +1140,11 @@ export default function CupTournamentPage() {
   const picksMap = stagedLineups.picksMap || {};
   const rosterByUid = stagedLineups.rosterByUid || {};
   const userById = Object.fromEntries(users.map((u) => [u.userId, u]));
-  const resolverPlayerInputs = useMemo(() => {
+  const resolverPicks = useMemo(
+    () => [...roomPickDocs, ...Object.values(picksMap || {})],
+    [picksMap, roomPickDocs]
+  );
+  const embeddedRosterPlayers = useMemo(() => {
     const players = [];
     const addPlayer = (player) => {
       if (!player || typeof player !== "object") return;
@@ -1162,11 +1160,39 @@ export default function CupTournamentPage() {
       (Array.isArray(roster) ? roster : []).forEach(addPlayer);
     }
 
-    return {
-      players: [...roomPlayerDocs, ...players],
-      picks: [...roomPickDocs, ...Object.values(picksMap || {})],
-    };
-  }, [users, rosterByUid, picksMap, roomPlayerDocs, roomPickDocs]);
+    return players;
+  }, [users, rosterByUid]);
+  const targetedResultDocs = useMemo(
+    () => [
+      cupDoc,
+      cupFixtureDocs,
+      historyEnabled ? historyRounds : [],
+      dayResults,
+      finalResultsDoc,
+    ],
+    [
+      cupDoc,
+      cupFixtureDocs,
+      dayResults,
+      finalResultsDoc,
+      historyEnabled,
+      historyRounds,
+    ]
+  );
+  const targetedPlayerDocs = useTargetedTournamentPlayers({
+    roomId,
+    embeddedPlayers: embeddedRosterPlayers,
+    picks: resolverPicks,
+    lineups,
+    resultDocs: targetedResultDocs,
+  });
+  const resolverPlayerInputs = useMemo(
+    () => ({
+      players: [...targetedPlayerDocs, ...embeddedRosterPlayers],
+      picks: resolverPicks,
+    }),
+    [embeddedRosterPlayers, resolverPicks, targetedPlayerDocs]
+  );
   const playerResolver = useMemo(
     () => buildTournamentPlayerResolver({
       players: resolverPlayerInputs.players,
@@ -1242,27 +1268,57 @@ export default function CupTournamentPage() {
 
     const isLive = statusLower === "live";
     const isResolving = statusLower === "resolving";
-    const isError = statusLower === "error";
-
-    const statusClass = isLive
-      ? "live"
-      : isResolving
-      ? "resolving"
-      : isError
-      ? "error"
-      : "idle";
-
-    const statusLabel = isLive
-      ? "LIVE"
-      : isResolving
-      ? "RESOLVING"
-      : isError
-      ? "ERROR"
-      : "IDLE";
+    const pollWeekStatus = String(
+      room?.competitionState?.weekStatus ||
+        room?.["competitionState.weekStatus"] ||
+        statusRaw ||
+        ""
+    )
+      .trim()
+      .toLowerCase();
+    const pollNextAtMs = Number(
+      room?.competitionState?.nextPollAtMs ||
+        room?.["competitionState.nextPollAtMs"] ||
+        0
+    );
+    const headerUpdateStatus =
+      pollWeekStatus === "live"
+        ? "live"
+        : ["complete", "completed", "final"].includes(pollWeekStatus)
+          ? "complete"
+          : pollWeekStatus || "idle";
+    const headerIsLive = headerUpdateStatus === "live";
+    const headerStatusClass =
+      headerUpdateStatus === "resolving"
+        ? "resolving"
+        : headerUpdateStatus === "error"
+          ? "error"
+          : headerUpdateStatus === "scheduled"
+            ? "scheduled"
+            : "idle";
+    const headerStatusLabel =
+      headerUpdateStatus === "live"
+        ? "LIVE UPDATING"
+        : headerUpdateStatus === "complete"
+          ? "COMPLETE"
+          : headerUpdateStatus === "resolving"
+            ? "RESOLVING"
+            : headerUpdateStatus === "error"
+              ? "ERROR"
+              : headerUpdateStatus === "scheduled"
+                ? "SCHEDULED"
+                : "IDLE";
 
     // --- Live-style header timing (match TournamentPage feel) ---
     const lastUpdateMs = Number(
-      (isWorldCupGroupRoom ? latestDayResult?.updatedAtMs || standingsDoc?.updatedAtMs : cupDoc?.updatedAtMs) || 0
+      (
+        isWorldCupGroupRoom
+          ? latestDayResult?.updatedAtMs || standingsDoc?.updatedAtMs
+          : cupDoc?.updatedAtMs ||
+            standingsDoc?.updatedAtMs ||
+            displayHistoryRounds[0]?.updatedAtMs ||
+            displayHistoryRounds[0]?.closedAtMs
+      ) || 0
     ) || null;
     const ageSec = lastUpdateMs ? Math.max(0, Math.floor((nowMs - lastUpdateMs) / 1000)) : null;
     const nextUpdateInSec = lastUpdateMs ? Math.max(0, 60 - (ageSec % 60)) : null;
@@ -2098,7 +2154,7 @@ export default function CupTournamentPage() {
                 </div>
               <div className="tpRoomMeta">Room: <b>{room?.name} - {roomId}</b></div>
               <div className="tpLiveHeaderLine">
-                {isLive ? (
+                {headerIsLive ? (
                     <span>
                     <b className="tpLivePill live">Live Updating</b>
                     {nextUpdateInSec != null ? <> • Next update in: <b>{nextUpdateInSec}s</b></> : null}
@@ -2106,7 +2162,10 @@ export default function CupTournamentPage() {
                     </span>
                 ) : (
                     <span>
-                    Status: <b className={`tpLivePill ${statusClass}`}>{statusLabel}</b>
+                    Status: <b className={`tpLivePill ${headerStatusClass}`}>{headerStatusLabel}</b>
+                    {pollNextAtMs > nowMs ? (
+                      <> • Next update at: <b>{fmtDT(pollNextAtMs)}</b></>
+                    ) : null}
                     <> • Last update at: <b>{lastUpdateLabel}</b></>
                     </span>
                 )}

@@ -65,22 +65,109 @@ function getCurrentWeekIndex(room = {}) {
 
 function getRoomTypeFlags(room = {}) {
   const worldCupPhase = String(room.worldCupPhase || "").trim();
+  const normalizedWorldCupPhase = worldCupPhase.toLowerCase();
+  const competitionKey = String(room.competitionKey || "").trim().toLowerCase();
+  const competitionType = String(room.competitionType || "").trim().toLowerCase();
+  const seasonKey = String(room.seasonKey || "").trim().toLowerCase();
   const isWorldCupGroupRoom =
     room.engineType === "worldCupDaily" ||
     room.phaseLabel === "WorldCupGroup" ||
-    worldCupPhase === "group" ||
+    normalizedWorldCupPhase === "group" ||
     worldCupPhase === "WorldCupGroup";
 
+  const isWorldCupRoom =
+    isWorldCupGroupRoom ||
+    normalizedWorldCupPhase === "knockout" ||
+    competitionKey === "worldcup" ||
+    competitionType === "worldcup" ||
+    seasonKey.startsWith("worldcup-");
   const isCupRoom = room.phaseLabel === "Cup" && !isWorldCupGroupRoom;
   const isRegularRoom = !isCupRoom && !isWorldCupGroupRoom;
 
-  return { isWorldCupGroupRoom, isCupRoom, isRegularRoom };
+  return { isWorldCupGroupRoom, isWorldCupRoom, isCupRoom, isRegularRoom };
+}
+
+function getWorldCupPlayerRepairActions() {
+  return [
+    {
+      key: "dryRunMissingWorldCupPlayers",
+      label: "Dry Run Missing World Cup Players",
+      callableName: "repairWorldCupRoomMissingPlayers",
+      payloadBuilder: (r) => ({
+        roomId: r.roomId,
+        forceApiRefresh: true,
+        dryRun: true,
+      }),
+      description:
+        "Compares the latest World Cup player pool with this room and previews missing players. Makes no writes.",
+      className: "shadow",
+    },
+    {
+      key: "addMissingWorldCupPlayers",
+      label: "Add Missing World Cup Players",
+      callableName: "repairWorldCupRoomMissingPlayers",
+      payloadBuilder: (r) => ({
+        roomId: r.roomId,
+        forceApiRefresh: true,
+        dryRun: false,
+      }),
+      confirm: true,
+      confirmMessage:
+        "This adds only missing World Cup player documents. It does not change picks, drafted ownership, or existing players. Continue?",
+      description:
+        "Adds only players missing from rooms/{roomId}/players so they can appear as undrafted Transfer Market players.",
+      className: "apply",
+    },
+  ];
+}
+
+function getWorldCupGlobalPlayerPoolSection() {
+  const payloadForRoom = (room, dryRun) => ({
+    seasonKey: room.seasonKey || `worldcup-${room.season || ""}`,
+    league: room.league ?? room.competition?.league,
+    season: room.season ?? room.competition?.season,
+    timezone:
+      room.timezone ||
+      room.competition?.timezone ||
+      "America/Los_Angeles",
+    worldCupPhase: room.worldCupPhase || "group",
+    forceRefresh: true,
+    dryRun,
+  });
+
+  return {
+    title: "Global World Cup Player Pool",
+    actions: [
+      {
+        key: "dryRunRefreshWorldCupGlobalPlayerPool",
+        label: "Dry Run Refresh World Cup Global Player Pool",
+        callableName: "refreshWorldCupGlobalPlayerPool",
+        payloadBuilder: (room) => payloadForRoom(room, true),
+        description:
+          "Checks the latest API player pool against globalData for future rooms. Makes no writes and does not modify this room or any drafted picks.",
+        className: "shadow",
+      },
+      {
+        key: "refreshWorldCupGlobalPlayerPool",
+        label: "Refresh World Cup Global Player Pool",
+        callableName: "refreshWorldCupGlobalPlayerPool",
+        payloadBuilder: (room) => payloadForRoom(room, false),
+        confirm: true,
+        confirmMessage:
+          "This merges the latest World Cup players into the global pool used by future rooms. It does not modify existing rooms or drafted picks. Continue?",
+        description:
+          "Refreshes and merges globalData only, preventing future World Cup rooms from using a stale pool. Existing rooms remain unchanged.",
+        className: "apply",
+      },
+    ],
+  };
 }
 
 function getOwnerActionSections(room = {}) {
   const currentWeekIndex = getCurrentWeekIndex(room);
   const missingWeek = !currentWeekIndex;
-  const { isWorldCupGroupRoom, isCupRoom, isRegularRoom } = getRoomTypeFlags(room);
+  const { isWorldCupGroupRoom, isWorldCupRoom, isCupRoom, isRegularRoom } =
+    getRoomTypeFlags(room);
 
   if (isWorldCupGroupRoom) {
     return [
@@ -98,8 +185,10 @@ function getOwnerActionSections(room = {}) {
               "Runs the group-stage engine once. Writes day results/standings/state if the current day is ready. Does not rebuild missing daily windows.",
             className: "danger",
           },
+          ...getWorldCupPlayerRepairActions(),
         ],
       },
+      getWorldCupGlobalPlayerPoolSection(),
     ];
   }
 
@@ -118,6 +207,7 @@ function getOwnerActionSections(room = {}) {
               "DANGER: This can rewrite Cup current state/results for this room. Use only if a Cup room is stuck. Continue?",
             className: "danger",
           },
+          ...(isWorldCupRoom ? getWorldCupPlayerRepairActions() : []),
         ],
       },
       {
@@ -307,6 +397,7 @@ function getOwnerActionSections(room = {}) {
           },
         ],
       },
+      ...(isWorldCupRoom ? [getWorldCupGlobalPlayerPoolSection()] : []),
     ];
   }
 
@@ -389,10 +480,26 @@ function getOwnerActionSections(room = {}) {
 }
 
 function formatResultValue(key, value) {
-  if (key === "nextPollAtMs" || key === "nextKickoffMs") {
+  if (
+    key === "nextPollAtMs" ||
+    key === "nextKickoffMs" ||
+    key === "lastApiRefreshAtMs"
+  ) {
     return `${value} (${formatWhen(value)})`;
   }
-  if (Array.isArray(value)) return value.join(", ");
+  if (key === "sampleMissingPlayers" && Array.isArray(value)) {
+    return value
+      .map((player) => player?.name || player?.id || "Unknown")
+      .join(", ");
+  }
+  if (key === "teamFetchSummary" && Array.isArray(value)) {
+    return `${value.length} team rows (full details logged to console)`;
+  }
+  if (Array.isArray(value)) {
+    return value.some((item) => item && typeof item === "object")
+      ? JSON.stringify(value)
+      : value.join(", ");
+  }
   if (value && typeof value === "object") return JSON.stringify(value);
   if (typeof value === "boolean") return value ? "true" : "false";
   return String(value);
@@ -405,9 +512,17 @@ function renderActionResult(resultWrapper) {
   const fields = [
     "ok",
     "roomId",
+    "targetUid",
     "mode",
     "message",
     "seasonKey",
+    "dryRun",
+    "forceApiRefresh",
+    "refreshed",
+    "wasStale",
+    "refreshReason",
+    "lastApiRefreshAtMs",
+    "staleMs",
     "enabled",
     "finalizeEnabled",
     "weekIndex",
@@ -419,8 +534,18 @@ function renderActionResult(resultWrapper) {
     "historyDocId",
     "fixtureCount",
     "refreshedCount",
+    "latestFetchedCount",
+    "beforeCount",
+    "afterCount",
+    "existingRoomPlayerCount",
+    "repairedRoomPlayerCount",
     "missingFixtureCount",
     "missingCount",
+    "addedCount",
+    "skippedExistingCount",
+    "teamCount",
+    "apiPlayerCount",
+    "globalPlayerCount",
     "maxAbsDiff",
     "userCount",
     "standingsCount",
@@ -458,6 +583,20 @@ function renderActionResult(resultWrapper) {
     "replayTestMode",
     "replayHistoryLabel",
     "auditPath",
+    "currentStarters",
+    "currentBench",
+    "ownedPlayerIds",
+    "invalidCurrentIds",
+    "removedInvalidPlayerIds",
+    "addedNewPlayerIdsToBench",
+    "nextStarters",
+    "nextBench",
+    "starterCount",
+    "benchCount",
+    "sampleMissingPlayers",
+    "teamFetchSummary",
+    "warnings",
+    "errors",
   ];
 
   return (
@@ -888,6 +1027,7 @@ export default function SuperAdminFix246() {
   const [actionBusyKey, setActionBusyKey] = useState("");
   const [actionResultByRoomId, setActionResultByRoomId] = useState({});
   const [actionErrorByRoomId, setActionErrorByRoomId] = useState({});
+  const [lineupRepairInputByRoomId, setLineupRepairInputByRoomId] = useState({});
 
   async function loadStatus() {
     setLoading(true);
@@ -959,11 +1099,30 @@ export default function SuperAdminFix246() {
     }
   }
 
+  function updateLineupRepairInput(roomId, field, value) {
+    setLineupRepairInputByRoomId((prev) => ({
+      ...prev,
+      [roomId]: {
+        roomId: prev[roomId]?.roomId || roomId,
+        targetUid: prev[roomId]?.targetUid || "",
+        [field]: value,
+      },
+    }));
+  }
+
   function renderRoomActionsDrawer(room) {
     const sections = getOwnerActionSections(room);
     const roomBusy = actionBusyKey.startsWith(`${room.roomId}:`);
     const latestResult = actionResultByRoomId[room.roomId] || null;
     const latestError = actionErrorByRoomId[room.roomId] || "";
+    const lineupRepairInput = lineupRepairInputByRoomId[room.roomId] || {
+      roomId: room.roomId,
+      targetUid: "",
+    };
+    const lineupRepairDisabled =
+      roomBusy ||
+      !String(lineupRepairInput.roomId || "").trim() ||
+      !String(lineupRepairInput.targetUid || "").trim();
 
     return (
       <div className="ownerRoomActions">
@@ -1022,6 +1181,96 @@ export default function SuperAdminFix246() {
             </div>
           </section>
         ))}
+
+        <section className="ownerActionSection">
+          <h3 className="ownerActionSectionTitle">Repair User Lineup From Picks</h3>
+          <div className="ownerLineupRepairFields">
+            <label>
+              <span>Room ID</span>
+              <input
+                type="text"
+                value={lineupRepairInput.roomId}
+                onChange={(event) =>
+                  updateLineupRepairInput(
+                    room.roomId,
+                    "roomId",
+                    event.target.value
+                  )
+                }
+                placeholder="Room ID"
+              />
+            </label>
+            <label>
+              <span>Target UID</span>
+              <input
+                type="text"
+                value={lineupRepairInput.targetUid}
+                onChange={(event) =>
+                  updateLineupRepairInput(
+                    room.roomId,
+                    "targetUid",
+                    event.target.value
+                  )
+                }
+                placeholder="Firebase Auth UID"
+              />
+            </label>
+          </div>
+          <div className="ownerActionGrid">
+            <button
+              type="button"
+              className="ownerActionBtn ownerActionBtn--shadow"
+              disabled={lineupRepairDisabled}
+              onClick={() =>
+                runOwnerRoomAction(
+                  room,
+                  "dryRunLineupRepair",
+                  "Dry Run Lineup Repair",
+                  "repairUserLineupFromPicks",
+                  () => ({
+                    roomId: String(lineupRepairInput.roomId || "").trim(),
+                    targetUid: String(lineupRepairInput.targetUid || "").trim(),
+                    dryRun: true,
+                  })
+                )
+              }
+            >
+              {actionBusyKey === `${room.roomId}:dryRunLineupRepair`
+                ? "Running..."
+                : "Dry Run Lineup Repair"}
+            </button>
+            <button
+              type="button"
+              className="ownerActionBtn ownerActionBtn--danger"
+              disabled={lineupRepairDisabled}
+              onClick={() =>
+                runOwnerRoomAction(
+                  room,
+                  "applyLineupRepair",
+                  "Apply Lineup Repair",
+                  "repairUserLineupFromPicks",
+                  () => ({
+                    roomId: String(lineupRepairInput.roomId || "").trim(),
+                    targetUid: String(lineupRepairInput.targetUid || "").trim(),
+                    dryRun: false,
+                  }),
+                  {
+                    confirm: true,
+                    confirmMessage:
+                      "This will rewrite the target user's lineup from their current picks. Continue?",
+                  }
+                )
+              }
+            >
+              {actionBusyKey === `${room.roomId}:applyLineupRepair`
+                ? "Running..."
+                : "Apply Lineup Repair"}
+            </button>
+          </div>
+          <div className="ownerActionMuted">
+            Dry run first. The repair never changes picks or player ownership.
+          </div>
+        </section>
 
         {latestError && <div className="ownerActionError">Action failed: {latestError}</div>}
         {renderActionResult(latestResult)}

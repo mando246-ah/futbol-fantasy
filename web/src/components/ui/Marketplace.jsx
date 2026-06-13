@@ -21,6 +21,10 @@ import {
   reportClientError,
 } from "../../utils/errorReporter";
 import { devError, devLog } from "../../utils/devLogger";
+import {
+  matchesPlayerSearch,
+  normalizeSearchText,
+} from "../../utils/playerSearch";
 
 const functions = getFunctions(app, "us-west2");
 const fnScheduleMarket = httpsCallable(functions, "scheduleMarket");
@@ -127,6 +131,8 @@ function friendlyMarketReason(code) {
       return "Not awarded — you can’t trade a player for themselves.";
     case "WANT_NOT_IN_POOL":
       return "Not awarded — requested player was not found.";
+    case "TIE_RANDOM_LOST":
+      return "Not awarded — you had the same priority as the winner, but lost the random tiebreaker.";
     default:
       return "Not awarded.";
   }
@@ -155,18 +161,6 @@ function getPlayerNation(p = {}) {
     p.countryName ||
     ""
   );
-}
-
-function getPlayerSearchText(p = {}) {
-  return [
-    getPlayerName(p),
-    p.position,
-    getPlayerTeam(p),
-    getPlayerNation(p),
-  ]
-    .filter(Boolean)
-    .join(" ")
-    .toLowerCase();
 }
 
 function PlayerMetaLine({ player }) {
@@ -220,13 +214,13 @@ const AcquireSearch = React.memo(function AcquireSearch({
   pickedSet,     // Set of drafted playerIds
   disabled,
 }) {
-  const q = search.trim().toLowerCase();
+  const q = normalizeSearchText(search);
 
   const results =
     q.length < 2
       ? []
       : (pool || [])
-          .filter((p) => pickDisplayName(p).toLowerCase().includes(q))
+          .filter((p) => matchesPlayerSearch(p, search))
           .slice(0, 20);
 
   const selected =
@@ -313,10 +307,10 @@ export default function Marketplace({
   const [isEditing, setIsEditing] = useState(true); // default: editable
   const [saveStatus, setSaveStatus] = useState(""); 
   const [marketError, setMarketError] = useState("");
-  const [ marketResults, setMarketResults ] = useState([]);
-  const [marketResultsLoading, setMarketResultsLoading] = useState(false);
-  const [marketResultsError, setMarketResultsError] = useState("");
-  const [marketResultsLoadedRoomId, setMarketResultsLoadedRoomId] = useState("");
+  const [historyLoaded, setHistoryLoaded] = useState(false);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [marketHistory, setMarketHistory] = useState([]);
+  const [historyError, setHistoryError] = useState("");
   const [availableLimit, setAvailableLimit] = useState(30); // how many "Available Players" cards to show
   const [availableSearch, setAvailableSearch] = useState("");
   const hasParentPlayers = Array.isArray(players);
@@ -364,24 +358,25 @@ export default function Marketplace({
     return { pickedSet: picked, myRoster: mine };
   }, [ownershipPicks, user?.uid]);
 
-  const loadMarketResults = useCallback(async () => {
+  const loadMarketHistory = useCallback(async () => {
     if (!roomId) {
-      setMarketResults([]);
+      setMarketHistory([]);
+      setHistoryLoaded(false);
       return;
     }
 
-    setMarketResultsLoading(true);
-    setMarketResultsError("");
+    setHistoryLoading(true);
+    setHistoryError("");
     try {
       const resultsRef = collection(db, "rooms", roomId, "marketResults");
       let snap = await getDocs(
-        query(resultsRef, orderBy("resolvedAtMs", "desc"), limit(20))
+        query(resultsRef, orderBy("resolvedAtMs", "desc"), limit(50))
       );
 
       // Older result docs may only have resolvedAt.
       if (snap.empty) {
         snap = await getDocs(
-          query(resultsRef, orderBy("resolvedAt", "desc"), limit(20))
+          query(resultsRef, orderBy("resolvedAt", "desc"), limit(50))
         );
       }
 
@@ -392,41 +387,27 @@ export default function Marketplace({
           const bMs = toMillis(b.resolvedAtMs ?? b.resolvedAt) || 0;
           return bMs - aMs;
         })
-        .slice(0, 20);
-      setMarketResults(rows);
-      setMarketResultsLoadedRoomId(roomId);
-      devLog("[Marketplace] market results read", {
+        .slice(0, 50);
+      setMarketHistory(rows);
+      setHistoryLoaded(true);
+      devLog("[Marketplace] market history read", {
         roomId,
         resultDocsRead: snap.size,
       });
     } catch (error) {
-      devError("[Marketplace] market results read failed", error);
-      setMarketResultsError("Could not load market results.");
+      devError("[Marketplace] market history read failed", error);
+      setHistoryError("Could not load market history.");
     } finally {
-      setMarketResultsLoading(false);
+      setHistoryLoading(false);
     }
   }, [roomId]);
 
   useEffect(() => {
-    setMarketResults([]);
-    setMarketResultsError("");
-    setMarketResultsLoadedRoomId("");
+    setMarketHistory([]);
+    setHistoryError("");
+    setHistoryLoaded(false);
+    setHistoryLoading(false);
   }, [roomId]);
-
-  useEffect(() => {
-    if (
-      market?.status === "resolved" &&
-      marketResultsLoadedRoomId !== roomId
-    ) {
-      loadMarketResults();
-    }
-  }, [
-    loadMarketResults,
-    market?.status,
-    marketResultsLoadedRoomId,
-    roomId,
-  ]);
-
 
   useEffect(() => {
     if (!roomId) return;
@@ -535,21 +516,16 @@ export default function Marketplace({
   }, [roomId, availableSearch]);
 
   const filteredUndrafted = useMemo(() => {
-    const q = availableSearch.trim().toLowerCase();
+    const q = normalizeSearchText(availableSearch);
     const list = undrafted || [];
 
     if (!q) return list;
 
-    const terms = q.split(/\s+/).filter(Boolean);
-
     return list
-      .filter((p) => {
-        const haystack = getPlayerSearchText(p);
-        return terms.every((term) => haystack.includes(term));
-      })
+      .filter((p) => matchesPlayerSearch(p, availableSearch))
       .sort((a, b) => {
-        const aName = getPlayerName(a).toLowerCase();
-        const bName = getPlayerName(b).toLowerCase();
+        const aName = normalizeSearchText(getPlayerName(a));
+        const bName = normalizeSearchText(getPlayerName(b));
 
         const aStarts = aName.startsWith(q) ? 0 : 1;
         const bStarts = bName.startsWith(q) ? 0 : 1;
@@ -1023,80 +999,93 @@ function clearChoice(label, state, setState) {
           )}
         </div>
 
-          {market?.status === "resolved" && (
-            <div className="marketResultsPanel">
-              <div className="marketResultsHeader">
-                <div className="marketResultsTitle">Market Results</div>
-                <button
-                  type="button"
-                  className="marketBtn marketBtnOutline"
-                  disabled={marketResultsLoading}
-                  onClick={loadMarketResults}
-                >
-                  {marketResultsLoading ? "Refreshing..." : "Refresh Results"}
-                </button>
-              </div>
+          <div className="marketResultsPanel">
+            <div className="marketResultsHeader">
+              <div className="marketResultsTitle">Market History</div>
+              <button
+                type="button"
+                className="marketBtn marketBtnOutline"
+                disabled={historyLoading}
+                onClick={loadMarketHistory}
+              >
+                {historyLoading
+                  ? "Loading History..."
+                  : historyLoaded
+                    ? "Refresh History"
+                    : "Load Market History"}
+              </button>
+            </div>
 
-              {marketResultsError ? (
-                <div className="marketTextError">{marketResultsError}</div>
-              ) : marketResults.length === 0 ? (
-                <div className="marketResultsEmpty">No market results recorded yet.</div>
-              ) : (
-                <div className="marketResultsList">
-                  {marketResults.map((r) => {
-                    const who = r.displayName || r.uid;
-                    const wantedPlayer = allPlayers.find(
-                      (p) => String(p.id) === String(r.wantId)
-                    );
-                    const releasedPick = (myRoster || []).find(
-                      (p) => pickPlayerId(p) === String(r.swapOutId)
-                    );
-                    const wantName =
-                      (wantedPlayer ? pickDisplayName(wantedPlayer) : "") ||
-                      r.wantId;
+            <div className="marketHistoryHelp">
+              History is loaded only when requested to save reads.
+            </div>
 
-                    const swapOutName =
-                      (releasedPick ? pickDisplayName(releasedPick) : "") ||
-                      r.swapOutId;
+            {historyError ? (
+              <div className="marketTextError">{historyError}</div>
+            ) : !historyLoaded ? null : marketHistory.length === 0 ? (
+              <div className="marketResultsEmpty">No market history yet.</div>
+            ) : (
+              <div className="marketResultsList">
+                {marketHistory.map((r) => {
+                  const who =
+                    r.managerName ||
+                    r.winnerName ||
+                    r.displayName ||
+                    r.uid ||
+                    "Manager";
+                  const wantedPlayer = allPlayers.find(
+                    (p) => String(p.id) === String(r.wantId)
+                  );
+                  const wantName =
+                    r.wantName ||
+                    r.gotName ||
+                    (wantedPlayer ? pickDisplayName(wantedPlayer) : "") ||
+                    r.wantId;
+                  const swapOutName =
+                    r.swapOutName ||
+                    r.releasedName ||
+                    r.swapOutId;
 
-                    const ok = r.ok === true || r.result === "won";
-                    const releasedId = r.releasedId || r.swapOutId;
-                    const gotId = r.gotId || r.wantId;
-                    const fallbackReason =
-                      r.reason
+                  const ok = r.ok === true || r.result === "won";
+                  const releasedId = r.releasedId || r.swapOutId;
+                  const gotId = r.gotId || r.wantId;
+                  const fallbackReason =
+                    r.reasonMessage ||
+                    (r.tieBrokenRandomly
+                      ? "Not awarded — you had the same priority as the winner, but lost the random tiebreaker."
+                      : r.reason
                         ? friendlyMarketReason(r.reason)
                         : r.result === "lost"
-                        ? "Not awarded — higher priority lost or player not available."
-                        : "Not awarded.";
+                          ? "Not awarded — higher priority lost or player not available."
+                          : "Not awarded.");
 
-                    return (
-                      <div key={r.id} className="marketResultRow">
-                        <div className="marketResultTop">
-                          <div className="marketResultUser">{who}</div>
-                          <span className={`marketResultTag ${ok ? "marketResultTagOk" : "marketResultTagFail"}`}>
-                            {ok ? "Awarded" : "Not awarded"}
-                          </span>
-                        </div>
-
-                        {ok ? (
-                          <div className="marketResultSwap">
-                            Dropped <b>{r.releasedName || releasedId}</b> → Added <b>{r.gotName || gotId}</b>
-                          </div>
-                        ) : (
-                          <>
-                            <div className="marketResultSwap">
-                              Requested <b>{wantName || "—"}</b> for <b>{swapOutName || "—"}</b>
-                            </div>
-                            <div className="marketResultReason">{fallbackReason}</div>
-                          </>
-                        )}
+                  return (
+                    <div key={r.id} className="marketResultRow">
+                      <div className="marketResultTop">
+                        <div className="marketResultUser">{who}</div>
+                        <span className={`marketResultTag ${ok ? "marketResultTagOk" : "marketResultTagFail"}`}>
+                          {ok ? "Awarded" : "Not awarded"}
+                        </span>
                       </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          )}
+
+                      {ok ? (
+                        <div className="marketResultSwap">
+                          Dropped <b>{r.releasedName || r.swapOutName || releasedId}</b> → Added <b>{r.gotName || r.wantName || gotId}</b>
+                        </div>
+                      ) : (
+                        <>
+                          <div className="marketResultSwap">
+                            Requested <b>{wantName || "—"}</b> for <b>{swapOutName || "—"}</b>
+                          </div>
+                          <div className="marketResultReason">{fallbackReason}</div>
+                        </>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
       </div>
 
     </div>

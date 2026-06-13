@@ -1,6 +1,7 @@
 const admin = require("firebase-admin");
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
 const { onSchedule } = require("firebase-functions/v2/scheduler");
+const { onDocumentCreated } = require("firebase-functions/v2/firestore");
 const logger = require("firebase-functions/logger"); // optional but nice
 
 if (!admin.apps.length) admin.initializeApp();
@@ -57,11 +58,19 @@ const {
 } = require("./worldCup/worldCupDailyWindows");
 const { runWorldCupGroupEngine } = require("./worldCup/worldCupGroupEngine");
 const {
+  findWorldCupDailyLockViolation,
+  formatWorldCupDailyLockDate,
+  getActiveWorldCupDailyLocks,
+  isWorldCupDailyRoom: isWorldCupDailyLineupRoom,
+} = require("./worldCup/worldCupDailyLineupLocks");
+const {
   buildWorldCupGroupSeasonTargetForRoom,
 } = require("./worldCup/worldCupGlobalTargets");
 const {
   WORLD_CUP_GLOBAL_PLAYER_POOL_MIN,
+  WORLD_CUP_GLOBAL_PLAYER_POOL_STALE_MS,
   collectWorldCupTeamsFromDailyWindows,
+  ensureFreshWorldCupGlobalPlayerPool,
   fetchWorldCupTeamPlayerPool,
 } = require("./worldCup/worldCupPlayerPool");
 
@@ -80,6 +89,61 @@ const CUP_GLOBAL_DRAFT_RECHECK_MS = 10 * 60 * 1000;
 const CUP_GLOBAL_ACTIVE_RECHECK_MS = 60 * 1000;
 const CUP_GLOBAL_CACHE_REFRESH_DEDUPE_MS = 45 * 1000;
 const cupGlobalRefreshResultByKey = new Map();
+
+exports.trimRoomChatMessages = onDocumentCreated(
+  {
+    document: "rooms/{roomId}/chatMessages/{messageId}",
+    region: "us-west2",
+    timeoutSeconds: 60,
+    memory: "256MiB",
+  },
+  async (event) => {
+    const roomId = String(event.params?.roomId || "").trim();
+    if (!roomId) return;
+
+    const messagesRef = db.collection(`rooms/${roomId}/chatMessages`);
+    const latestSnap = await messagesRef
+      .orderBy("createdAtMs", "desc")
+      .limit(31)
+      .get();
+    const expiredDocs = latestSnap.docs.slice(30);
+
+    if (!expiredDocs.length) return;
+
+    const mediaPaths = expiredDocs
+      .map((messageDoc) => String(messageDoc.data()?.mediaPath || "").trim())
+      .filter(Boolean);
+    const batch = db.batch();
+
+    for (const messageDoc of expiredDocs) {
+      batch.delete(messageDoc.ref);
+    }
+
+    await batch.commit();
+
+    await Promise.all(
+      mediaPaths.map(async (mediaPath) => {
+        try {
+          await admin.storage().bucket().file(mediaPath).delete({
+            ignoreNotFound: true,
+          });
+        } catch (error) {
+          console.warn("[trimRoomChatMessages] media cleanup failed", {
+            roomId,
+            mediaPath,
+            message: error?.message,
+          });
+        }
+      })
+    );
+
+    console.log("[trimRoomChatMessages] removed expired room chat messages", {
+      roomId,
+      deletedMessageCount: expiredDocs.length,
+      deletedMediaCount: mediaPaths.length,
+    });
+  }
+);
 
 //Serve Resolve Market Helpers
 async function loadStandingsByUid(roomRef) {
@@ -110,6 +174,10 @@ function comparePriority(a, b) {
   if (a.matchPts !== b.matchPts) return a.matchPts - b.matchPts;
   if (a.totalFantasy !== b.totalFantasy) return a.totalFantasy - b.totalFantasy;
   return 0;
+}
+
+function seededTieValue(seed, wantId, uid) {
+  return hashToUint32(`${seed}:${wantId}:${uid}`);
 }
 
 function top3FromStandings(standingsArr) {
@@ -1455,7 +1523,6 @@ exports.seedWorldCupRoom = onCall(
         Number(request.data?.worldCupMaxPlayers ?? 5000)
       )
     );
-    const maxPages = Math.max(1, Math.min(250, Number(request.data?.maxPages ?? 200)));
     const maxPagesPerTeam = Math.max(1, Math.min(20, Number(request.data?.maxPagesPerTeam ?? 10)));
 
     if (!roomId) throw new HttpsError("invalid-argument", "roomId is required.");
@@ -1567,155 +1634,112 @@ exports.seedWorldCupRoom = onCall(
       );
     }
 
-    let fetchResult = {
+    let globalPoolResult;
+    try {
+      globalPoolResult = await ensureFreshWorldCupGlobalPlayerPool({
+        db,
+        apiFootballGet,
+        apiKey,
+        seasonKey: mode.seasonKey,
+        season,
+        dailyWindows,
+        qualifiedTeams,
+        worldCupPhase: mode.worldCupPhase,
+        maxPlayers: worldCupMaxPlayers,
+        maxPagesPerTeam,
+        forceRefresh: false,
+        nowMs,
+        loadDailyWindows:
+          mode.worldCupPhase === WORLD_CUP_KNOCKOUT_PHASE
+            ? () =>
+                loadWorldCupGroupDailyWindows({
+                  apiFootballGet,
+                  apiKey,
+                  league,
+                  season,
+                  timezone,
+                })
+            : null,
+      });
+    } catch (error) {
+      const code = ["aborted", "failed-precondition"].includes(error?.code)
+        ? error.code
+        : "internal";
+      throw new HttpsError(
+        code,
+        error?.message || "World Cup global player pool refresh failed."
+      );
+    }
+
+    if (
+      globalPoolResult.refreshed &&
+      (
+        globalPoolResult.latestFetchedCount <
+          WORLD_CUP_GLOBAL_PLAYER_POOL_MIN ||
+        globalPoolResult.allTeamsProcessed === false ||
+        globalPoolResult.hitCap === true
+      )
+    ) {
+      throw new HttpsError(
+        "failed-precondition",
+        "World Cup global player pool refresh was incomplete. Retry before seeding this room."
+      );
+    }
+
+    const roomPlayers = Array.isArray(globalPoolResult.players)
+      ? globalPoolResult.players
+      : [];
+    const usedGlobalSeasonPlayers = true;
+    const globalBootstrapWritten = Number(
+      globalPoolResult.globalWrittenCount || 0
+    );
+    const globalBootstrapError =
+      (globalPoolResult.errors || []).join("; ") || null;
+    const worldCupPlayerPoolIncomplete =
+      roomPlayers.length < WORLD_CUP_GLOBAL_PLAYER_POOL_MIN ||
+      globalPoolResult.allTeamsProcessed === false ||
+      globalPoolResult.hitCap === true;
+    const worldCupPlayerPoolWarning = (globalPoolResult.warnings || []).join(
+      " "
+    );
+    const worldCupTeamIds = Array.isArray(globalPoolResult.teamIds)
+      ? globalPoolResult.teamIds
+      : [];
+    const worldCupTeams = Array.isArray(globalPoolResult.teams)
+      ? globalPoolResult.teams
+      : [];
+    const worldCupTeamFetchSummary = Array.isArray(
+      globalPoolResult.teamFetchSummary
+    )
+      ? globalPoolResult.teamFetchSummary
+      : [];
+    const ignoredIncompleteGlobalWorldCupPoolCount =
+      globalPoolResult.beforeCount > 0 &&
+      globalPoolResult.beforeCount < WORLD_CUP_GLOBAL_PLAYER_POOL_MIN
+        ? globalPoolResult.beforeCount
+        : null;
+    const playersFrom = globalPoolResult.source;
+    const playersFromLabel = globalPoolResult.refreshed
+      ? "Refreshed Global Season Player Pool"
+      : "Global Season Player Pool";
+    const fetchResult = {
       players: [],
-      pagesFetched: 0,
-      hitCap: false,
-      teamFetchSummary: [],
-      teamIds: [],
-      teamCount: 0,
-      processedTeamCount: 0,
-      expectedTeamCount: 0,
-      allTeamsProcessed: true,
-      missingFetchTeamIds: [],
-      missingFetchTeamNames: [],
-      skippedTeamIdsDueToGlobalCap: [],
+      pagesFetched: Number(globalPoolResult.pagesFetched || 0),
+      hitCap: Boolean(globalPoolResult.hitCap),
+      teamFetchSummary: worldCupTeamFetchSummary,
+      teamIds: worldCupTeamIds,
+      teamCount: Number(globalPoolResult.teamCount || 0),
+      processedTeamCount: Number(globalPoolResult.processedTeamCount || 0),
+      expectedTeamCount: Number(globalPoolResult.expectedTeamCount || 0),
+      allTeamsProcessed: globalPoolResult.allTeamsProcessed === true,
+      missingFetchTeamIds: globalPoolResult.missingFetchTeamIds || [],
+      missingFetchTeamNames: globalPoolResult.missingFetchTeamNames || [],
+      skippedTeamIdsDueToGlobalCap:
+        globalPoolResult.skippedTeamIdsDueToGlobalCap || [],
       usedSquadFallbackTeamIds: [],
       emptyTeamIds: [],
       maxPlayers: worldCupMaxPlayers,
     };
-    let roomPlayers = [];
-    let usedGlobalSeasonPlayers = false;
-    let globalBootstrapWritten = 0;
-    let globalBootstrapError = null;
-    let worldCupPlayerPoolIncomplete = false;
-    let worldCupPlayerPoolWarning = "";
-    let worldCupTeamIds = [];
-    let worldCupTeams = [];
-    let worldCupTeamFetchSummary = [];
-    let ignoredIncompleteGlobalWorldCupPoolCount = null;
-    let playersFrom = "api-football-world-cup-team-fallback";
-    let playersFromLabel = "API-Football World Cup Team Fallback";
-
-    const existingGlobalPool = await loadSeasonPlayerPool({
-      db,
-      seasonKey: mode.seasonKey,
-    }).catch((e) => {
-      console.warn("[seedWorldCupRoom] failed to load global World Cup player pool", {
-        roomId,
-        seasonKey: mode.seasonKey,
-        error: String(e?.message || e),
-      });
-      return [];
-    });
-
-    if (existingGlobalPool.length >= WORLD_CUP_GLOBAL_PLAYER_POOL_MIN) {
-      roomPlayers = existingGlobalPool;
-      usedGlobalSeasonPlayers = true;
-      playersFrom = "global-season-player-pool";
-      playersFromLabel = "Global Season Player Pool";
-    } else if (existingGlobalPool.length > 0) {
-      ignoredIncompleteGlobalWorldCupPoolCount = existingGlobalPool.length;
-    }
-
-    if (!usedGlobalSeasonPlayers) {
-      let collected = null;
-
-      if (mode.worldCupPhase === WORLD_CUP_GROUP_PHASE) {
-        collected = collectWorldCupTeamsFromDailyWindows(dailyWindows);
-      } else if (Array.isArray(qualifiedTeams?.teamIds) && qualifiedTeams.teamIds.length) {
-        const teamMeta = new Map();
-        for (const team of Array.isArray(qualifiedTeams?.teams) ? qualifiedTeams.teams : []) {
-          const id = String(team?.id || "").trim();
-          if (!id) continue;
-          teamMeta.set(id, {
-            id,
-            name: team.name || "",
-            logo: team.logo || "",
-          });
-        }
-        const teams = Array.from(teamMeta.values());
-        collected = {
-          teamIds: qualifiedTeams.teamIds.map(String).filter(Boolean),
-          teams,
-          teamMeta,
-        };
-      }
-
-      worldCupTeamIds = Array.isArray(collected?.teamIds) ? collected.teamIds : [];
-      worldCupTeams = Array.isArray(collected?.teams) ? collected.teams : [];
-
-      if (worldCupTeamIds.length) {
-        fetchResult = await fetchWorldCupTeamPlayerPool({
-          apiFootballGet,
-          apiKey,
-          season,
-          teamIds: worldCupTeamIds,
-          teamMeta: collected.teamMeta,
-          maxPlayers: worldCupMaxPlayers,
-          maxPagesPerTeam,
-        });
-        roomPlayers = fetchResult.players;
-        worldCupTeamFetchSummary = fetchResult.teamFetchSummary || [];
-        playersFrom = "world-cup-team-player-pool";
-        playersFromLabel = "API-Football World Cup Team Player Pool";
-      } else {
-        fetchResult = await fetchCompetitionPlayerPoolFromApi({
-          apiKey,
-          league,
-          season,
-          maxPlayers: worldCupMaxPlayers,
-          maxPages,
-          maxPagesPerTeam,
-          teamIds: null,
-        });
-        fetchResult = {
-          ...fetchResult,
-          processedTeamCount: 0,
-          expectedTeamCount: worldCupTeamIds.length,
-          allTeamsProcessed: false,
-          missingFetchTeamIds: worldCupTeamIds,
-          missingFetchTeamNames: worldCupTeams.map((team) => team?.name || String(team?.id || "")),
-          skippedTeamIdsDueToGlobalCap: [],
-          maxPlayers: worldCupMaxPlayers,
-        };
-        roomPlayers = fetchResult.players;
-        playersFrom = "api-football-world-cup-safe-fallback";
-        playersFromLabel = "API-Football World Cup Safe Fallback";
-      }
-
-      const skippedTeamIdsDueToGlobalCap = Array.isArray(fetchResult.skippedTeamIdsDueToGlobalCap)
-        ? fetchResult.skippedTeamIdsDueToGlobalCap
-        : [];
-      const canBootstrapWorldCupPlayerPool =
-        roomPlayers.length >= WORLD_CUP_GLOBAL_PLAYER_POOL_MIN &&
-        fetchResult.allTeamsProcessed !== false &&
-        fetchResult.hitCap !== true &&
-        skippedTeamIdsDueToGlobalCap.length === 0;
-
-      if (canBootstrapWorldCupPlayerPool) {
-        try {
-          globalBootstrapWritten = await bootstrapSeasonPlayerPool({
-            db,
-            seasonKey: mode.seasonKey,
-            players: roomPlayers,
-          });
-        } catch (e) {
-          globalBootstrapError = String(e?.message || e);
-        }
-      } else {
-        worldCupPlayerPoolIncomplete = true;
-        worldCupPlayerPoolWarning =
-          fetchResult.allTeamsProcessed === false ||
-          fetchResult.hitCap === true ||
-          skippedTeamIdsDueToGlobalCap.length > 0
-            ? "World Cup player pool did not process every team; not written to globalData"
-            : "World Cup player pool below global bootstrap threshold; not written to globalData";
-        playersFrom = "api-football-world-cup-team-fallback";
-        playersFromLabel = "API-Football World Cup Team Fallback";
-        globalBootstrapWritten = 0;
-      }
-    }
 
     if (!roomPlayers.length) {
       throw new HttpsError(
@@ -1738,9 +1762,8 @@ exports.seedWorldCupRoom = onCall(
     const worldCupMissingFetchTeamNames = Array.isArray(fetchResult.missingFetchTeamNames)
       ? fetchResult.missingFetchTeamNames
       : [];
-    const worldCupAllTeamsProcessed = usedGlobalSeasonPlayers
-      ? true
-      : fetchResult.allTeamsProcessed === true;
+    const worldCupAllTeamsProcessed =
+      globalPoolResult.allTeamsProcessed !== false;
     const worldCupHitGlobalCap = Boolean(fetchResult.hitCap);
     const worldCupSkippedTeamIdsDueToGlobalCap = Array.isArray(fetchResult.skippedTeamIdsDueToGlobalCap)
       ? fetchResult.skippedTeamIdsDueToGlobalCap
@@ -1860,6 +1883,19 @@ exports.seedWorldCupRoom = onCall(
         worldCupHitGlobalCap,
         worldCupSkippedTeamIdsDueToGlobalCap,
         ignoredIncompleteGlobalWorldCupPoolCount,
+        globalPoolWasStale: Boolean(globalPoolResult.wasStale),
+        globalPoolRefreshed: Boolean(globalPoolResult.refreshed),
+        globalPoolLastApiRefreshAtMs:
+          globalPoolResult.lastApiRefreshAtMs || null,
+        globalPoolBeforeCount: Number(globalPoolResult.beforeCount || 0),
+        globalPoolAfterCount: Number(globalPoolResult.afterCount || 0),
+        globalPoolAddedCount: Number(globalPoolResult.addedCount || 0),
+        globalPoolLatestFetchedCount: Number(
+          globalPoolResult.latestFetchedCount || 0
+        ),
+        globalPoolRefreshReason: globalPoolResult.refreshReason || "",
+        globalPoolWarnings: globalPoolResult.warnings || [],
+        globalPoolErrors: globalPoolResult.errors || [],
         qualifiedTeamsError: qualifiedTeamsError || null,
       },
       { merge: true }
@@ -1945,6 +1981,19 @@ exports.seedWorldCupRoom = onCall(
       worldCupHitGlobalCap,
       worldCupSkippedTeamIdsDueToGlobalCap,
       ignoredIncompleteGlobalWorldCupPoolCount,
+      globalPoolWasStale: Boolean(globalPoolResult.wasStale),
+      globalPoolRefreshed: Boolean(globalPoolResult.refreshed),
+      globalPoolLastApiRefreshAtMs:
+        globalPoolResult.lastApiRefreshAtMs || null,
+      globalPoolBeforeCount: Number(globalPoolResult.beforeCount || 0),
+      globalPoolAfterCount: Number(globalPoolResult.afterCount || 0),
+      globalPoolAddedCount: Number(globalPoolResult.addedCount || 0),
+      globalPoolLatestFetchedCount: Number(
+        globalPoolResult.latestFetchedCount || 0
+      ),
+      globalPoolRefreshReason: globalPoolResult.refreshReason || "",
+      globalPoolWarnings: globalPoolResult.warnings || [],
+      globalPoolErrors: globalPoolResult.errors || [],
       qualifiedTeamsError: qualifiedTeamsError || null,
     };
   }
@@ -3221,8 +3270,8 @@ async function ensureDefaultLineupsForRoom(roomId, memberUids) {
     batch.set(
       lineupRef,
       {
-        starters,          
-        bench,            
+        starters,
+        bench,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         autoInit: true,
@@ -3235,6 +3284,1173 @@ async function ensureDefaultLineupsForRoom(roomId, memberUids) {
   if (writes > 0) await batch.commit();
   return { writes };
 }
+
+function lineupEntryId(entry) {
+  if (entry == null) return "";
+  if (typeof entry === "string" || typeof entry === "number") {
+    return String(entry).trim();
+  }
+
+  return String(
+    entry.id ??
+      entry.playerId ??
+      entry.apiPlayerId ??
+      entry.pid ??
+      entry.player?.id ??
+      ""
+  ).trim();
+}
+
+function inferLineupPickOwnerUid(d = {}) {
+  const v =
+    d.ownerUid ??
+    d.ownerId ??
+    d.ownedBy ??
+    d.managerUid ??
+    d.userId ??
+    d.uid ??
+    d.pickedByUid ??
+    d.pickedBy ??
+    d.owner?.uid ??
+    d.owner?.id;
+
+  if (!v) return null;
+  if (typeof v === "string") return v;
+  if (typeof v === "object") return v.uid || v.id || null;
+  return String(v);
+}
+
+function inferLineupPickPlayerId(d = {}) {
+  const v =
+    d.playerId ??
+    d.pid ??
+    d.apiPlayerId ??
+    d.id ??
+    d.player?.id ??
+    d.player?.playerId;
+
+  return v == null ? "" : String(v).trim();
+}
+
+async function loadOwnedLineupPlayerIdsForUser({ roomId, targetUid }) {
+  const picksSnap = await db.collection(`rooms/${roomId}/picks`).get();
+  const ownedPicks = [];
+
+  for (const pickDoc of picksSnap.docs || []) {
+    const data = pickDoc.data() || {};
+    const ownerUid = inferLineupPickOwnerUid(data);
+    if (String(ownerUid || "") !== String(targetUid)) continue;
+
+    const playerId = inferLineupPickPlayerId(data);
+    if (!playerId) continue;
+
+    ownedPicks.push({
+      pickDocId: pickDoc.id,
+      playerId,
+      data,
+    });
+  }
+
+  ownedPicks.sort((a, b) => {
+    const aOrder = Number(
+      a.data?.turn ??
+        a.data?.pickIndex ??
+        a.data?.overallPick ??
+        a.data?.pickNumber ??
+        a.data?.createdAtMs
+    );
+    const bOrder = Number(
+      b.data?.turn ??
+        b.data?.pickIndex ??
+        b.data?.overallPick ??
+        b.data?.pickNumber ??
+        b.data?.createdAtMs
+    );
+    const safeA = Number.isFinite(aOrder) ? aOrder : Number.MAX_SAFE_INTEGER;
+    const safeB = Number.isFinite(bOrder) ? bOrder : Number.MAX_SAFE_INTEGER;
+
+    return safeA - safeB || String(a.playerId).localeCompare(String(b.playerId));
+  });
+
+  const ownedPlayerIds = Array.from(
+    new Set(ownedPicks.map((pick) => String(pick.playerId)).filter(Boolean))
+  );
+
+  return {
+    ownedPicks,
+    ownedPlayerIds,
+    ownedPlayerIdSet: new Set(ownedPlayerIds),
+  };
+}
+
+function sanitizeLineupIdsAgainstOwnedRoster({
+  starters = [],
+  bench = [],
+  ownedPlayerIds = [],
+}) {
+  const ownedSet = new Set((ownedPlayerIds || []).map(String).filter(Boolean));
+  const used = new Set();
+  const removedInvalidPlayerIds = [];
+
+  const cleanStarters = [];
+  for (const rawId of starters || []) {
+    const id = String(rawId || "").trim();
+    if (!id) continue;
+
+    if (!ownedSet.has(id)) {
+      removedInvalidPlayerIds.push(id);
+      continue;
+    }
+
+    if (used.has(id)) continue;
+    if (cleanStarters.length >= 11) continue;
+    cleanStarters.push(id);
+    used.add(id);
+  }
+
+  const cleanBench = [];
+  for (const rawId of bench || []) {
+    const id = String(rawId || "").trim();
+    if (!id) continue;
+
+    if (!ownedSet.has(id)) {
+      removedInvalidPlayerIds.push(id);
+      continue;
+    }
+
+    if (used.has(id)) continue;
+    cleanBench.push(id);
+    used.add(id);
+  }
+
+  const addedMissingOwnedPlayerIdsToBench = [];
+  for (const id of ownedPlayerIds || []) {
+    const cleanId = String(id || "").trim();
+    if (!cleanId || used.has(cleanId)) continue;
+
+    cleanBench.push(cleanId);
+    addedMissingOwnedPlayerIdsToBench.push(cleanId);
+    used.add(cleanId);
+  }
+
+  return {
+    starters: cleanStarters,
+    bench: cleanBench,
+    removedInvalidPlayerIds: Array.from(new Set(removedInvalidPlayerIds)),
+    addedMissingOwnedPlayerIdsToBench,
+  };
+}
+
+async function assertLineupPlayersOwnedByUser({
+  roomId,
+  targetUid,
+  starters = [],
+  bench = [],
+}) {
+  const submittedIds = Array.from(
+    new Set([...(starters || []), ...(bench || [])].map(String).filter(Boolean))
+  );
+
+  if (!submittedIds.length) return;
+
+  const picksSnap = await db.collection(`rooms/${roomId}/picks`).get();
+  const ownedPlayerIds = new Set();
+
+  for (const pickDoc of picksSnap.docs || []) {
+    const data = pickDoc.data() || {};
+    const ownerUid = inferLineupPickOwnerUid(data);
+    if (String(ownerUid || "") !== String(targetUid)) continue;
+
+    const playerId = inferLineupPickPlayerId(data);
+    if (playerId) ownedPlayerIds.add(playerId);
+  }
+
+  const missingIds = submittedIds.filter((playerId) => !ownedPlayerIds.has(playerId));
+
+  if (missingIds.length > 0) {
+    throw new HttpsError(
+      "failed-precondition",
+      "Lineup contains players that are not on this manager's drafted roster.",
+      {
+        roomId,
+        targetUid,
+        missingIds,
+        submittedIds,
+        ownedPlayerIds: Array.from(ownedPlayerIds),
+      }
+    );
+  }
+}
+
+function normalizeCanonicalLineupPlayer(d = {}, fallbackId = "") {
+  const playerId = String(
+    d.playerId ??
+      d.pid ??
+      d.apiPlayerId ??
+      d.id ??
+      d.player?.id ??
+      d.player?.playerId ??
+      fallbackId ??
+      ""
+  ).trim();
+
+  if (!playerId) return null;
+
+  const apiPlayerId = d.apiPlayerId ?? d.api_player_id ?? d.player?.id ?? null;
+  const teamId = d.teamId ?? d.apiTeamId ?? d.team?.id ?? null;
+
+  return {
+    id: playerId,
+    playerId,
+    apiPlayerId: apiPlayerId != null ? String(apiPlayerId) : null,
+    name:
+      d.playerName ||
+      d.name ||
+      d.fullName ||
+      d.displayName ||
+      d.player?.name ||
+      "Unknown",
+    position: toPos(d.position || d.pos || d.role || d.player?.position || "MID"),
+    teamId: teamId != null ? String(teamId) : null,
+    apiTeamId: teamId != null ? String(teamId) : null,
+    teamName: d.teamName || d.team?.name || "",
+    teamLogo: d.teamLogo || d.team?.logo || "",
+    nationality: d.nationality || d.country || d.player?.nationality || "",
+  };
+}
+
+async function buildCanonicalLineupObjectsForUser({
+  roomId,
+  targetUid,
+  starters = [],
+  bench = [],
+}) {
+  const neededIds = Array.from(
+    new Set([...(starters || []), ...(bench || [])].map(String).filter(Boolean))
+  );
+
+  const byId = new Map();
+
+  const picksSnap = await db.collection(`rooms/${roomId}/picks`).get();
+
+  for (const pickDoc of picksSnap.docs || []) {
+    const data = pickDoc.data() || {};
+    const ownerUid = inferLineupPickOwnerUid(data);
+    if (String(ownerUid || "") !== String(targetUid)) continue;
+
+    const playerId = inferLineupPickPlayerId(data);
+    if (!playerId) continue;
+
+    const canonical = normalizeCanonicalLineupPlayer(data, playerId);
+    if (canonical) byId.set(playerId, canonical);
+  }
+
+  // Optional fallback: if a pick doc is light/missing metadata, enrich from rooms/{roomId}/players/{playerId}
+  const missingMetaIds = neededIds.filter((playerId) => {
+    const player = byId.get(playerId);
+    return (
+      !player ||
+      !player.name ||
+      player.name === "Unknown" ||
+      !player.position ||
+      !player.teamId
+    );
+  });
+
+  if (missingMetaIds.length > 0) {
+    const playerRefs = missingMetaIds.map((playerId) =>
+      db.doc(`rooms/${roomId}/players/${playerId}`)
+    );
+    const playerSnaps = await db.getAll(...playerRefs);
+
+    for (let i = 0; i < playerSnaps.length; i += 1) {
+      const snap = playerSnaps[i];
+      if (!snap.exists) continue;
+
+      const playerId = missingMetaIds[i];
+      const existing = byId.get(playerId) || {};
+      const fromPlayerDoc = normalizeCanonicalLineupPlayer(snap.data() || {}, playerId);
+
+      byId.set(playerId, {
+        ...existing,
+        ...fromPlayerDoc,
+        id: playerId,
+        playerId,
+        name:
+          existing.name && existing.name !== "Unknown"
+            ? existing.name
+            : fromPlayerDoc?.name || "Unknown",
+        position: toPos(existing.position || fromPlayerDoc?.position || "MID"),
+        teamId: existing.teamId || fromPlayerDoc?.teamId || null,
+        apiTeamId: existing.apiTeamId || fromPlayerDoc?.apiTeamId || null,
+        teamName: existing.teamName || fromPlayerDoc?.teamName || "",
+        teamLogo: existing.teamLogo || fromPlayerDoc?.teamLogo || "",
+        nationality: existing.nationality || fromPlayerDoc?.nationality || "",
+      });
+    }
+  }
+
+  const toCanonicalList = (ids = []) =>
+    ids.map((playerId) => {
+      const id = String(playerId);
+      return (
+        byId.get(id) || {
+          id,
+          playerId: id,
+          name: "Unknown",
+          position: "MID",
+        }
+      );
+    });
+
+  return {
+    startingXI: toCanonicalList(starters),
+    benchXI: toCanonicalList(bench),
+  };
+}
+
+async function repairUserLineupFromCurrentPicks({
+  db: firestoreDb,
+  roomId,
+  targetUid,
+  nowMs = Date.now(),
+  dryRun = false,
+  reason = "manual-repair",
+}) {
+  const cleanRoomId = String(roomId || "").trim();
+  const cleanTargetUid = String(targetUid || "").trim();
+  if (!cleanRoomId || !cleanTargetUid) {
+    throw new HttpsError(
+      "invalid-argument",
+      "roomId and targetUid are required."
+    );
+  }
+
+  const roomRef = firestoreDb.doc(`rooms/${cleanRoomId}`);
+  const lineupRef = roomRef.collection("lineups").doc(cleanTargetUid);
+  const [roomSnap, picksSnap, lineupSnap] = await Promise.all([
+    roomRef.get(),
+    roomRef.collection("picks").get(),
+    lineupRef.get(),
+  ]);
+
+  if (!roomSnap.exists) {
+    throw new HttpsError("not-found", "Room not found.");
+  }
+
+  const ownedPicks = [];
+  for (const pickDoc of picksSnap.docs || []) {
+    const data = pickDoc.data() || {};
+    const ownerUid = String(inferLineupPickOwnerUid(data) || "").trim();
+    if (ownerUid !== cleanTargetUid) continue;
+
+    const playerId = inferLineupPickPlayerId(data);
+    if (!playerId) continue;
+    ownedPicks.push({
+      pickDocId: pickDoc.id,
+      playerId,
+      data,
+    });
+  }
+
+  ownedPicks.sort((a, b) => {
+    const aOrder = Number(
+      a.data?.turn ??
+        a.data?.pickIndex ??
+        a.data?.overallPick ??
+        a.data?.pickNumber ??
+        a.data?.createdAtMs
+    );
+    const bOrder = Number(
+      b.data?.turn ??
+        b.data?.pickIndex ??
+        b.data?.overallPick ??
+        b.data?.pickNumber ??
+        b.data?.createdAtMs
+    );
+    const safeA = Number.isFinite(aOrder) ? aOrder : Number.MAX_SAFE_INTEGER;
+    const safeB = Number.isFinite(bOrder) ? bOrder : Number.MAX_SAFE_INTEGER;
+    return safeA - safeB || a.playerId.localeCompare(b.playerId);
+  });
+
+  const ownedPlayerIds = Array.from(
+    new Set(ownedPicks.map((pick) => pick.playerId).filter(Boolean))
+  );
+  const ownedPlayerIdSet = new Set(ownedPlayerIds);
+  const pickByPlayerId = new Map(
+    ownedPicks.map((pick) => [pick.playerId, pick.data])
+  );
+  const lineup = lineupSnap.exists ? lineupSnap.data() || {} : {};
+  const currentStarters = (
+    Array.isArray(lineup.starters)
+      ? lineup.starters
+      : Array.isArray(lineup.startingXI)
+        ? lineup.startingXI
+        : []
+  )
+    .map(lineupEntryId)
+    .filter(Boolean);
+  const currentBench = (
+    Array.isArray(lineup.bench)
+      ? lineup.bench
+      : Array.isArray(lineup.benchXI)
+        ? lineup.benchXI
+        : []
+  )
+    .map(lineupEntryId)
+    .filter(Boolean);
+  const currentIds = Array.from(
+    new Set([...currentStarters, ...currentBench])
+  );
+  const invalidCurrentIds = currentIds.filter(
+    (playerId) => !ownedPlayerIdSet.has(playerId)
+  );
+
+  const nextStarters = [];
+  const usedIds = new Set();
+  for (const playerId of currentStarters) {
+    if (
+      ownedPlayerIdSet.has(playerId) &&
+      !usedIds.has(playerId) &&
+      nextStarters.length < 11
+    ) {
+      nextStarters.push(playerId);
+      usedIds.add(playerId);
+    }
+  }
+
+  const benchCandidates = [];
+  for (const playerId of currentBench) {
+    if (ownedPlayerIdSet.has(playerId) && !usedIds.has(playerId)) {
+      benchCandidates.push(playerId);
+      usedIds.add(playerId);
+    }
+  }
+
+  const addedNewPlayerIdsToBench = [];
+  for (const playerId of ownedPlayerIds) {
+    if (usedIds.has(playerId)) continue;
+    benchCandidates.push(playerId);
+    addedNewPlayerIdsToBench.push(playerId);
+    usedIds.add(playerId);
+  }
+
+  if (nextStarters.length === 0 && benchCandidates.length > 0) {
+    const goalkeeperIndex = benchCandidates.findIndex(
+      (playerId) =>
+        toPos(pickByPlayerId.get(playerId)?.position || "") === "GK"
+    );
+    if (goalkeeperIndex > 0) {
+      const [goalkeeperId] = benchCandidates.splice(goalkeeperIndex, 1);
+      benchCandidates.unshift(goalkeeperId);
+    }
+  }
+
+  while (nextStarters.length < 11 && benchCandidates.length > 0) {
+    nextStarters.push(benchCandidates.shift());
+  }
+  const nextBench = benchCandidates;
+  const canonicalLineup = await buildCanonicalLineupObjectsForUser({
+    roomId: cleanRoomId,
+    targetUid: cleanTargetUid,
+    starters: nextStarters,
+    bench: nextBench,
+  });
+
+  const result = {
+    ok: true,
+    dryRun: Boolean(dryRun),
+    roomId: cleanRoomId,
+    targetUid: cleanTargetUid,
+    reason,
+    currentStarters,
+    currentBench,
+    ownedPlayerIds,
+    invalidCurrentIds,
+    removedInvalidPlayerIds: invalidCurrentIds,
+    addedNewPlayerIdsToBench,
+    nextStarters,
+    nextBench,
+    starterCount: nextStarters.length,
+    benchCount: nextBench.length,
+  };
+
+  if (!dryRun) {
+    await lineupRef.set(
+      {
+        uid: cleanTargetUid,
+        starters: nextStarters,
+        bench: nextBench,
+        startingXI: canonicalLineup.startingXI,
+        benchXI: canonicalLineup.benchXI,
+        updatedAt: FieldValue.serverTimestamp(),
+        updatedAtMs: nowMs,
+        lineupSyncedAfterRosterChangeAtMs: nowMs,
+        lineupSyncedAfterRosterChangeReason: reason,
+        removedInvalidPlayerIds: invalidCurrentIds,
+        addedNewPlayerIdsToBench,
+      },
+      { merge: true }
+    );
+  }
+
+  return result;
+}
+
+function assertPlayerRemovalNotWorldCupLocked({
+  room,
+  lineup,
+  playerId,
+  nowMs = Date.now(),
+}) {
+  if (!isWorldCupDailyLineupRoom(room)) return;
+  const cleanPlayerId = String(playerId || "").trim();
+  const lock = getActiveWorldCupDailyLocks(lineup || {}, nowMs)[cleanPlayerId];
+  if (!lock) return;
+
+  throw new HttpsError(
+    "failed-precondition",
+    `Player is locked by World Cup Group Stage lineup lock until ${formatWorldCupDailyLockDate(lock)}.`,
+    {
+      playerId: cleanPlayerId,
+      lockedUntilMs: Number(lock.lockedUntilMs || 0),
+    }
+  );
+}
+
+exports.repairUserLineupFromPicks = onCall(
+  { region: "us-west2", timeoutSeconds: 120, memory: "512MiB" },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) {
+      throw new HttpsError("unauthenticated", "Sign in required.");
+    }
+
+    const roomId = String(request.data?.roomId || "").trim();
+    const targetUid = String(request.data?.targetUid || "").trim();
+    const dryRun = request.data?.dryRun !== false;
+    if (!roomId || !targetUid) {
+      throw new HttpsError(
+        "invalid-argument",
+        "roomId and targetUid are required."
+      );
+    }
+
+    const roomSnap = await db.doc(`rooms/${roomId}`).get();
+    if (!roomSnap.exists) {
+      throw new HttpsError("not-found", "Room not found.");
+    }
+    const room = roomSnap.data() || {};
+    if (!isHost(room, uid) && !ADMIN_UIDS.has(String(uid))) {
+      throw new HttpsError(
+        "permission-denied",
+        "Only the room host or owner can repair another user's lineup."
+      );
+    }
+
+    return repairUserLineupFromCurrentPicks({
+      db,
+      roomId,
+      targetUid,
+      nowMs: Date.now(),
+      dryRun,
+      reason: dryRun ? "manual-repair-dry-run" : "manual-repair",
+    });
+  }
+);
+
+exports.applyAcceptedTrade = onCall(
+  { region: "us-west2", timeoutSeconds: 120, memory: "512MiB" },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) {
+      throw new HttpsError("unauthenticated", "Sign in required.");
+    }
+
+    const roomId = String(request.data?.roomId || "").trim();
+    const tradeId = String(request.data?.tradeId || "").trim();
+    if (!roomId || !tradeId) {
+      throw new HttpsError(
+        "invalid-argument",
+        "roomId and tradeId are required."
+      );
+    }
+
+    const roomRef = db.doc(`rooms/${roomId}`);
+    const tradeRef = roomRef.collection("trades").doc(tradeId);
+    const [roomSnap, tradeSnap, picksSnap] = await Promise.all([
+      roomRef.get(),
+      tradeRef.get(),
+      roomRef.collection("picks").get(),
+    ]);
+
+    if (!roomSnap.exists) {
+      throw new HttpsError("not-found", "Room not found.");
+    }
+    const room = roomSnap.data() || {};
+    if (!isHost(room, uid)) {
+      throw new HttpsError("permission-denied", "Only host can apply trades.");
+    }
+    if (!tradeSnap.exists) {
+      throw new HttpsError("not-found", "Trade not found.");
+    }
+
+    const trade = tradeSnap.data() || {};
+    if (trade.status !== "accepted") {
+      return { ok: true, roomId, tradeId, status: trade.status };
+    }
+    if (trade.appliedAt) {
+      return { ok: true, roomId, tradeId, status: "completed" };
+    }
+
+    const normalizeTradeEntry = (entry = {}) => ({
+      pickId: String(
+        entry.pickId || entry.pickDocId || entry.docId || ""
+      ).trim(),
+      playerId: inferLineupPickPlayerId(entry),
+      name:
+        entry.playerName ||
+        entry.name ||
+        entry.fullName ||
+        entry.displayName ||
+        entry.player?.name ||
+        "Unknown",
+      position: entry.position || entry.pos || "SUB",
+      teamId: entry.teamId || entry.apiTeamId || entry.team?.id || null,
+      teamName: entry.teamName || entry.team?.name || "",
+      teamLogo: entry.teamLogo || entry.team?.logo || "",
+      nationality: entry.nationality || entry.country || "",
+      apiPlayerId:
+        entry.apiPlayerId || entry.player?.id || entry.playerId || null,
+    });
+    const give = (Array.isArray(trade.give) ? trade.give : [])
+      .map(normalizeTradeEntry);
+    const receive = (Array.isArray(trade.receive) ? trade.receive : [])
+      .map(normalizeTradeEntry);
+    if (give.length < 1 || give.length > 2 || receive.length !== give.length) {
+      throw new HttpsError("failed-precondition", "Invalid trade player count.");
+    }
+
+    const pickDocs = picksSnap.docs.map((pickDoc) => ({
+      id: pickDoc.id,
+      ref: pickDoc.ref,
+      ...(pickDoc.data() || {}),
+    }));
+    const findTradePick = (entry, expectedOwnerUid) => {
+      if (entry.pickId) {
+        const exact = pickDocs.find((pick) => pick.id === entry.pickId);
+        if (exact) return exact;
+      }
+      return pickDocs.find(
+        (pick) =>
+          String(inferLineupPickOwnerUid(pick) || "") ===
+            String(expectedOwnerUid || "") &&
+          inferLineupPickPlayerId(pick) === String(entry.playerId || "")
+      );
+    };
+    const fromPicks = give.map((entry) =>
+      findTradePick(entry, trade.fromUid)
+    );
+    const toPicks = receive.map((entry) =>
+      findTradePick(entry, trade.toUid)
+    );
+    if (fromPicks.some((pick) => !pick) || toPicks.some((pick) => !pick)) {
+      await tradeRef.set(
+        {
+          status: "rejected",
+          failureReason: "TRADE_PICK_NOT_OWNED",
+          respondedAt: FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp(),
+          updatedAtMs: Date.now(),
+        },
+        { merge: true }
+      );
+      return { ok: true, roomId, tradeId, status: "rejected" };
+    }
+
+    const nowMs = Date.now();
+    const fromLineupRef = roomRef.collection("lineups").doc(String(trade.fromUid));
+    const toLineupRef = roomRef.collection("lineups").doc(String(trade.toUid));
+    const transactionResult = await db.runTransaction(async (tx) => {
+      const freshRoomSnap = await tx.get(roomRef);
+      const freshTradeSnap = await tx.get(tradeRef);
+      const freshFromLineupSnap = await tx.get(fromLineupRef);
+      const freshToLineupSnap = await tx.get(toLineupRef);
+      const freshFromPickSnaps = [];
+      const freshToPickSnaps = [];
+
+      for (const pick of fromPicks) {
+        freshFromPickSnaps.push(await tx.get(pick.ref));
+      }
+      for (const pick of toPicks) {
+        freshToPickSnaps.push(await tx.get(pick.ref));
+      }
+
+      if (!freshRoomSnap.exists) {
+        throw new HttpsError("not-found", "Room not found.");
+      }
+      const freshRoom = freshRoomSnap.data() || {};
+      if (!isHost(freshRoom, uid)) {
+        throw new HttpsError(
+          "permission-denied",
+          "Only host can apply trades."
+        );
+      }
+      if (!freshTradeSnap.exists) {
+        throw new HttpsError("not-found", "Trade not found.");
+      }
+      const freshTrade = freshTradeSnap.data() || {};
+      if (freshTrade.status !== "accepted" || freshTrade.appliedAt) {
+        return {
+          applied: false,
+          status: freshTrade.appliedAt ? "completed" : freshTrade.status,
+        };
+      }
+
+      freshFromPickSnaps.forEach((snap, index) => {
+        const data = snap.exists ? snap.data() || {} : {};
+        if (
+          !snap.exists ||
+          String(inferLineupPickOwnerUid(data) || "") !==
+            String(freshTrade.fromUid || "") ||
+          inferLineupPickPlayerId(data) !== give[index].playerId
+        ) {
+          throw new HttpsError(
+            "failed-precondition",
+            "Sender no longer owns an offered player."
+          );
+        }
+      });
+      freshToPickSnaps.forEach((snap, index) => {
+        const data = snap.exists ? snap.data() || {} : {};
+        if (
+          !snap.exists ||
+          String(inferLineupPickOwnerUid(data) || "") !==
+            String(freshTrade.toUid || "") ||
+          inferLineupPickPlayerId(data) !== receive[index].playerId
+        ) {
+          throw new HttpsError(
+            "failed-precondition",
+            "Receiver no longer owns a requested player."
+          );
+        }
+      });
+
+      const fromLineup = freshFromLineupSnap.exists
+        ? freshFromLineupSnap.data() || {}
+        : {};
+      const toLineup = freshToLineupSnap.exists
+        ? freshToLineupSnap.data() || {}
+        : {};
+      for (const entry of give) {
+        assertPlayerRemovalNotWorldCupLocked({
+          room: freshRoom,
+          lineup: fromLineup,
+          playerId: entry.playerId,
+          nowMs,
+        });
+      }
+      for (const entry of receive) {
+        assertPlayerRemovalNotWorldCupLocked({
+          room: freshRoom,
+          lineup: toLineup,
+          playerId: entry.playerId,
+          nowMs,
+        });
+      }
+
+      for (let index = 0; index < give.length; index += 1) {
+        tx.update(fromPicks[index].ref, {
+          playerId: String(receive[index].playerId),
+          apiPlayerId:
+            receive[index].apiPlayerId != null
+              ? String(receive[index].apiPlayerId)
+              : null,
+          name: receive[index].name,
+          playerName: receive[index].name,
+          position: receive[index].position || "SUB",
+          teamId: receive[index].teamId,
+          teamName: receive[index].teamName,
+          teamLogo: receive[index].teamLogo,
+          nationality: receive[index].nationality,
+          updatedAt: FieldValue.serverTimestamp(),
+          updatedAtMs: nowMs,
+        });
+        tx.update(toPicks[index].ref, {
+          playerId: String(give[index].playerId),
+          apiPlayerId:
+            give[index].apiPlayerId != null
+              ? String(give[index].apiPlayerId)
+              : null,
+          name: give[index].name,
+          playerName: give[index].name,
+          position: give[index].position || "SUB",
+          teamId: give[index].teamId,
+          teamName: give[index].teamName,
+          teamLogo: give[index].teamLogo,
+          nationality: give[index].nationality,
+          updatedAt: FieldValue.serverTimestamp(),
+          updatedAtMs: nowMs,
+        });
+      }
+
+      tx.set(
+        tradeRef,
+        {
+          status: "completed",
+          appliedAt: FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp(),
+          updatedAtMs: nowMs,
+        },
+        { merge: true }
+      );
+      return { applied: true, status: "completed" };
+    });
+
+    const lineupRepairs = [];
+    const lineupRepairErrors = [];
+    if (transactionResult.applied) {
+      for (const targetUid of [trade.fromUid, trade.toUid]) {
+        try {
+          lineupRepairs.push(
+            await repairUserLineupFromCurrentPicks({
+              db,
+              roomId,
+              targetUid,
+              nowMs,
+              dryRun: false,
+              reason: "direct-trade-completed",
+            })
+          );
+        } catch (error) {
+          console.error("[applyAcceptedTrade] lineup repair failed", {
+            roomId,
+            tradeId,
+            targetUid,
+            code: error?.code,
+            message: error?.message,
+          });
+          lineupRepairErrors.push({
+            targetUid,
+            code: error?.code || "unknown",
+            message: error?.message || String(error),
+          });
+        }
+      }
+
+      if (lineupRepairErrors.length > 0) {
+        await tradeRef.set(
+          {
+            lineupRepairErrors,
+            lineupRepairFailedAtMs: Date.now(),
+          },
+          { merge: true }
+        );
+      } else {
+        await tradeRef.set(
+          {
+            lineupRepairErrors: FieldValue.delete(),
+            lineupRepairFailedAtMs: FieldValue.delete(),
+          },
+          { merge: true }
+        );
+      }
+    }
+
+    return {
+      ok: true,
+      roomId,
+      tradeId,
+      status: transactionResult.status,
+      lineupRepairs,
+      lineupRepairErrors,
+    };
+  }
+);
+
+function assertWorldCupDailyLineupLocks({
+  room,
+  lineup,
+  nextStarters,
+  nowMs = Date.now(),
+}) {
+  if (!isWorldCupDailyLineupRoom(room)) return;
+
+  const violation = findWorldCupDailyLockViolation({
+    lineup,
+    nextStarters,
+    nowMs,
+  });
+  if (!violation) return;
+
+  const playerName = violation.playerName || "This player";
+  const unlockLabel = formatWorldCupDailyLockDate(violation);
+  throw new HttpsError(
+    "failed-precondition",
+    `${playerName} is locked until ${unlockLabel} because they appeared in a World Cup Group Stage match.`
+  );
+}
+
+function assertWorldCupDailyRoomIsNotLive(room = {}) {
+  if (!isWorldCupDailyLineupRoom(room)) return;
+  const status = String(
+    getCompetitionState(room)?.weekStatus ||
+      room?.competitionState?.weekStatus ||
+      room?.status ||
+      ""
+  ).toLowerCase();
+
+  if (status === "live" || status === "resolving") {
+    throw new HttpsError(
+      "failed-precondition",
+      "World Cup Group Stage lineups cannot be changed while matches are live or resolving."
+    );
+  }
+}
+
+async function assertWorldCupDailySubstitutionPlayersNotStarted({
+  roomId,
+  room,
+  playerIds = [],
+  nowMs = Date.now(),
+}) {
+  if (!isWorldCupDailyLineupRoom(room)) return;
+
+  const cleanPlayerIds = Array.from(
+    new Set(
+      (Array.isArray(playerIds) ? playerIds : [])
+        .map((id) => String(id || "").trim())
+        .filter(Boolean)
+    )
+  );
+  if (!cleanPlayerIds.length) return;
+
+  const currentDayIndex = Number(
+    room?.worldCup?.currentDayIndex ||
+      room?.currentDayIndex ||
+      room?.competitionState?.currentDayIndex ||
+      0
+  );
+  if (!Number.isFinite(currentDayIndex) || currentDayIndex <= 0) return;
+
+  const daySnap = await db
+    .doc(`rooms/${roomId}/days/${String(currentDayIndex)}`)
+    .get();
+  if (!daySnap.exists) return;
+
+  const day = daySnap.data() || {};
+  const fixtures = Array.isArray(day.fixtures) ? day.fixtures : [];
+  if (!fixtures.length) return;
+
+  const playerRefs = cleanPlayerIds.map((playerId) =>
+    db.doc(`rooms/${roomId}/players/${playerId}`)
+  );
+  const playerSnaps = await db.getAll(...playerRefs);
+  const playerTeamById = new Map();
+
+  for (let index = 0; index < playerSnaps.length; index += 1) {
+    const data = playerSnaps[index]?.exists
+      ? playerSnaps[index].data() || {}
+      : {};
+    const teamId = String(
+      data.teamId ??
+        data.apiTeamId ??
+        data.team?.id ??
+        ""
+    ).trim();
+
+    if (teamId) {
+      playerTeamById.set(cleanPlayerIds[index], teamId);
+    }
+  }
+
+  const lockedPlayers = [];
+
+  for (const playerId of cleanPlayerIds) {
+    const teamId = playerTeamById.get(playerId);
+    if (!teamId) continue;
+
+    for (const fixture of fixtures) {
+      const homeTeamId = String(
+        fixture?.homeTeamId ??
+          fixture?.teams?.home?.id ??
+          fixture?.home?.id ??
+          ""
+      ).trim();
+      const awayTeamId = String(
+        fixture?.awayTeamId ??
+          fixture?.teams?.away?.id ??
+          fixture?.away?.id ??
+          ""
+      ).trim();
+
+      if (teamId !== homeTeamId && teamId !== awayTeamId) continue;
+
+      const fixtureId = String(
+        fixture?.fixtureId ??
+          fixture?.id ??
+          fixture?.fixture?.id ??
+          ""
+      ).trim();
+      const kickoffMsRaw =
+        fixture?.kickoffMs ??
+        fixture?.startAtMs ??
+        fixture?.fixture?.timestamp ??
+        fixture?.timestamp ??
+        null;
+      const kickoffMsNumber = Number(kickoffMsRaw);
+      const parsedKickoffMs = Date.parse(
+        fixture?.fixture?.date ||
+          fixture?.date ||
+          fixture?.kickoff ||
+          fixture?.startAt ||
+          ""
+      );
+      const kickoffMs =
+        Number.isFinite(kickoffMsNumber) && kickoffMsNumber > 0
+          ? kickoffMsNumber < 100000000000
+            ? kickoffMsNumber * 1000
+            : kickoffMsNumber
+          : Number.isFinite(parsedKickoffMs)
+            ? parsedKickoffMs
+            : null;
+      const statusShort = String(
+        day?.fixtureStatusById?.[fixtureId] ||
+          fixture?.statusShort ||
+          fixture?.fixtureStatus ||
+          fixture?.matchStatus ||
+          fixture?.fixture?.status?.short ||
+          ""
+      )
+        .trim()
+        .toUpperCase();
+      const hasFixtureKickedOff =
+        (Number.isFinite(kickoffMs) && kickoffMs > 0 && nowMs >= kickoffMs) ||
+        (
+          statusShort &&
+          !["NS", "TBD", "PST", "CANC"].includes(statusShort)
+        );
+
+      if (hasFixtureKickedOff) {
+        lockedPlayers.push({
+          playerId,
+          teamId,
+          fixtureId,
+          statusShort,
+          kickoffMs: Number.isFinite(kickoffMs) ? kickoffMs : null,
+        });
+        break;
+      }
+    }
+  }
+
+  if (lockedPlayers.length > 0) {
+    throw new HttpsError(
+      "failed-precondition",
+      "This player cannot be moved because their World Cup Group Stage match has already kicked off.",
+      {
+        roomId,
+        currentDayIndex,
+        lockedPlayers,
+      }
+    );
+  }
+}
+
+exports.saveWorldCupDailyLineup = onCall(
+  { region: "us-west2" },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) throw new HttpsError("unauthenticated", "Sign in required.");
+
+    const roomId = String(request.data?.roomId || "").trim();
+    const targetUid = String(request.data?.targetUid || uid).trim() || uid;
+    if (!roomId) throw new HttpsError("invalid-argument", "roomId is required.");
+
+    const roomRef = db.doc(`rooms/${roomId}`);
+    const roomSnap = await roomRef.get();
+    if (!roomSnap.exists) throw new HttpsError("not-found", "Room not found.");
+
+    const room = roomSnap.data() || {};
+    if (!isWorldCupDailyLineupRoom(room)) {
+      throw new HttpsError(
+        "failed-precondition",
+        "This lineup save is only for World Cup Group Stage rooms."
+      );
+    }
+    if (uid !== targetUid && !isHost(room, uid)) {
+      throw new HttpsError("permission-denied", "Not allowed to edit this lineup.");
+    }
+    assertWorldCupDailyRoomIsNotLive(room);
+
+    const starters = (Array.isArray(request.data?.starters) ? request.data.starters : [])
+      .map(lineupEntryId)
+      .filter(Boolean);
+    const bench = (Array.isArray(request.data?.bench) ? request.data.bench : [])
+      .map(lineupEntryId)
+      .filter(Boolean);
+
+    if (starters.length > 11) {
+      throw new HttpsError("invalid-argument", "A starting lineup cannot exceed 11 players.");
+    }
+    if (new Set(starters).size !== starters.length || new Set(bench).size !== bench.length) {
+      throw new HttpsError("invalid-argument", "Lineup player IDs must be unique.");
+    }
+    if (starters.some((playerId) => bench.includes(playerId))) {
+      throw new HttpsError(
+        "invalid-argument",
+        "A player cannot be both a starter and a bench player."
+      );
+    }
+
+    await assertLineupPlayersOwnedByUser({
+      roomId,
+      targetUid,
+      starters,
+      bench,
+    });
+
+    const canonicalLineup = await buildCanonicalLineupObjectsForUser({
+      roomId,
+      targetUid,
+      starters,
+      bench,
+    });
+
+    const lineupRef = db.doc(`rooms/${roomId}/lineups/${targetUid}`);
+    const lineupSnap = await lineupRef.get();
+    const lineup = lineupSnap.exists ? lineupSnap.data() || {} : {};
+    const nowMs = Date.now();
+
+    assertWorldCupDailyLineupLocks({
+      room,
+      lineup,
+      nextStarters: starters,
+      nowMs,
+    });
+
+    const lineupPatch = {
+      uid: targetUid,
+      starters,
+      bench,
+      startingXI: canonicalLineup.startingXI,
+      benchXI: canonicalLineup.benchXI,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAtMs: nowMs,
+      updatedBy: uid,
+    };
+
+    await lineupRef.set(lineupPatch, { merge: true });
+
+    return {
+      ok: true,
+      roomId,
+      targetUid,
+      starters,
+      bench,
+    };
+  }
+);
 
 exports.saveLineupSubstitution = onCall(
   { region: "us-west2" },
@@ -3262,6 +4478,9 @@ exports.saveLineupSubstitution = onCall(
     if (uid !== targetUid && !isHost(room, uid)) {
       throw new HttpsError("permission-denied", "Not allowed to edit this lineup.");
     }
+    if (!isWorldCupDailyLineupRoom(room)) {
+      assertWorldCupDailyRoomIsNotLive(room);
+    }
 
     const lineupRef = db.doc(`rooms/${roomId}/lineups/${targetUid}`);
     let lineupSnap = await lineupRef.get();
@@ -3272,14 +4491,76 @@ exports.saveLineupSubstitution = onCall(
     }
 
     const lineup = lineupSnap.exists ? (lineupSnap.data() || {}) : {};
-    const starters = Array.isArray(lineup?.starters)
-      ? lineup.starters.map((id) => String(id))
-      : [];
-    const bench = Array.isArray(lineup?.bench)
-      ? lineup.bench.map((id) => String(id))
-      : [];
+    const savedStarterEntries = Array.isArray(lineup?.starters)
+      ? lineup.starters
+      : Array.isArray(lineup?.startingXI)
+        ? lineup.startingXI
+        : [];
+    const savedBenchEntries = Array.isArray(lineup?.bench)
+      ? lineup.bench
+      : Array.isArray(lineup?.benchXI)
+        ? lineup.benchXI
+        : [];
+    let starters = savedStarterEntries.map(lineupEntryId).filter(Boolean);
+    let bench = savedBenchEntries.map(lineupEntryId).filter(Boolean);
     const startingXI = Array.isArray(lineup?.startingXI) ? lineup.startingXI : null;
     const benchXI = Array.isArray(lineup?.benchXI) ? lineup.benchXI : null;
+    let repairedBeforeSubstitution = false;
+    let removedInvalidPlayerIds = [];
+    let addedMissingOwnedPlayerIdsToBench = [];
+
+    if (isWorldCupDailyLineupRoom(room)) {
+      const {
+        ownedPlayerIds,
+        ownedPlayerIdSet,
+      } = await loadOwnedLineupPlayerIdsForUser({
+        roomId,
+        targetUid,
+      });
+
+      if (!ownedPlayerIdSet.has(starterOutId)) {
+        throw new HttpsError(
+          "failed-precondition",
+          "starterOutId is not on this manager's drafted roster.",
+          {
+            roomId,
+            targetUid,
+            starterOutId,
+            ownedPlayerIds,
+          }
+        );
+      }
+
+      if (!ownedPlayerIdSet.has(benchInId)) {
+        throw new HttpsError(
+          "failed-precondition",
+          "benchInId is not on this manager's drafted roster.",
+          {
+            roomId,
+            targetUid,
+            benchInId,
+            ownedPlayerIds,
+          }
+        );
+      }
+
+      const sanitized = sanitizeLineupIdsAgainstOwnedRoster({
+        starters,
+        bench,
+        ownedPlayerIds,
+      });
+
+      starters = sanitized.starters;
+      bench = sanitized.bench;
+      removedInvalidPlayerIds = sanitized.removedInvalidPlayerIds;
+      addedMissingOwnedPlayerIdsToBench =
+        sanitized.addedMissingOwnedPlayerIdsToBench;
+      repairedBeforeSubstitution =
+        removedInvalidPlayerIds.length > 0 ||
+        addedMissingOwnedPlayerIdsToBench.length > 0 ||
+        starters.length !== savedStarterEntries.length ||
+        bench.length !== savedBenchEntries.length;
+    }
 
     if (!starters.includes(starterOutId)) {
       throw new HttpsError("failed-precondition", "starterOutId is not in starters.");
@@ -3289,12 +4570,38 @@ exports.saveLineupSubstitution = onCall(
       throw new HttpsError("failed-precondition", "benchInId is not in bench.");
     }
 
+    const nowMs = Date.now();
+    await assertWorldCupDailySubstitutionPlayersNotStarted({
+      roomId,
+      room,
+      playerIds: [starterOutId, benchInId],
+      nowMs,
+    });
+
     const nextStarters = starters.map((id) =>
       id === starterOutId ? benchInId : id
     );
     const nextBench = bench.map((id) =>
       id === benchInId ? starterOutId : id
     );
+    if (isWorldCupDailyLineupRoom(room)) {
+      await assertLineupPlayersOwnedByUser({
+        roomId,
+        targetUid,
+        starters: nextStarters,
+        bench: nextBench,
+      });
+    }
+
+    const canonicalLineup = isWorldCupDailyLineupRoom(room)
+      ? await buildCanonicalLineupObjectsForUser({
+          roomId,
+          targetUid,
+          starters: nextStarters,
+          bench: nextBench,
+        })
+      : null;
+
     const entryIdOf = (entry) => {
       if (entry == null) return "";
       if (typeof entry === "string") return String(entry);
@@ -3306,10 +4613,10 @@ exports.saveLineupSubstitution = onCall(
         ""
       );
     };
-    let nextStartingXI = startingXI;
-    let nextBenchXI = benchXI;
+    let nextStartingXI = canonicalLineup?.startingXI || startingXI;
+    let nextBenchXI = canonicalLineup?.benchXI || benchXI;
 
-    if (Array.isArray(startingXI) && Array.isArray(benchXI)) {
+    if (!canonicalLineup && Array.isArray(startingXI) && Array.isArray(benchXI)) {
       const starterOutEntry = startingXI.find(
         (entry) => entryIdOf(entry) === starterOutId
       );
@@ -3326,7 +4633,28 @@ exports.saveLineupSubstitution = onCall(
         );
       }
     }
-    const nowMs = Date.now();
+    const scoringNextStarters = Array.isArray(nextStartingXI)
+      ? nextStartingXI.map(lineupEntryId)
+      : nextStarters;
+    if (
+      isWorldCupDailyLineupRoom(room) &&
+      (
+        scoringNextStarters.length !== nextStarters.length ||
+        scoringNextStarters.some((playerId, index) => playerId !== nextStarters[index])
+      )
+    ) {
+      throw new HttpsError(
+        "failed-precondition",
+        "Lineup starter fields are out of sync. Refresh the roster and try again."
+      );
+    }
+
+    assertWorldCupDailyLineupLocks({
+      room,
+      lineup,
+      nextStarters: scoringNextStarters,
+      nowMs,
+    });
 
     const lineupPatch = {
       uid: targetUid,
@@ -3337,12 +4665,17 @@ exports.saveLineupSubstitution = onCall(
       updatedBy: uid,
     };
 
-    if (Array.isArray(nextStartingXI)) {
-      lineupPatch.startingXI = nextStartingXI;
-    }
+    if (canonicalLineup) {
+      lineupPatch.startingXI = canonicalLineup.startingXI;
+      lineupPatch.benchXI = canonicalLineup.benchXI;
+    } else {
+      if (Array.isArray(nextStartingXI)) {
+        lineupPatch.startingXI = nextStartingXI;
+      }
 
-    if (Array.isArray(nextBenchXI)) {
-      lineupPatch.benchXI = nextBenchXI;
+      if (Array.isArray(nextBenchXI)) {
+        lineupPatch.benchXI = nextBenchXI;
+      }
     }
 
     await lineupRef.set(lineupPatch, { merge: true });
@@ -3351,6 +4684,9 @@ exports.saveLineupSubstitution = onCall(
       ok: true,
       starters: nextStarters,
       bench: nextBench,
+      repairedBeforeSubstitution,
+      removedInvalidPlayerIds,
+      addedMissingOwnedPlayerIdsToBench,
     };
   }
 );
@@ -8355,6 +9691,129 @@ function isOwnerWorldCupGroupRoom(room) {
   );
 }
 
+function isOwnerWorldCupRoom(room = {}) {
+  const worldCupPhase = String(
+    room?.worldCupPhase || room?.worldCup?.phase || ""
+  ).trim().toLowerCase();
+  const engineType = String(
+    room?.engineType || room?.worldCup?.engineType || ""
+  ).trim();
+
+  return (
+    isOwnerWorldCupGroupRoom(room) ||
+    worldCupPhase === WORLD_CUP_GROUP_PHASE ||
+    worldCupPhase === WORLD_CUP_KNOCKOUT_PHASE ||
+    engineType === WORLD_CUP_GROUP_ENGINE ||
+    (
+      engineType === WORLD_CUP_KNOCKOUT_ENGINE &&
+      isWorldCupCompetition({
+        competitionKey: room?.competitionKey,
+        competitionName:
+          room?.competitionMeta?.name ||
+          room?.competition?.name ||
+          "",
+      })
+    ) ||
+    isWorldCupCompetition({
+      competitionKey: room?.competitionKey,
+      competitionName:
+        room?.competitionMeta?.name ||
+        room?.competition?.name ||
+        "",
+    })
+  );
+}
+
+function worldCupRepairPlayerIds(player = {}, fallbackId = "") {
+  return Array.from(
+    new Set(
+      [
+        fallbackId,
+        player?.id,
+        player?.playerId,
+        player?.apiPlayerId,
+        player?.pid,
+        player?.player?.id,
+      ]
+        .map((value) => String(value ?? "").trim())
+        .filter(Boolean)
+    )
+  );
+}
+
+function normalizeWorldCupRepairPlayer(player = {}, nowMs = Date.now()) {
+  const playerId = worldCupRepairPlayerIds(player)[0];
+  if (!playerId) return null;
+
+  const teamId = String(
+    player?.teamId ??
+      player?.apiTeamId ??
+      player?.team?.id ??
+      ""
+  ).trim();
+
+  return {
+    id: playerId,
+    playerId,
+    apiPlayerId: String(player?.apiPlayerId ?? playerId),
+    name:
+      player?.name ||
+      player?.fullName ||
+      player?.displayName ||
+      player?.playerName ||
+      player?.player?.name ||
+      "Unknown",
+    position: player?.position || player?.pos || "MID",
+    teamId,
+    apiTeamId: teamId,
+    teamName: player?.teamName || player?.team?.name || "",
+    teamLogo: player?.teamLogo || player?.team?.logo || "",
+    nationality:
+      player?.nationality ||
+      player?.country ||
+      player?.player?.nationality ||
+      "",
+    provider: player?.provider || "api-football",
+    updatedAt: FieldValue.serverTimestamp(),
+    addedByRepair: true,
+    repairedAtMs: nowMs,
+  };
+}
+
+async function writeMissingWorldCupRoomPlayers({
+  roomRef,
+  players = [],
+}) {
+  if (!players.length) return 0;
+
+  let batch = db.batch();
+  let operations = 0;
+  let written = 0;
+
+  const commitBatch = async () => {
+    if (!operations) return;
+    const currentBatch = batch;
+    batch = db.batch();
+    operations = 0;
+    await currentBatch.commit();
+  };
+
+  for (const player of players) {
+    batch.set(roomRef.collection("players").doc(player.id), player, {
+      merge: true,
+    });
+    operations += 1;
+    written += 1;
+
+    if (operations >= 450) {
+      await commitBatch();
+    }
+  }
+
+  await commitBatch();
+  return written;
+}
+
 function assertOwnerRegularRoom(room) {
   const phase = getRoomPhaseLabel(room);
   if (phase === "Cup" || isOwnerWorldCupGroupRoom(room)) {
@@ -9910,6 +11369,36 @@ exports.ownerRunWorldCupGroupEngineNow = onCall(
         ensureDefaultLineupsForRoom,
       });
 
+      const resultWeekStatus = String(
+        result?.weekStatus || result?.status || ""
+      ).toLowerCase();
+      const resultNextPollAtMs = Number(result?.nextPollAtMs || 0);
+      const manualQueueUpdated = ["scheduled", "live", "resolving"].includes(
+        resultWeekStatus
+      );
+      const manualQueueDeleted =
+        !manualQueueUpdated &&
+        (["final", "complete", "completed"].includes(resultWeekStatus) ||
+          result?.isDone === true);
+      const manualQueueNextPollAtMs = manualQueueUpdated
+        ? Number.isFinite(resultNextPollAtMs) &&
+          resultNextPollAtMs > debugNowMs
+          ? resultNextPollAtMs
+          : debugNowMs + 60 * 1000
+        : null;
+
+      if (manualQueueUpdated) {
+        await upsertTournamentPollTask({
+          roomId,
+          phase: "WorldCupGroup",
+          nextPollAtMs: manualQueueNextPollAtMs,
+          reason: "owner-run-world-cup-engine-now",
+          nowMs: debugNowMs,
+        });
+      } else if (manualQueueDeleted) {
+        await deleteTournamentPollTask(roomId);
+      }
+
       return {
         ok: true,
         roomId,
@@ -9921,12 +11410,400 @@ exports.ownerRunWorldCupGroupEngineNow = onCall(
         status: result?.status ?? null,
         weekStatus: result?.weekStatus ?? null,
         isDone: Boolean(result?.isDone),
+        pollReason: result?.pollReason ?? result?.skippedReason ?? null,
+        skippedReason: result?.skippedReason ?? null,
         nextPollAtMs: result?.nextPollAtMs ?? null,
         nextKickoffMs: result?.nextKickoffMs ?? null,
         fixtureCoverage: result?.fixtureCoverage || [],
+        statusByFixtureId:
+          result?.statusByFixtureId ||
+          result?.fixtureStatusById ||
+          {},
+        manualQueueUpdated,
+        manualQueueDeleted,
+        manualQueueReason: "owner-run-world-cup-engine-now",
+        manualQueueNextPollAtMs,
         teamScoresByUserId: result?.teamScoresByUserId || {},
         dailyLeaderboard: result?.dailyLeaderboard || [],
         standingsPreview: result?.standingsPreview || result?.leaderboard || [],
+      };
+    } catch (err) {
+      handleOwnerActionError(functionName, err);
+    }
+  }
+);
+
+exports.refreshWorldCupGlobalPlayerPool = onCall(
+  {
+    region: "us-west2",
+    secrets: [APIFOOTBALL_KEY],
+    timeoutSeconds: 540,
+    memory: "1GiB",
+  },
+  async (request) => {
+    const functionName = "refreshWorldCupGlobalPlayerPool";
+    const nowMs = Date.now();
+
+    try {
+      const uid = requireOwnerActionUid(request);
+      const league = Number(request.data?.league);
+      const season = Number(request.data?.season);
+      const timezone = String(
+        request.data?.timezone || "America/Los_Angeles"
+      );
+      const worldCupPhase = String(
+        request.data?.worldCupPhase || WORLD_CUP_GROUP_PHASE
+      )
+        .trim()
+        .toLowerCase();
+      const requestedSeasonKey = String(
+        request.data?.seasonKey || ""
+      ).trim();
+      const seasonKey =
+        requestedSeasonKey || buildWorldCupSeasonKey(season);
+      const forceRefresh = request.data?.forceRefresh !== false;
+      const dryRun = request.data?.dryRun !== false;
+
+      if (!Number.isFinite(league) || !Number.isFinite(season)) {
+        throw new HttpsError(
+          "invalid-argument",
+          "league and season are required."
+        );
+      }
+      if (!seasonKey) {
+        throw new HttpsError(
+          "invalid-argument",
+          "seasonKey is required."
+        );
+      }
+      if (
+        worldCupPhase !== WORLD_CUP_GROUP_PHASE &&
+        worldCupPhase !== WORLD_CUP_KNOCKOUT_PHASE
+      ) {
+        throw new HttpsError(
+          "invalid-argument",
+          "worldCupPhase must be 'group' or 'knockout'."
+        );
+      }
+
+      logOwnerAction(functionName, {
+        functionName,
+        uid,
+        seasonKey,
+        league,
+        season,
+        worldCupPhase,
+        forceRefresh,
+        dryRun,
+        nowMs,
+      });
+
+      const result = await ensureFreshWorldCupGlobalPlayerPool({
+        db,
+        apiFootballGet,
+        apiKey: APIFOOTBALL_KEY.value(),
+        seasonKey,
+        season,
+        worldCupPhase,
+        maxPlayers: 5000,
+        maxPagesPerTeam: 10,
+        forceRefresh,
+        dryRun,
+        nowMs,
+        loadDailyWindows: () =>
+          loadWorldCupGroupDailyWindows({
+            apiFootballGet,
+            apiKey: APIFOOTBALL_KEY.value(),
+            league,
+            season,
+            timezone,
+          }),
+      });
+
+      return {
+        ok: true,
+        dryRun,
+        mode: "world-cup-global-player-pool-refresh",
+        seasonKey,
+        beforeCount: result.beforeCount,
+        latestFetchedCount: result.latestFetchedCount,
+        missingCount: result.missingPlayers.length,
+        addedCount: result.addedCount,
+        afterCount: result.afterCount,
+        sampleMissingPlayers: result.missingPlayers
+          .slice(0, 25)
+          .map((player) => ({
+            id: worldCupRepairPlayerIds(player)[0] || "",
+            name:
+              player?.name ||
+              player?.fullName ||
+              player?.displayName ||
+              "Unknown",
+            position: player?.position || "",
+            teamName: player?.teamName || "",
+            nationality: player?.nationality || "",
+          })),
+        teamCount: result.teamCount,
+        teamFetchSummary: result.teamFetchSummary,
+        refreshed: result.refreshed,
+        wasStale: result.wasStale,
+        lastApiRefreshAtMs: result.lastApiRefreshAtMs,
+        refreshReason: result.refreshReason,
+        source: result.source,
+        staleMs: WORLD_CUP_GLOBAL_PLAYER_POOL_STALE_MS,
+        warnings: result.warnings,
+        errors: result.errors,
+      };
+    } catch (err) {
+      if (
+        !(err instanceof HttpsError) &&
+        ["aborted", "failed-precondition"].includes(err?.code)
+      ) {
+        err = new HttpsError(
+          err.code,
+          err?.message || "World Cup refresh failed."
+        );
+      }
+      handleOwnerActionError(functionName, err);
+    }
+  }
+);
+
+exports.repairWorldCupRoomMissingPlayers = onCall(
+  {
+    region: "us-west2",
+    secrets: [APIFOOTBALL_KEY],
+    timeoutSeconds: 540,
+    memory: "1GiB",
+  },
+  async (request) => {
+    const functionName = "repairWorldCupRoomMissingPlayers";
+    const nowMs = Date.now();
+
+    try {
+      const uid = requireOwnerActionUid(request);
+      const roomId = getOwnerActionRoomId(request);
+      const forceApiRefresh = request.data?.forceApiRefresh !== false;
+      const dryRun = request.data?.dryRun !== false;
+      const { roomRef, room } = await loadOwnerActionRoom(roomId);
+
+      if (!isOwnerWorldCupRoom(room)) {
+        throw new HttpsError(
+          "failed-precondition",
+          "Room is not a World Cup room."
+        );
+      }
+
+      const competition = room?.competition || {};
+      const league = Number(competition?.league);
+      const season = Number(competition?.season);
+      const timezone = String(
+        competition?.timezone || "America/Los_Angeles"
+      );
+      const seasonContext = deriveRoomSeasonContext(room);
+      const seasonKey = String(
+        room?.seasonKey ||
+          room?.worldCup?.seasonKey ||
+          seasonContext?.seasonKey ||
+          buildWorldCupSeasonKey(season)
+      ).trim();
+
+      if (!Number.isFinite(league) || !Number.isFinite(season)) {
+        throw new HttpsError(
+          "failed-precondition",
+          "World Cup room competition league/season is incomplete."
+        );
+      }
+      if (!seasonKey) {
+        throw new HttpsError(
+          "failed-precondition",
+          "Could not resolve seasonKey for World Cup room."
+        );
+      }
+
+      logOwnerAction(functionName, {
+        functionName,
+        uid,
+        roomId,
+        nowMs,
+        forceApiRefresh,
+        dryRun,
+        league,
+        season,
+        seasonKey,
+      });
+
+      const warnings = [];
+      const errors = [];
+      const latestPlayersById = new Map();
+      let teamCount = Number(
+        room?.worldCupPlayerPoolTeamCount ||
+          room?.worldCupExpectedTeamCount ||
+          0
+      );
+      let source = "global-season-player-pool";
+      let apiFetchResult = null;
+
+      const globalPlayers = await loadSeasonPlayerPool({
+        db,
+        seasonKey,
+      }).catch((error) => {
+        errors.push(
+          `Global World Cup player pool read failed: ${String(
+            error?.message || error
+          )}`
+        );
+        return [];
+      });
+
+      for (const player of globalPlayers) {
+        const normalized = normalizeWorldCupRepairPlayer(player, nowMs);
+        if (normalized) latestPlayersById.set(normalized.id, normalized);
+      }
+
+      if (forceApiRefresh) {
+        try {
+          const dailyWindows = await loadWorldCupGroupDailyWindows({
+            apiFootballGet,
+            apiKey: APIFOOTBALL_KEY.value(),
+            league,
+            season,
+            timezone,
+          });
+          const collected = collectWorldCupTeamsFromDailyWindows(dailyWindows);
+          teamCount = collected.teamIds.length;
+
+          if (!teamCount) {
+            warnings.push(
+              "API refresh did not discover World Cup teams; using the global season pool only."
+            );
+          } else {
+            apiFetchResult = await fetchWorldCupTeamPlayerPool({
+              apiFootballGet,
+              apiKey: APIFOOTBALL_KEY.value(),
+              season,
+              teamIds: collected.teamIds,
+              teamMeta: collected.teamMeta,
+              maxPlayers: 5000,
+              maxPagesPerTeam: 10,
+            });
+
+            for (const player of apiFetchResult.players || []) {
+              const normalized = normalizeWorldCupRepairPlayer(player, nowMs);
+              if (normalized) latestPlayersById.set(normalized.id, normalized);
+            }
+            source = globalPlayers.length
+              ? "api-football-world-cup-teams+global-season-player-pool"
+              : "api-football-world-cup-teams";
+
+            if (apiFetchResult.allTeamsProcessed === false) {
+              warnings.push(
+                `API refresh did not process every team. Missing teams: ${
+                  (apiFetchResult.missingFetchTeamNames || []).join(", ") ||
+                  (apiFetchResult.missingFetchTeamIds || []).join(", ") ||
+                  "unknown"
+                }.`
+              );
+            }
+            if (apiFetchResult.hitCap === true) {
+              warnings.push(
+                "API refresh hit the 5,000-player emergency cap."
+              );
+            }
+            if ((apiFetchResult.emptyTeamIds || []).length) {
+              warnings.push(
+                `${apiFetchResult.emptyTeamIds.length} World Cup teams returned no player rows.`
+              );
+            }
+          }
+        } catch (error) {
+          errors.push(
+            `API World Cup player refresh failed: ${String(
+              error?.message || error
+            )}`
+          );
+          if (globalPlayers.length) {
+            warnings.push(
+              "API refresh failed; comparison used the existing global season player pool."
+            );
+          }
+        }
+      }
+
+      const latestPlayers = Array.from(latestPlayersById.values());
+      if (!latestPlayers.length) {
+        throw new HttpsError(
+          "failed-precondition",
+          errors[0] ||
+            "No World Cup players were available from API or global season pool."
+        );
+      }
+
+      const roomPlayersSnap = await roomRef.collection("players").get();
+      const existingPlayerIds = new Set();
+
+      for (const playerDoc of roomPlayersSnap.docs) {
+        const data = playerDoc.data() || {};
+        for (const id of worldCupRepairPlayerIds(data, playerDoc.id)) {
+          existingPlayerIds.add(id);
+        }
+      }
+
+      const missingPlayers = latestPlayers.filter((player) =>
+        worldCupRepairPlayerIds(player).every(
+          (id) => !existingPlayerIds.has(id)
+        )
+      );
+
+      const addedCount = dryRun
+        ? 0
+        : await writeMissingWorldCupRoomPlayers({
+            roomRef,
+            players: missingPlayers,
+          });
+      const repairedRoomPlayerCount = roomPlayersSnap.size + addedCount;
+
+      if (!dryRun) {
+        await roomRef.set(
+          {
+            playerCount: repairedRoomPlayerCount,
+            worldCupPlayerPoolCount: repairedRoomPlayerCount,
+            lastWorldCupPlayerRepairAtMs: nowMs,
+            lastWorldCupPlayerRepairAt: FieldValue.serverTimestamp(),
+            lastWorldCupPlayerRepairAddedCount: addedCount,
+            lastWorldCupPlayerRepairLatestFetchedCount:
+              latestPlayers.length,
+          },
+          { merge: true }
+        );
+      }
+
+      return {
+        ok: true,
+        dryRun,
+        roomId,
+        mode: "world-cup-room-missing-player-repair",
+        source,
+        forceApiRefresh,
+        seasonKey,
+        latestFetchedCount: latestPlayers.length,
+        existingRoomPlayerCount: roomPlayersSnap.size,
+        repairedRoomPlayerCount,
+        missingCount: missingPlayers.length,
+        addedCount,
+        skippedExistingCount: latestPlayers.length - missingPlayers.length,
+        sampleMissingPlayers: missingPlayers.slice(0, 25).map((player) => ({
+          id: player.id,
+          name: player.name,
+          position: player.position,
+          teamName: player.teamName,
+          nationality: player.nationality,
+        })),
+        teamCount,
+        apiPlayerCount: Number(apiFetchResult?.players?.length || 0),
+        globalPlayerCount: globalPlayers.length,
+        warnings,
+        errors,
       };
     } catch (err) {
       handleOwnerActionError(functionName, err);
@@ -11115,50 +12992,16 @@ exports.pollGlobalSeasonLiveFixtures = onSchedule(
     const nowMs = Date.now();
     const runSweep = await shouldRunGlobalSeasonFixtureSweep(nowMs);
 
-    const [
-      queueSnap,
-      activeSnap,
-      scheduledWorldCupSnap,
-      scheduledWorldCupNestedSnap,
-      scheduledWorldCupPhaseSnap,
-      sweepSnap,
-    ] = await Promise.all([
+    const [queueSnap, sweepSnap] = await Promise.all([
       db.collection("tournamentPollQueue")
         .where("nextPollAtMs", "<=", nowMs)
         .limit(100)
         .get(),
 
-      db.collection("rooms")
-        .where("competitionState.weekStatus", "in", ["live", "resolving"])
-        .get(),
-
-      runSweep
-        ? db.collection("rooms")
-            .where("competitionState.weekStatus", "==", "scheduled")
-            .where("engineType", "==", "worldCupDaily")
-            .limit(50)
-            .get()
-        : Promise.resolve({ docs: [], size: 0 }),
-
-      runSweep
-        ? db.collection("rooms")
-            .where("competitionState.weekStatus", "==", "scheduled")
-            .where("worldCup.engineType", "==", "worldCupDaily")
-            .limit(50)
-            .get()
-        : Promise.resolve({ docs: [], size: 0 }),
-
-      runSweep
-        ? db.collection("rooms")
-            .where("competitionState.weekStatus", "==", "scheduled")
-            .where("competitionState.phaseLabel", "==", "WorldCupGroup")
-            .limit(50)
-            .get()
-        : Promise.resolve({ docs: [], size: 0 }),
-
       runSweep
         ? db.collection("rooms")
             .where("competitionState.weekStatus", "in", ["scheduled", "live", "resolving"])
+            .limit(100)
             .get()
         : Promise.resolve({ docs: [], size: 0 }),
     ]);
@@ -11181,22 +13024,6 @@ exports.pollGlobalSeasonLiveFixtures = onSchedule(
       roomDocsById.set(roomId, roomSnap);
     }
 
-    for (const roomDoc of activeSnap.docs) {
-      roomDocsById.set(roomDoc.id, roomDoc);
-    }
-
-    for (const roomDoc of scheduledWorldCupSnap.docs) {
-      roomDocsById.set(roomDoc.id, roomDoc);
-    }
-
-    for (const roomDoc of scheduledWorldCupNestedSnap.docs) {
-      roomDocsById.set(roomDoc.id, roomDoc);
-    }
-
-    for (const roomDoc of scheduledWorldCupPhaseSnap.docs) {
-      roomDocsById.set(roomDoc.id, roomDoc);
-    }
-
     for (const roomDoc of sweepSnap.docs) {
       roomDocsById.set(roomDoc.id, roomDoc);
     }
@@ -11210,10 +13037,6 @@ exports.pollGlobalSeasonLiveFixtures = onSchedule(
     console.log("[pollGlobalSeasonLiveFixtures] summary", {
       seasonTargets: seasonTargets.length,
       queueDue: queueSnap.size,
-      activeRooms: activeSnap.size,
-      scheduledWorldCupRooms: scheduledWorldCupSnap.size,
-      scheduledWorldCupNestedRooms: scheduledWorldCupNestedSnap.size,
-      scheduledWorldCupPhaseRooms: scheduledWorldCupPhaseSnap.size,
       sweepRooms: sweepSnap.size || 0,
       roomsRead: roomDocsById.size,
       sleepingRoomCount: stats.sleepingRoomCount,
@@ -11620,62 +13443,18 @@ exports.pollLiveTournamentWeeks = onSchedule(
 
     const runSweep = await shouldRunTournamentSweep(nowMs);
 
-    const [
-      queueSnap,
-      activeSnap,
-      scheduledWorldCupSnap,
-      scheduledWorldCupNestedSnap,
-      scheduledWorldCupPhaseSnap,
-      scheduledGlobalSnap,
-      sweepSnap,
-    ] = await Promise.all([
+    const [queueSnap, sweepSnap] = await Promise.all([
       // ✅ Main cheap path: only rooms whose wake time is due.
       db.collection("tournamentPollQueue")
         .where("nextPollAtMs", "<=", nowMs)
-        .limit(50)
+        .limit(100)
         .get(),
 
-      // ✅ Live/resolving rooms stay watched.
-      db.collection("rooms")
-        .where("competitionState.weekStatus", "in", ["live", "resolving"])
-        .get(),
-
-      // ✅ Hourly safety check for scheduled rooms without queue/missing kickoff.
+      // Hourly repair sweep for scheduled/live/resolving rooms with stale or missing queue tasks.
       runSweep
         ? db.collection("rooms")
-            .where("competitionState.weekStatus", "==", "scheduled")
-            .where("engineType", "==", "worldCupDaily")
-            .limit(50)
-            .get()
-        : Promise.resolve({ docs: [], size: 0 }),
-
-      runSweep
-        ? db.collection("rooms")
-            .where("competitionState.weekStatus", "==", "scheduled")
-            .where("worldCup.engineType", "==", "worldCupDaily")
-            .limit(50)
-            .get()
-        : Promise.resolve({ docs: [], size: 0 }),
-
-      runSweep
-        ? db.collection("rooms")
-            .where("competitionState.weekStatus", "==", "scheduled")
-            .where("competitionState.phaseLabel", "==", "WorldCupGroup")
-            .limit(50)
-            .get()
-        : Promise.resolve({ docs: [], size: 0 }),
-
-      runSweep
-        ? db.collection("rooms")
-            .where("competitionState.weekStatus", "==", "scheduled")
-            .where("globalPipeline.mode", "==", "global")
-            .limit(50)
-            .get()
-        : Promise.resolve({ docs: [], size: 0 }),
-
-      runSweep
-        ? db.collection("rooms")
-            .where("competitionState.weekStatus", "==", "scheduled")
+            .where("competitionState.weekStatus", "in", ["scheduled", "live", "resolving"])
+            .limit(100)
             .get()
         : Promise.resolve({ docs: [], size: 0 }),
     ]);
@@ -11699,27 +13478,6 @@ exports.pollLiveTournamentWeeks = onSchedule(
       roomDocsById.set(roomId, roomSnap);
     }
 
-    // Active rooms: usually very small number.
-    for (const roomDoc of activeSnap.docs) {
-      roomDocsById.set(roomDoc.id, roomDoc);
-    }
-
-    for (const roomDoc of scheduledWorldCupSnap.docs) {
-      roomDocsById.set(roomDoc.id, roomDoc);
-    }
-
-    for (const roomDoc of scheduledWorldCupNestedSnap.docs) {
-      roomDocsById.set(roomDoc.id, roomDoc);
-    }
-
-    for (const roomDoc of scheduledWorldCupPhaseSnap.docs) {
-      roomDocsById.set(roomDoc.id, roomDoc);
-    }
-
-    for (const roomDoc of scheduledGlobalSnap.docs) {
-      roomDocsById.set(roomDoc.id, roomDoc);
-    }
-
     // Hourly sweep: keeps old/missing queue rooms from being forgotten.
     for (const roomDoc of sweepSnap.docs) {
       roomDocsById.set(roomDoc.id, roomDoc);
@@ -11730,11 +13488,6 @@ exports.pollLiveTournamentWeeks = onSchedule(
     console.log("[pollLiveTournamentWeeks] summary", {
       roomsFound: roomDocs.length,
       queueDue: queueSnap.size,
-      activeRooms: activeSnap.size,
-      scheduledWorldCupRooms: scheduledWorldCupSnap.size,
-      scheduledWorldCupNestedRooms: scheduledWorldCupNestedSnap.size,
-      scheduledWorldCupPhaseRooms: scheduledWorldCupPhaseSnap.size,
-      scheduledGlobalRooms: scheduledGlobalSnap.size,
       sweepRooms: sweepSnap.size || 0,
       runSweep,
       nowMs,
@@ -13015,6 +14768,9 @@ exports.scheduleMarket = onCall({ region: "us-west2" }, async (request) => {
       openedAt: null,
       closesAt: null,
       resolvedAt: null,
+      tieBreakSeed: admin.firestore.FieldValue.delete(),
+      tieBreakMode: admin.firestore.FieldValue.delete(),
+      priorityMode: admin.firestore.FieldValue.delete(),
       marketReminderId: newMarketReminderRef.id,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     },
@@ -13599,6 +15355,8 @@ async function resolveMarketForRoom(roomId, { trigger = "scheduler" } = {}) {
   const marketRef = roomRef.collection("market").doc("current");
   const now = Date.now();
   const lockId = `${trigger}-${now}-${Math.random().toString(16).slice(2)}`;
+  const generatedTieBreakSeed =
+    `${roomId}-${now}-${Math.random().toString(16).slice(2)}`;
 
   // A) Lock + sanity checks
   const locked = await db.runTransaction(async (tx) => {
@@ -13623,21 +15381,29 @@ async function resolveMarketForRoom(roomId, { trigger = "scheduler" } = {}) {
       return { ok: false, reason: "not-closed-yet" };
     }
 
+    const tieBreakSeed = String(
+      m.tieBreakSeed || generatedTieBreakSeed
+    );
+
     tx.set(
       marketRef,
       {
         status: "resolving",
         resolveLock: lockId,
         resolvingAt: now,
+        tieBreakSeed,
+        tieBreakMode: "seeded-random",
+        priorityMode: "standings-then-random",
         updatedAt: FieldValue.serverTimestamp(),
       },
       { merge: true }
     );
 
-    return { ok: true };
+    return { ok: true, tieBreakSeed };
   });
 
   if (!locked.ok) return locked;
+  const tieBreakSeed = String(locked.tieBreakSeed || generatedTieBreakSeed);
   // Needed for display names and safe room context.
   // Without this, memberNameByUid can crash with "room is not defined"
   // after the market has already been set to resolving.
@@ -13767,13 +15533,14 @@ async function resolveMarketForRoom(roomId, { trigger = "scheduler" } = {}) {
   );
   const playerById = new Map(wantPlayerDocs);
 
-  function buildDecision(r, status, reason) {
+  function buildDecision(r, status, reason, extra = {}) {
     return {
       uid: r.uid,
       wantId: r.wantId,
       swapOutId: r.swapOutId,
       status,
       reason,
+      ...extra,
     };
   }
 
@@ -13791,6 +15558,20 @@ async function resolveMarketForRoom(roomId, { trigger = "scheduler" } = {}) {
 
     if (!owned || !owned.has(r.swapOutId)) {
       decisions.push(buildDecision(r, "lost", "SWAPOUT_NOT_OWNED"));
+      continue;
+    }
+
+    const activeWorldCupLock = isWorldCupDailyLineupRoom(room)
+      ? getActiveWorldCupDailyLocks(lineupByUid.get(r.uid) || {}, now)[r.swapOutId]
+      : null;
+    if (activeWorldCupLock) {
+      decisions.push(
+        buildDecision(r, "lost", "WORLD_CUP_STARTER_LOCKED", {
+          lockedUntilMs: Number(activeWorldCupLock.lockedUntilMs || 0),
+          reasonMessage:
+            `Player is locked by World Cup Group Stage lineup lock until ${formatWorldCupDailyLockDate(activeWorldCupLock)}.`,
+        })
+      );
       continue;
     }
 
@@ -13816,20 +15597,63 @@ async function resolveMarketForRoom(roomId, { trigger = "scheduler" } = {}) {
 
   // G) Award by priority and record explicit losers for the same target.
   for (const [wantId, list] of byWant.entries()) {
-    list.sort((a, b) => {
-      const pa = getPriority(standingsByUid, a.uid);
-      const pb = getPriority(standingsByUid, b.uid);
-      const cmp = comparePriority(pa, pb);
+    const priorityRows = list.map((request) => {
+      const priority = getPriority(standingsByUid, request.uid);
+      return {
+        ...request,
+        priority,
+        randomTieValue: seededTieValue(
+          `${roomId}:${wantId}:${now}`,
+          wantId,
+          request.uid
+        ),
+      };
+    });
+
+    priorityRows.sort((a, b) => {
+      const cmp = comparePriority(a.priority, b.priority);
       if (cmp !== 0) return cmp;
-      if (a.updatedAtMs !== b.updatedAtMs) return a.updatedAtMs - b.updatedAtMs;
+
+      // Same priority: random seeded tiebreaker.
+      if (a.randomTieValue !== b.randomTieValue) {
+        return a.randomTieValue - b.randomTieValue;
+      }
+
       return String(a.uid).localeCompare(String(b.uid));
     });
 
-    const winner = list[0];
-    decisions.push(buildDecision(winner, "won", "AWARDED"));
+    const winner = priorityRows[0];
+    decisions.push(
+      buildDecision(winner, "won", "AWARDED", {
+        priority: winner.priority,
+        randomTieValue: winner.randomTieValue,
+        tieBrokenRandomly:
+          priorityRows.length > 1 &&
+          comparePriority(priorityRows[0].priority, priorityRows[1].priority) === 0,
+      })
+    );
 
-    for (let i = 1; i < list.length; i++) {
-      decisions.push(buildDecision(list[i], "lost", "WANT_NOT_AVAILABLE"));
+    for (let i = 1; i < priorityRows.length; i++) {
+      const loser = priorityRows[i];
+
+      const tiedWithWinner =
+        comparePriority(loser.priority, winner.priority) === 0;
+
+      decisions.push(
+        buildDecision(
+          loser,
+          "lost",
+          tiedWithWinner ? "TIE_RANDOM_LOST" : "WANT_NOT_AVAILABLE",
+          {
+            priority: loser.priority,
+            winnerUid: winner.uid,
+            winnerPriority: winner.priority,
+            randomTieValue: loser.randomTieValue,
+            winnerRandomTieValue: winner.randomTieValue,
+            tieBrokenRandomly: tiedWithWinner,
+          }
+        )
+      );
     }
   }
 
@@ -13888,6 +15712,20 @@ async function resolveMarketForRoom(roomId, { trigger = "scheduler" } = {}) {
       result: dec.status,
       ok: dec.status === "won",
       reason: normalizedReason,
+      reasonMessage:
+        normalizedReason === "TIE_RANDOM_LOST"
+          ? "Not awarded — same priority as the winner, but lost the random tiebreaker."
+          : null,
+      priority: dec.priority || null,
+      winnerUid: dec.winnerUid || null,
+      winnerPriority: dec.winnerPriority || null,
+      randomTieValue: dec.randomTieValue ?? null,
+      winnerRandomTieValue: dec.winnerRandomTieValue ?? null,
+      tieBrokenRandomly: dec.tieBrokenRandomly === true,
+      lockedUntilMs: dec.lockedUntilMs || null,
+      tieBreakMode: "seeded-random",
+      priorityMode: "standings-then-random",
+      tieBreakSeed,
       resolvedAt: FieldValue.serverTimestamp(),
       resolvedAtMs: now,
       createdAt: FieldValue.serverTimestamp(),
@@ -13977,12 +15815,18 @@ async function resolveMarketForRoom(roomId, { trigger = "scheduler" } = {}) {
       status: "resolved",
       resolvedAt: FieldValue.serverTimestamp(),
       resolvedAtMs: now,
+      tieBreakSeed,
+      tieBreakMode: "seeded-random",
+      priorityMode: "standings-then-random",
       lastResolveSummary: {
         interestDocs: interestSnap.size,
         requestCount: requests.length,
         decisionCount: decisions.length,
         wonCount,
         resolvedAtMs: now,
+        tieBreakSeed,
+        tieBreakMode: "seeded-random",
+        priorityMode: "standings-then-random",
       },
       updatedAt: FieldValue.serverTimestamp(),
     },
@@ -13996,9 +15840,54 @@ async function resolveMarketForRoom(roomId, { trigger = "scheduler" } = {}) {
     requestCount: requests.length,
     decisionCount: decisions.length,
     wonCount,
+    tieBreakMode: "seeded-random",
   });
   await batch.commit();
-  return { ok: true, resolvedCount: decisions.length };
+
+  const affectedUids = new Set(
+    decisions
+      .filter((decision) => decision.status === "won")
+      .map((decision) => String(decision.uid || "").trim())
+      .filter(Boolean)
+  );
+  const lineupRepairs = [];
+  const lineupRepairErrors = [];
+  for (const targetUid of affectedUids) {
+    try {
+      lineupRepairs.push(
+        await repairUserLineupFromCurrentPicks({
+          db,
+          roomId,
+          targetUid,
+          nowMs: now,
+          dryRun: false,
+          reason: "transfer-market-resolved",
+        })
+      );
+    } catch (error) {
+      console.error("[resolveMarketForRoom] lineup repair failed", {
+        roomId,
+        targetUid,
+        code: error?.code,
+        message: error?.message,
+      });
+      lineupRepairErrors.push({
+        targetUid,
+        code: error?.code || "unknown",
+        message: error?.message || String(error),
+      });
+    }
+  }
+
+  return {
+    ok: true,
+    resolvedCount: decisions.length,
+    tieBreakMode: "seeded-random",
+    priorityMode: "standings-then-random",
+    affectedUidCount: affectedUids.size,
+    lineupRepairCount: lineupRepairs.length,
+    lineupRepairErrors,
+  };
 }
 
 exports.resolveMarketNow = onCall({ region: "us-west2" }, async (req) => {

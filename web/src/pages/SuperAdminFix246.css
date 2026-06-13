@@ -800,6 +800,39 @@
   min-width: 0;
 }
 
+.ownerLineupRepairFields {
+  display: grid;
+  grid-template-columns: minmax(0, 0.7fr) minmax(0, 1.3fr);
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.ownerLineupRepairFields label {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  color: rgba(226, 232, 240, 0.72);
+  font-size: 0.72rem;
+  font-weight: 850;
+}
+
+.ownerLineupRepairFields input {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 10px;
+  padding: 9px 10px;
+  color: #f8fafc;
+  background: rgba(2, 6, 23, 0.64);
+}
+
+.ownerLineupRepairFields input:focus {
+  outline: none;
+  border-color: rgba(56, 189, 248, 0.72);
+  box-shadow: 0 0 0 3px rgba(14, 165, 233, 0.12);
+}
+
 .ownerActionBtn,
 .ownerActionLogBtn {
   border: 1px solid rgba(125, 211, 252, 0.3);
@@ -969,6 +1002,10 @@
 
   .ownerActionBtn {
     width: 100%;
+  }
+
+  .ownerLineupRepairFields {
+    grid-template-columns: 1fr;
   }
 
   .ownerActionResultGrid span,

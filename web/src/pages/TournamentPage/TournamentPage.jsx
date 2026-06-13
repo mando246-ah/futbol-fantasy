@@ -813,9 +813,6 @@ export default function TournamentPage() {
   const activeResults = stableWeekResults || weekResults || null;
 
   // --- Live Updating display (header) ---
-  const resultsStatusRaw = activeResults?.status ?? "";
-  const resultsStatus = String(resultsStatusRaw).toLowerCase();
-
   let lastUpdateMs = null;
   if (activeResults?.updatedAtMs) lastUpdateMs = Number(activeResults.updatedAtMs);
   else if (activeResults?.computedAt?.toMillis) lastUpdateMs = activeResults.computedAt.toMillis();
@@ -824,6 +821,44 @@ export default function TournamentPage() {
   const ageSec = lastUpdateMs ? Math.max(0, Math.floor((nowMs - lastUpdateMs) / 1000)) : null;
   const nextUpdateInSec = lastUpdateMs ? Math.max(0, 60 - (ageSec % 60)) : null;
   const lastUpdateLabel = lastUpdateMs ? fmtDT(lastUpdateMs) : "—";
+
+  const pollWeekStatus = String(
+    data?.room?.competitionState?.weekStatus ||
+      data?.room?.["competitionState.weekStatus"] ||
+      activeResults?.weekStatus ||
+      activeResults?.status ||
+      ""
+  )
+    .trim()
+    .toLowerCase();
+  const pollNextAtMs = Number(
+    data?.room?.competitionState?.nextPollAtMs ||
+      data?.room?.["competitionState.nextPollAtMs"] ||
+      0
+  );
+  const headerUpdateStatus =
+    pollWeekStatus === "live"
+      ? "live"
+      : ["complete", "completed", "final"].includes(pollWeekStatus)
+        ? "complete"
+        : pollWeekStatus || "idle";
+  const headerIsLive = headerUpdateStatus === "live";
+  const headerStatusClass =
+    headerUpdateStatus === "resolving"
+      ? "resolving"
+      : headerUpdateStatus === "scheduled"
+        ? "scheduled"
+        : "idle";
+  const headerStatusLabel =
+    headerUpdateStatus === "live"
+      ? "LIVE UPDATING"
+      : headerUpdateStatus === "complete"
+        ? "COMPLETE"
+        : headerUpdateStatus === "resolving"
+          ? "RESOLVING"
+          : headerUpdateStatus === "scheduled"
+            ? "SCHEDULED"
+            : "IDLE";
 
   const isSeasonComplete = Boolean(finalResultsDoc) || data?.room?.seasonPhase === "COMPLETE";
 
@@ -1095,19 +1130,6 @@ export default function TournamentPage() {
     return { ...m, homeTotal, awayTotal, homeResult, awayResult };
   });
 
-  //Status label with color 
-  const statusRaw = activeResults?.status || "idle";
-  const statusLowerRaw = String(statusRaw).toLowerCase();
-
-  // Keep the UI consistent: scheduled/sleeping should look like IDLE.
-  const statusLower = statusLowerRaw === "scheduled" ? "idle" : statusLowerRaw;
-
-  const isLive = statusLower === "live";
-  const isResolving = statusLower === "resolving";
-
-  const statusClass = isLive ? "live" : isResolving ? "resolving" : "idle";
-  const statusLabel = isLive ? "LIVE" : isResolving ? "RESOLVING" : "IDLE";
-
   return (
     <div className="tpPage">
     <div className="tpWrap">
@@ -1153,7 +1175,7 @@ export default function TournamentPage() {
             </div>
 
             <div className="tpLiveHeaderLine">
-              {resultsStatus === "live" ? (
+              {headerIsLive ? (
                 <span>
                   <b className="tpLivePill live">Live Updating</b>
                   {nextUpdateInSec != null ? <> • Next update in: <b>{nextUpdateInSec}s</b></> : null}
@@ -1161,7 +1183,10 @@ export default function TournamentPage() {
                 </span>
               ) : (
                 <span>
-                  Status:  <b className={`tpLivePill ${statusClass}`}>{statusLabel}</b>
+                  Status: <b className={`tpLivePill ${headerStatusClass}`}>{headerStatusLabel}</b>
+                  {pollNextAtMs > nowMs ? (
+                    <> • Next update at: <b>{fmtDT(pollNextAtMs)}</b></>
+                  ) : null}
                   <> • Last update at: <b>{lastUpdateLabel}</b></>
                 </span>
               )}

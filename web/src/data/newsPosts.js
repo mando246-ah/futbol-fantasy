@@ -1,0 +1,56 @@
+const newsPosts = [
+  {
+    id: "draft-search-and-market-player-pool-update",
+    date: "2026-06-08",
+    tag: "Draft & Marketplace",
+    title: "Improved Draft Search and Updated Marketplace Player Pool",
+    summary:
+    "Draft search is now easier to use, and missing World Cup players have been added to the marketplace for existing rooms.",
+    body: [
+    "We made new improvements to the Draft experience to help managers find players faster and plan their picks better.",
+    "Player search is now broader and more forgiving. Managers no longer need to type a player’s full legal name or use the exact accent marks to find someone. Common names, shorter names, nicknames, and some spelling variations should now be easier to search.",
+    "Managers can also search and browse the player pool even when it is not their turn. This lets everyone plan ahead during the draft instead of waiting until they are on the clock.",
+    "Only the manager whose turn it is can actually make a pick. When it becomes your turn, the player pool will show an active green highlight and the pick buttons will become available.",
+    "We also repaired the World Cup player pool for existing rooms. Players that were missing from the original World Cup pool have now been added, and those undrafted players should be available in the marketplace.",
+    "Future World Cup rooms will also check the global player pool freshness before seeding players. This helps prevent new rooms from using an outdated player list.",
+    "Thank you to everyone who reported missing players and search issues. These updates are part of our beta process, and we will keep improving the draft and marketplace experience based on feedback.",
+    ],
+    bullets: [
+    "Draft search now supports broader name matching.",
+    "Players can be searched even when it is not your turn.",
+    "Only the current manager can make a pick.",
+    "Your turn is highlighted with a green active state.",
+    "Missing World Cup players have been added to the marketplace.",
+    "Future World Cup rooms now check for a fresher player pool before seeding.",
+    ],
+    isNew: true,
+  },
+
+  {
+    id: "world-cup-group-stage-three-day-player-lock",
+    date: "2026-06-08",
+    tag: "World Cup Group Stage",
+    title: "New 3-Day Player Lock for World Cup Group Stage Rooms",
+    summary:
+      "Starting XI players are now locked for three calendar days after making a real-life World Cup Group Stage appearance.",
+    body: [
+      "When a player in your starting XI appears in a real-life World Cup Group Stage match and plays at least one minute, that player becomes locked for three calendar days.",
+      "While locked, the player must remain in the exact same starting slot. They cannot be moved, swapped, benched, or removed from your lineup.",
+      "Players who do not appear in the match are not locked. Bench players also do not receive this lock because bench players do not score.",
+      "This rule only applies to World Cup Group Stage rooms. It does not apply to Regular Season rooms, normal Cup rooms, or World Cup Knockout rooms.",
+      "The change makes daily lineup choices more strategic and prevents fixture-spam substitutions across the busy group-stage schedule.",
+      "We hope this adds an exciting new layer of strategy to your World Cup Daily experience instead of being a game of substitutions. Good luck to all managers in the tournament!",
+    ],
+    bullets: [
+      "A real appearance of at least one minute triggers the lock.",
+      "The lock lasts three calendar days in the competition timezone.",
+      "Only starting XI players can receive this lock.",
+      "Locked players stay in their exact starter slot until the lock expires.",
+      "Hoping to add strategic depth and prevent a game of substitutions during the busy group stage schedule.",
+    ],
+    isNew: false,
+  },
+];
+
+export default newsPosts;
+

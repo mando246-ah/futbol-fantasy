@@ -4,7 +4,6 @@ import { useParams, Link, useLocation } from "react-router-dom";
 import { doc, onSnapshot } from "firebase/firestore";
 
 import { db } from "../../firebase";
-import { useTournament } from "../../tournament/hooks/useTournament";
 import TournamentPage from "./TournamentPage";
 import CupTournamentPage from "./CupTournamentPage";
 import WorldCupTournamentPage from "./WorldCupTournamentPage";
@@ -51,38 +50,38 @@ function getClientCompetitionState(room = {}) {
 export default function TournamentRouter() {
   const { roomId } = useParams();
   const location = useLocation();
-  const { loading, error, data } = useTournament(roomId);
-  const [cupDoc, setCupDoc] = useState(null);
-  const [weekDoc, setWeekDoc] = useState(null);
-
-  useEffect(() => {
-    const currentWeekIndex = Number(data?.room?.currentWeekIndex);
-
-    if (!roomId || !Number.isFinite(currentWeekIndex) || currentWeekIndex <= 0) {
-      setWeekDoc(null);
-      return;
-    }
-
-    const unsub = onSnapshot(
-      doc(db, "rooms", roomId, "weeks", String(currentWeekIndex)),
-      (snap) => setWeekDoc(snap.exists() ? snap.data() : null),
-      () => setWeekDoc(null)
-    );
-
-    return unsub;
-  }, [roomId, data?.room?.currentWeekIndex]);
-
+  const [room, setRoom] = useState(null);
+  const [loading, setLoading] = useState(Boolean(roomId));
+  const [error, setError] = useState(null);
 
   useEffect(() => {
     if (!roomId) {
-      setCupDoc(null);
+      setRoom(null);
+      setLoading(false);
+      setError(null);
       return;
     }
 
+    setLoading(true);
+    setError(null);
+
     const unsub = onSnapshot(
-      doc(db, "rooms", roomId, "cup", "current"),
-      (snap) => setCupDoc(snap.exists() ? snap.data() : null),
-      () => setCupDoc(null)
+      doc(db, "rooms", roomId),
+      (snap) => {
+        if (!snap.exists()) {
+          setRoom(null);
+          setError(new Error(`Room ${roomId} not found`));
+        } else {
+          setRoom({ id: snap.id, ...(snap.data() || {}) });
+          setError(null);
+        }
+        setLoading(false);
+      },
+      (snapshotError) => {
+        setRoom(null);
+        setError(snapshotError);
+        setLoading(false);
+      }
     );
 
     return unsub;
@@ -133,8 +132,7 @@ export default function TournamentRouter() {
   }
 
   // 4. Robust Cup vs RegularSeason routing
-  const room = data?.room || {};
-  const state = getClientCompetitionState(room);
+  const state = getClientCompetitionState(room || {});
   const engineType = String(room?.engineType || room?.worldCup?.engineType || "").trim();
   const worldCupPhase = String(room?.worldCupPhase || room?.worldCup?.phase || "").trim();
   const competitionKey = String(room?.competitionKey || "").toLowerCase();
@@ -187,12 +185,6 @@ export default function TournamentRouter() {
 
   const roundLabel =
     state.currentLabel ||
-    cupDoc?.currentWindowLabel ||
-    weekDoc?.roundLabel ||
-    data?.week?.roundLabel ||
-    data?.currentWeek?.roundLabel ||
-    data?.activeWeek?.roundLabel ||
-    data?.weekDoc?.roundLabel ||
     room?.roundLabel ||
     room?.competitionMeta?.roundLabel ||
     room?.competitionMeta?.currentLabel ||
@@ -200,23 +192,11 @@ export default function TournamentRouter() {
 
   const detectedPhase = detectPhaseFromRoundLabelClient(roundLabel);
 
-  const hasCupDoc =
-    !!cupDoc &&
-    (
-      Array.isArray(cupDoc.currentWindowFixtureIds) ||
-      cupDoc.currentWindowLabel ||
-      cupDoc.currentWindowId ||
-      cupDoc.cupTotalsByUid ||
-      cupDoc.livePointsByUid ||
-      cupDoc.projectedTotalsByUid
-    );
-
   const isCup =
     worldCupPhase.toLowerCase() === "knockout" ||
     engineType === "cupEngine" ||
     String(storedPhase).toLowerCase() === "cup" ||
-    detectedPhase === "Cup" ||
-    hasCupDoc;
+    detectedPhase === "Cup";
 
   
 

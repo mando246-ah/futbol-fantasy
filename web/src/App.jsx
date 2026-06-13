@@ -14,11 +14,13 @@ import Profile from "./pages/Profile";
 import DraftSummary from "./pages/DraftSummary";
 import Home from "./pages/Home";
 import SupportPage from "./pages/SupportPage";
+import NewsPage from "./pages/NewsPage";
 import SuperAdminFix246 from "./pages/SuperAdminFix246";
 import TermsPage from "./pages/Legal/TermsPage";
 import PrivacyPage from "./pages/Legal/PrivacyPage";
 import CopyrightPage from "./pages/Legal/CopyrightPage";
 import DataDeletionPage from "./pages/Legal/DataDeletionPage";
+import RoomChatBubble from "./components/RoomChatBubble";
 //import TournamentPage from "./pages/TournamentPage/TournamentPage";
 import TournamentRouter from "./pages/TournamentPage/TournamentRouter";
 import {
@@ -80,6 +82,7 @@ function Nav({ user, displayName, photoURL }) {
 
   const tabs = [
     { to: "/", label: "Home" },
+    { to: "/news", label: "News" },
     { to: "/draft", label: "Draft", hideWhenNoUser: true },
     {
       to: lastRoomId ? `/room?room=${lastRoomId}` : null,
@@ -406,6 +409,7 @@ function AnalyticsRouteTracker() {
     else if (pathname === "/draft") title = "Fútbol Fantasy — Draft";
     else if (pathname === "/room") title = "Fútbol Fantasy — Rosters";
     else if (pathname.startsWith("/tournament")) title = "Fútbol Fantasy — Tournament";
+    else if (pathname === "/news") title = "Fútbol Fantasy — News & Updates";
 
     document.title = title;
 
@@ -453,6 +457,62 @@ function PresenceTracker({ user, displayName, photoURL }) {
   return null;
 }
 
+function RoomChatRouteMount({ user, displayName }) {
+  const location = useLocation();
+  const [lastRoomId, setLastRoomIdState] = useState("");
+
+  useEffect(() => {
+    const refresh = () => {
+      setLastRoomIdState(user?.uid ? getLastRoomId(user.uid) : "");
+    };
+
+    refresh();
+    window.addEventListener("lastRoomIdChanged", refresh);
+    window.addEventListener("storage", refresh);
+
+    return () => {
+      window.removeEventListener("lastRoomIdChanged", refresh);
+      window.removeEventListener("storage", refresh);
+    };
+  }, [user?.uid]);
+
+  if (!user?.uid) return null;
+
+  const pathname = location.pathname || "";
+  const isDraftPage = pathname === "/draft";
+  const isRosterPage = pathname === "/room";
+  const tournamentMatch = pathname.match(/^\/tournament\/([^/]+)$/);
+  const isTournamentPage = pathname === "/tournament" || Boolean(tournamentMatch);
+
+  if (!isDraftPage && !isRosterPage && !isTournamentPage) return null;
+
+  const queryRoomId = new URLSearchParams(location.search).get("room") || "";
+  let tournamentRoomId = "";
+  if (tournamentMatch?.[1]) {
+    try {
+      tournamentRoomId = decodeURIComponent(tournamentMatch[1]);
+    } catch {
+      tournamentRoomId = tournamentMatch[1];
+    }
+  }
+
+  const roomId = String(
+    tournamentRoomId ||
+    queryRoomId ||
+    ((isDraftPage || isRosterPage) ? lastRoomId : "")
+  ).trim();
+
+  if (!roomId) return null;
+
+  return (
+    <RoomChatBubble
+      roomId={roomId}
+      user={user}
+      displayName={displayName || user.displayName || ""}
+    />
+  );
+}
+
 // ---------- App ----------
 export default function App() {
   const [user, setUser] = useState(null);
@@ -497,6 +557,7 @@ export default function App() {
     <Router>
       <AnalyticsRouteTracker />
       <PresenceTracker user={user} displayName={displayName} photoURL={photoURL} />
+      <RoomChatRouteMount user={user} displayName={displayName} />
       <Routes>
         <Route element={<AppLayout user={user} displayName={displayName} photoURL={photoURL} />}>
           <Route path="/" element={<Home user={user} />} />
@@ -507,6 +568,7 @@ export default function App() {
           <Route path="/privacy" element={<PrivacyPage />} />
           <Route path="/copyright" element={<CopyrightPage />} />
           <Route path="/data-deletion" element={<DataDeletionPage />} />
+          <Route path="/news" element={<NewsPage />} />
 
           <Route path="/profile" element={
             <RequireAuth user={user}>

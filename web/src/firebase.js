@@ -28,7 +28,7 @@ import {
 } from "firebase/firestore";
 import { collection, getDocs } from "firebase/firestore";
 import { writeBatch } from "firebase/firestore";
-import { getFunctions } from "firebase/functions";
+import { getFunctions, httpsCallable } from "firebase/functions";
 import { getStorage, ref, uploadBytes, getDownloadURL } from "firebase/storage";
 import { getAnalytics , isSupported, logEvent } from "firebase/analytics";
 import { setLogLevel } from "firebase/firestore";
@@ -522,7 +522,7 @@ export function watchRoom(roomId, cb) {
 /* =========================
    Draft helpers
    ========================= */
-const DRAFT_TURN_SECONDS = 45;
+const DRAFT_TURN_SECONDS = 60;
 const DRAFT_TURN_MS = DRAFT_TURN_SECONDS * 1000;
 const DEFAULT_DRAFT_PLAN = ["ATT", "ATT", "MID", "MID", "DEF", "DEF", "GK", "SUB", "SUB"];
 
@@ -1494,6 +1494,8 @@ export async function createTradeOffer({ roomId, toUid, give, receive }) {
       updatedAt: serverTimestamp(),
       respondedAt: null,
       appliedAt: null,
+      createdAtMs: Date.now(),
+      updatedAtMs: Date.now(),
     });
   });
 
@@ -1531,138 +1533,17 @@ export async function respondToTradeOffer({ roomId, tradeId, action }) {
     tx.update(tradeRef, {
       status: nextStatus,
       updatedAt: serverTimestamp(),
+      updatedAtMs: Date.now(),
       respondedAt: serverTimestamp(),
     });
     return { ok: true, status: nextStatus };
   });
 }
 
-// Host-only: apply an accepted trade by swapping pick docs
+// Host-only server apply: validates ownership/locks and repairs both lineups.
 export async function applyAcceptedTrade({ roomId, tradeId }) {
-  const user = auth.currentUser;
-  if (!user) throw new Error("Not signed in");
-
-  const roomRef = doc(db, "rooms", roomId);
-  const tradeRef = doc(db, "rooms", roomId, "trades", tradeId);
-  const tradeSnap = await getDoc(tradeRef);
-  if (!tradeSnap.exists()) throw new Error("Trade not found");
-  const trade = tradeSnap.data() || {};
-
-  if (trade.status !== "accepted") return { ok: true, status: trade.status };
-  if (trade.appliedAt) return { ok: true, status: "completed" };
-
-  const give = Array.isArray(trade.give) ? trade.give.map(normalizeTradeSideEntry) : [];
-  const receive = Array.isArray(trade.receive) ? trade.receive.map(normalizeTradeSideEntry) : [];
-  if (give.length < 1 || give.length > 2) throw new Error("Invalid give length");
-  if (receive.length !== give.length) throw new Error("Trade must be 1-for-1 or 2-for-2");
-
-  const picksRef = collection(db, "rooms", roomId, "picks");
-  const picksSnap = await getDocs(picksRef);
-  const pickDocs = picksSnap.docs.map((pickDoc) => ({
-    id: pickDoc.id,
-    ref: pickDoc.ref,
-    ...(pickDoc.data() || {}),
-  }));
-  const findTradePick = (entry, expectedOwnerUid) => {
-    if (entry.pickId) {
-      const exact = pickDocs.find((pick) => pick.id === entry.pickId);
-      if (exact) return exact;
-    }
-    return pickDocs.find(
-      (pick) =>
-        tradePickOwnerUid(pick) === String(expectedOwnerUid) &&
-        tradePickPlayerId(pick, pick.id) === String(entry.playerId)
-    );
-  };
-  const fromPickRefs = give.map((entry) =>
-    findTradePick(entry, trade.fromUid)
-  );
-  const toPickRefs = receive.map((entry) =>
-    findTradePick(entry, trade.toUid)
-  );
-
-  if (fromPickRefs.some(x => !x) || toPickRefs.some(x => !x)) {
-    // Someone no longer owns the listed players
-    await updateDoc(tradeRef, { status: "rejected", updatedAt: serverTimestamp(), respondedAt: serverTimestamp() });
-    return { ok: true, status: "rejected" };
-  }
-
-  await runTransaction(db, async (tx) => {
-    const refs = [
-      roomRef,
-      tradeRef,
-      ...fromPickRefs.map((pick) => pick.ref),
-      ...toPickRefs.map((pick) => pick.ref),
-    ];
-    const snapshots = await Promise.all(refs.map((ref) => tx.get(ref)));
-    const freshRoom = snapshots[0];
-    const freshTrade = snapshots[1];
-    const freshFromPicks = snapshots.slice(2, 2 + fromPickRefs.length);
-    const freshToPicks = snapshots.slice(2 + fromPickRefs.length);
-
-    if (!freshRoom.exists()) throw new Error("Room not found");
-    if (freshRoom.data()?.hostUid !== user.uid) {
-      throw new Error("Only host can apply trades");
-    }
-    if (!freshTrade.exists()) throw new Error("Trade missing");
-    const freshTradeData = freshTrade.data() || {};
-    if (freshTradeData.status !== "accepted" || freshTradeData.appliedAt) return;
-
-    freshFromPicks.forEach((snap, index) => {
-      const data = snap.exists() ? snap.data() || {} : {};
-      if (
-        !snap.exists() ||
-        tradePickOwnerUid(data) !== String(freshTradeData.fromUid) ||
-        tradePickPlayerId(data, snap.id) !== String(give[index].playerId)
-      ) {
-        throw new Error("Sender no longer owns an offered player");
-      }
-    });
-    freshToPicks.forEach((snap, index) => {
-      const data = snap.exists() ? snap.data() || {} : {};
-      if (
-        !snap.exists() ||
-        tradePickOwnerUid(data) !== String(freshTradeData.toUid) ||
-        tradePickPlayerId(data, snap.id) !== String(receive[index].playerId)
-      ) {
-        throw new Error("Receiver no longer owns a requested player");
-      }
-    });
-
-    // Pairwise swap: give[i] <-> receive[i]
-    for (let i = 0; i < give.length; i++) {
-      const fromPick = fromPickRefs[i];
-      const toPick = toPickRefs[i];
-
-      tx.update(fromPick.ref, {
-        playerId: String(receive[i].playerId),
-        name: tradePickDisplayName(receive[i]),
-        playerName: tradePickDisplayName(receive[i]),
-        position: receive[i].position || "SUB",
-        teamName: receive[i].teamName || "",
-        teamLogo: receive[i].teamLogo || "",
-        nationality: receive[i].nationality || "",
-        updatedAt: serverTimestamp(),
-      });
-
-      tx.update(toPick.ref, {
-        playerId: String(give[i].playerId),
-        name: tradePickDisplayName(give[i]),
-        playerName: tradePickDisplayName(give[i]),
-        position: give[i].position || "SUB",
-        teamName: give[i].teamName || "",
-        teamLogo: give[i].teamLogo || "",
-        nationality: give[i].nationality || "",
-        updatedAt: serverTimestamp(),
-      });
-    }
-
-    tx.update(tradeRef, {
-      status: "completed",
-      appliedAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
-  });
-
-  return { ok: true, status: "completed" };
+  if (!auth.currentUser) throw new Error("Not signed in");
+  const callable = httpsCallable(functions, "applyAcceptedTrade");
+  const result = await callable({ roomId, tradeId });
+  return result?.data || { ok: true };
 }

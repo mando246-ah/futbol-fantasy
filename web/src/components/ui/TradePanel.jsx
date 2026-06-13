@@ -3,10 +3,12 @@ import { auth, db } from "../../firebase";
 import { createTradeOffer, respondToTradeOffer, applyAcceptedTrade } from "../../firebase";
 import {
   collection,
+  getDocs,
   limit,
   onSnapshot,
   orderBy,
   query,
+  where,
 } from "firebase/firestore";
 import useUserProfiles from "../../lib/useUserProfiles";
 import "./TradePanel.css";
@@ -20,7 +22,7 @@ function statusLabel(s) {
   if (s === "pending") return "Offer Pending";
   if (s === "accepted") return "Offer Accepted (waiting host)";
   if (s === "rejected") return "Offer Rejected";
-  if (s === "canceled") return "Offer Canceled";
+  if (s === "canceled" || s === "cancelled") return "Offer Canceled";
   if (s === "completed") return "Trade Completed";
   return s || "—";
 }
@@ -109,22 +111,42 @@ function memberUidOf(member) {
   ).trim();
 }
 
+function tradeTimestampMs(trade = {}) {
+  const direct = Number(trade.updatedAtMs || trade.createdAtMs || 0);
+  if (Number.isFinite(direct) && direct > 0) return direct;
+  if (typeof trade.updatedAt?.toMillis === "function") {
+    return trade.updatedAt.toMillis();
+  }
+  if (typeof trade.createdAt?.toMillis === "function") {
+    return trade.createdAt.toMillis();
+  }
+  return 0;
+}
+
 export default function TradePanel({ tradeRoomPath, room, picks }) {
   const myUid = auth.currentUser?.uid || null;
   const isHost = !!myUid && room?.hostUid === myUid;
 
   const [trades, setTrades] = useState([]);
   const [tradeMsg, setTradeMsg] = useState("");
+  const [tradeHistoryLoaded, setTradeHistoryLoaded] = useState(false);
+  const [tradeHistoryLoading, setTradeHistoryLoading] = useState(false);
+  const [tradeHistory, setTradeHistory] = useState([]);
+  const [tradeHistoryError, setTradeHistoryError] = useState("");
 
   const [partnerUid, setPartnerUid] = useState("");
   const [givePickIds, setGivePickIds] = useState(["", ""]);
   const [recvPickIds, setRecvPickIds] = useState(["", ""]);
 
-  // This listener exists only while TradePanel is mounted.
+  // Keep only actionable offers live. Historical trades are loaded on demand.
   useEffect(() => {
     if (!tradeRoomPath) return;
     const ref = collection(db, "rooms", tradeRoomPath, "trades");
-    const qy = query(ref, orderBy("createdAt", "desc"), limit(50));
+    const qy = query(
+      ref,
+      where("status", "in", ["pending", "accepted"]),
+      limit(50)
+    );
     return onSnapshot(
       qy,
       (snap) => {
@@ -139,6 +161,55 @@ export default function TradePanel({ tradeRoomPath, room, picks }) {
         setTradeMsg("Could not load trades. Please refresh and try again.");
       }
     );
+  }, [tradeRoomPath]);
+
+  const loadTradeHistory = useCallback(async () => {
+    if (!tradeRoomPath) {
+      setTradeHistory([]);
+      setTradeHistoryLoaded(false);
+      return;
+    }
+
+    setTradeHistoryLoading(true);
+    setTradeHistoryError("");
+    try {
+      const ref = collection(db, "rooms", tradeRoomPath, "trades");
+      const snap = await getDocs(
+        query(ref, orderBy("updatedAt", "desc"), limit(50))
+      );
+
+      const historyStatuses = new Set([
+        "completed",
+        "accepted",
+        "rejected",
+        "canceled",
+        "cancelled",
+      ]);
+      const rows = snap.docs
+        .map((tradeDoc) => ({ id: tradeDoc.id, ...(tradeDoc.data() || {}) }))
+        .filter((trade) => historyStatuses.has(String(trade.status || "")))
+        .sort((a, b) => tradeTimestampMs(b) - tradeTimestampMs(a));
+
+      setTradeHistory(rows);
+      setTradeHistoryLoaded(true);
+      devLog("[TradePanel] trade history read", {
+        roomId: tradeRoomPath,
+        tradeDocsRead: snap.size,
+        historyRows: rows.length,
+      });
+    } catch (error) {
+      devError("[TradePanel] trade history read failed", error);
+      setTradeHistoryError("Could not load trade history.");
+    } finally {
+      setTradeHistoryLoading(false);
+    }
+  }, [tradeRoomPath]);
+
+  useEffect(() => {
+    setTradeHistory([]);
+    setTradeHistoryError("");
+    setTradeHistoryLoaded(false);
+    setTradeHistoryLoading(false);
   }, [tradeRoomPath]);
 
   // Host auto-applies accepted trades
@@ -190,13 +261,13 @@ export default function TradePanel({ tradeRoomPath, room, picks }) {
       if (uid) ids.add(uid);
     }
 
-    for (const trade of trades) {
+    for (const trade of [...trades, ...tradeHistory]) {
       if (trade?.fromUid) ids.add(String(trade.fromUid));
       if (trade?.toUid) ids.add(String(trade.toUid));
     }
 
     return Array.from(ids);
-  }, [members, picks, trades]);
+  }, [members, picks, tradeHistory, trades]);
   const profilesByUid = useUserProfiles(managerUids);
   const managerName = useCallback((uid, fallback = "Manager") => {
     const profile = profilesByUid?.[String(uid || "")] || {};
@@ -387,10 +458,6 @@ export default function TradePanel({ tradeRoomPath, room, picks }) {
   const incomingPending = incoming.filter(t => t.status === "pending");
   const outgoingPending = outgoing.filter(t => t.status === "pending");
 
-  const history = trades.filter(t =>
-    t.status === "completed" || t.status === "rejected" || t.status === "canceled" || t.status === "accepted"
-  );
-
   return (
     <div className="tradePanel">
       <div className="tradePanelHeader">
@@ -525,11 +592,35 @@ export default function TradePanel({ tradeRoomPath, room, picks }) {
 
         {/* History */}
         <div className="tradeCard tradeCard--wide">
-          <div className="tradeCardTitle">Trade history</div>
+          <div className="tradeHistoryHeader">
+            <div className="tradeCardTitle">Trade history</div>
+            <button
+              type="button"
+              className="tradeBtn tradeBtn--ghost"
+              disabled={tradeHistoryLoading}
+              onClick={loadTradeHistory}
+            >
+              {tradeHistoryLoading
+                ? "Loading Trade History..."
+                : tradeHistoryLoaded
+                  ? "Refresh Trade History"
+                  : "Load Trade History"}
+            </button>
+          </div>
 
-          {history.length === 0 && <div className="tradeEmpty">No trade history yet.</div>}
+          <div className="tradeHistoryHelp">
+            Trade history is loaded only when requested to save reads.
+          </div>
 
-          {history.map(t => (
+          {tradeHistoryError && (
+            <div className="tradeHistoryError">{tradeHistoryError}</div>
+          )}
+
+          {tradeHistoryLoaded && tradeHistory.length === 0 && (
+            <div className="tradeEmpty">No trade history yet.</div>
+          )}
+
+          {tradeHistory.map(t => (
             <div key={t.id} className="tradeItem tradeItem--compact">
               <div className="tradeItemTop">
                 <div className="tradeItemFrom">

@@ -7,6 +7,11 @@ const {
   WORLD_CUP_GROUP_PHASE,
 } = require("./worldCupMode");
 const { loadWorldCupGlobalFixtureCache } = require("./worldCupGlobalCache");
+const {
+  WORLD_CUP_DAILY_LOCKS_FIELD,
+  buildWorldCupDailyLockWindow,
+  hasScoringAppearance,
+} = require("./worldCupDailyLineupLocks");
 
 const PRE_MS = 20 * 60 * 1000;
 const PREGAME_POLL_MS = 5 * 60 * 1000;
@@ -53,11 +58,35 @@ function isNotStarted(short) {
 }
 
 function kickoffMsFromFixture(fixture) {
-  return toNumber(
+  const raw =
     fixture?.kickoffMs ??
       fixture?.startAtMs ??
-      (fixture?.fixture?.timestamp ? Number(fixture.fixture.timestamp) * 1000 : NaN),
-    NaN
+      fixture?.fixture?.timestamp ??
+      fixture?.timestamp ??
+      null;
+
+  const n = Number(raw);
+  if (Number.isFinite(n) && n > 0) {
+    // API timestamps use seconds; app kickoff fields use milliseconds.
+    return n < 100000000000 ? n * 1000 : n;
+  }
+
+  const parsed = Date.parse(
+    fixture?.fixture?.date ||
+      fixture?.date ||
+      fixture?.kickoff ||
+      fixture?.startAt ||
+      ""
+  );
+
+  return Number.isFinite(parsed) ? parsed : NaN;
+}
+
+function fixtureIdFromFixture(fixture = {}) {
+  return toId(
+    fixture?.fixtureId ??
+      fixture?.id ??
+      fixture?.fixture?.id
   );
 }
 
@@ -353,6 +382,7 @@ async function loadRoomUsersLineups({ db, roomId, room, ensureDefaultLineupsForR
       teamName: teamNamesByUid.get(uid) || member.teamName || member.displayName || "Team",
       starters: starters.length ? starters : fallback.starters,
       bench: bench.length ? bench : fallback.bench,
+      lineup,
     });
   }
 
@@ -374,6 +404,77 @@ function dayFixtureById(day = {}) {
     if (id) map.set(id, fixture);
   }
   return map;
+}
+
+function lineupPlayerIds(lineup = {}) {
+  const values = extractLineupList(lineup, "starters");
+  return uniqueIds(
+    values.map((value) =>
+      typeof value === "string" || typeof value === "number"
+        ? value
+        : value?.id ?? value?.playerId ?? value?.pid ?? value?.apiPlayerId ?? value?.player?.id
+    )
+  );
+}
+
+async function ensureWorldCupFixtureStarterSnapshots({
+  db,
+  roomId,
+  currentDay,
+  fixtureIds,
+  fixturesById,
+  nowMs,
+}) {
+  const existing =
+    currentDay?.starterSnapshotsByFixtureId &&
+    typeof currentDay.starterSnapshotsByFixtureId === "object"
+      ? currentDay.starterSnapshotsByFixtureId
+      : {};
+  const dueFixtureIds = fixtureIds.filter((fixtureId) => {
+    if (existing[fixtureId]) return false;
+    const kickoffMs = kickoffMsFromFixture(fixturesById.get(fixtureId) || {});
+    return Number.isFinite(kickoffMs) && nowMs >= kickoffMs;
+  });
+
+  if (!dueFixtureIds.length) return currentDay;
+
+  const lineupsSnap = await db.collection(`rooms/${roomId}/lineups`).get();
+  const startersByUserId = {};
+  for (const lineupDoc of lineupsSnap.docs || []) {
+    startersByUserId[lineupDoc.id] = lineupPlayerIds(lineupDoc.data() || {});
+  }
+
+  const nextSnapshots = { ...existing };
+  for (const fixtureId of dueFixtureIds) {
+    const fixture = fixturesById.get(fixtureId) || {};
+    nextSnapshots[fixtureId] = {
+      fixtureId,
+      kickoffMs: kickoffMsFromFixture(fixture) || null,
+      capturedAtMs: nowMs,
+      startersByUserId,
+    };
+  }
+
+  await db.doc(`rooms/${roomId}/days/${String(currentDay.dayIndex)}`).set(
+    {
+      starterSnapshotsByFixtureId: nextSnapshots,
+      starterSnapshotsUpdatedAtMs: nowMs,
+      starterSnapshotsUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+
+  console.log("[worldCupGroupEngine] fixture starter snapshots created", {
+    roomId,
+    dayIndex: currentDay.dayIndex,
+    fixtureIds: dueFixtureIds,
+    lineupCount: Object.keys(startersByUserId).length,
+  });
+
+  return {
+    ...currentDay,
+    starterSnapshotsByFixtureId: nextSnapshots,
+  };
 }
 
 function computeDayWindowStatus({ day, fixtureIds, statusByFixtureId }) {
@@ -415,7 +516,39 @@ function statusShortForFixture(fixture = {}, statusByFixtureId = {}) {
 }
 
 function computeNextPollFromFixtures(fixtures = [], nowMs, statusByFixtureId = {}) {
-  const rows = (Array.isArray(fixtures) ? fixtures : [])
+  const rawFixtures = Array.isArray(fixtures) ? fixtures : [];
+  const liveStatusFixtureIds = rawFixtures
+    .map((fixture) => {
+      const fixtureId = fixtureIdFromFixture(fixture);
+      const statusShort = statusShortForFixture(fixture, statusByFixtureId);
+      return {
+        fixtureId,
+        statusShort,
+        kickoffMs: kickoffMsFromFixture(fixture),
+      };
+    })
+    .filter(
+      (row) =>
+        row.fixtureId &&
+        !isFinished(row.statusShort) &&
+        hasFixtureStarted(row.statusShort)
+    );
+
+  if (liveStatusFixtureIds.length > 0) {
+    const bestKickoffMs =
+      liveStatusFixtureIds
+        .map((row) => row.kickoffMs)
+        .filter((ms) => Number.isFinite(ms) && ms > 0)
+        .sort((a, b) => a - b)[0] || null;
+
+    return {
+      nextKickoffMs: bestKickoffMs,
+      nextPollAtMs: nowMs + ACTIVE_POLL_MS,
+      reason: "world-cup-live-status-force-1min-check",
+    };
+  }
+
+  const rows = rawFixtures
     .map((fixture) => {
       const kickoffMs = kickoffMsFromFixture(fixture);
       const statusShort = statusShortForFixture(fixture, statusByFixtureId);
@@ -434,7 +567,7 @@ function computeNextPollFromFixtures(fixtures = [], nowMs, statusByFixtureId = {
     !row.final &&
     (
       hasFixtureStarted(row.statusShort) ||
-      (nowMs >= row.kickoffMs && nowMs <= row.kickoffMs + POST_MS)
+      nowMs >= row.kickoffMs
     )
   );
 
@@ -502,6 +635,8 @@ async function loadDailyWindows(db, roomId) {
 async function loadStatsForDay({
   fixtureIds,
   statusByFixtureId,
+  fixturesById,
+  nowMs,
   globalPlayerStatsByFixtureId = {},
   getFixturePlayersStatsMapCached,
   apiKey,
@@ -514,6 +649,12 @@ async function loadStatsForDay({
     const globalStats = globalPlayerStatsByFixtureId?.[fixtureId] || {};
     const hasGlobalStats = globalStats && typeof globalStats === "object" && Object.keys(globalStats).length > 0;
     const statusShort = statusByFixtureId[fixtureId];
+    const fixture = fixturesById?.get?.(String(fixtureId)) || {};
+    const kickoffMs = kickoffMsFromFixture(fixture);
+    const kickoffHasPassed =
+      Number.isFinite(kickoffMs) && nowMs >= kickoffMs;
+    const shouldTryStats =
+      hasFixtureStarted(statusShort) || kickoffHasPassed;
 
     if (hasGlobalStats) {
       statsByFixtureId.set(fixtureId, globalStats);
@@ -523,11 +664,14 @@ async function loadStatsForDay({
         usedGlobalStats: true,
         usedDirectFallback: false,
         rawStatsPlayerCount: Object.keys(globalStats).length,
+        kickoffMs: Number.isFinite(kickoffMs) ? kickoffMs : null,
+        kickoffHasPassed,
+        shouldTryStats,
       });
       continue;
     }
 
-    if (!hasFixtureStarted(statusShort)) {
+    if (!shouldTryStats) {
       statsByFixtureId.set(fixtureId, {});
       fixtureCoverage.push({
         fixtureId,
@@ -535,11 +679,17 @@ async function loadStatsForDay({
         usedGlobalStats: false,
         usedDirectFallback: false,
         rawStatsPlayerCount: 0,
+        kickoffMs: Number.isFinite(kickoffMs) ? kickoffMs : null,
+        kickoffHasPassed,
+        shouldTryStats,
       });
       continue;
     }
 
-    const ttlMs = isInPlay(statusShort) ? ACTIVE_POLL_MS : 60 * 60 * 1000;
+    const ttlMs =
+      isInPlay(statusShort) || kickoffHasPassed
+        ? ACTIVE_POLL_MS
+        : 60 * 60 * 1000;
     const statsMap = await getFixturePlayersStatsMapCached({
       fixtureId,
       apiKey,
@@ -555,6 +705,9 @@ async function loadStatsForDay({
       usedGlobalStats: false,
       usedDirectFallback: true,
       rawStatsPlayerCount: Object.keys(fallbackStats).length,
+      kickoffMs: Number.isFinite(kickoffMs) ? kickoffMs : null,
+      kickoffHasPassed,
+      shouldTryStats,
     });
   }
 
@@ -618,6 +771,158 @@ function buildPlayerEntriesForDay({
   return { total, entries };
 }
 
+function buildWorldCupUserStarterPlan({
+  user,
+  fixtureIds,
+  currentDay,
+  fixturesById,
+  playersById,
+}) {
+  const currentStarters = Array.isArray(user?.starters) ? user.starters : [];
+  const currentRoster = [...currentStarters, ...(Array.isArray(user?.bench) ? user.bench : [])];
+  const currentById = new Map(
+    currentRoster
+      .map((player) => [toId(player?.id || player?.playerId), player])
+      .filter(([playerId]) => playerId)
+  );
+  const snapshots =
+    currentDay?.starterSnapshotsByFixtureId &&
+    typeof currentDay.starterSnapshotsByFixtureId === "object"
+      ? currentDay.starterSnapshotsByFixtureId
+      : {};
+  const fixtureIdsByPlayerId = new Map();
+  const starterIndexByFixturePlayer = new Map();
+  const effectiveStarterIds = [];
+  const seen = new Set();
+
+  for (const fixtureId of fixtureIds) {
+    const snapshotIds = snapshots?.[fixtureId]?.startersByUserId?.[user.uid];
+    const fixture = fixturesById.get(fixtureId) || {};
+    const fixtureTeamIds = new Set(
+      [fixture?.homeTeamId, fixture?.awayTeamId].map(toId).filter(Boolean)
+    );
+    const starterIds = Array.isArray(snapshotIds)
+      ? snapshotIds.map(toId).filter(Boolean)
+      : currentStarters
+          .filter((player) => {
+            const playerId = toId(player?.id || player?.playerId);
+            const meta = mergePlayerMeta(player, playersById.get(playerId)) || player || {};
+            const teamId = toId(meta?.teamId || meta?.apiTeamId);
+            return !fixtureTeamIds.size || !teamId || fixtureTeamIds.has(teamId);
+          })
+          .map((player) => toId(player?.id || player?.playerId))
+          .filter(Boolean);
+
+    starterIds.forEach((playerId, starterIndex) => {
+      if (!seen.has(playerId)) {
+        seen.add(playerId);
+        effectiveStarterIds.push(playerId);
+      }
+      const playerFixtureIds = fixtureIdsByPlayerId.get(playerId) || [];
+      playerFixtureIds.push(fixtureId);
+      fixtureIdsByPlayerId.set(playerId, playerFixtureIds);
+      starterIndexByFixturePlayer.set(`${fixtureId}:${playerId}`, starterIndex);
+    });
+  }
+
+  const starters = effectiveStarterIds.map((playerId) => {
+    const current = currentById.get(playerId) || {};
+    const fromPool = playersById.get(playerId) || {};
+    return (
+      mergePlayerMeta(current, fromPool) ||
+      mergePlayerMeta(fromPool, { id: playerId }) ||
+      { id: playerId, playerId, name: "Unknown", position: "MID" }
+    );
+  });
+  const roster = currentRoster.map((player) => {
+    const playerId = toId(player?.id || player?.playerId);
+    return mergePlayerMeta(player, playersById.get(playerId)) || player;
+  });
+
+  return {
+    starters,
+    roster,
+    fixtureIdsByPlayerId,
+    starterIndexByFixturePlayer,
+  };
+}
+
+async function persistWorldCupDailyAppearanceLocks({
+  db,
+  roomId,
+  users,
+  lockCandidatesByUid,
+  nowMs,
+}) {
+  let batch = db.batch();
+  let writes = 0;
+  let pendingOps = 0;
+
+  const commitBatch = async () => {
+    if (!pendingOps) return;
+    const current = batch;
+    batch = db.batch();
+    pendingOps = 0;
+    await current.commit();
+  };
+
+  for (const user of users || []) {
+    const candidates = lockCandidatesByUid.get(user.uid) || [];
+    if (!candidates.length) continue;
+
+    const existingLocks =
+      user?.lineup?.[WORLD_CUP_DAILY_LOCKS_FIELD] &&
+      typeof user.lineup[WORLD_CUP_DAILY_LOCKS_FIELD] === "object"
+        ? user.lineup[WORLD_CUP_DAILY_LOCKS_FIELD]
+        : {};
+    const nextLocks = { ...existingLocks };
+    const createdLocks = [];
+
+    for (const candidate of candidates) {
+      const existing = existingLocks[candidate.playerId] || null;
+      const existingUntilMs = Number(existing?.lockedUntilMs || 0);
+      const sameFixture = String(existing?.fixtureId || "") === String(candidate.fixtureId || "");
+
+      if (sameFixture && existingUntilMs >= candidate.lockedUntilMs) continue;
+      if (existingUntilMs > candidate.lockedUntilMs) continue;
+
+      nextLocks[candidate.playerId] = candidate;
+      createdLocks.push(candidate);
+    }
+
+    if (!createdLocks.length) continue;
+
+    batch.set(
+      db.doc(`rooms/${roomId}/lineups/${user.uid}`),
+      {
+        [WORLD_CUP_DAILY_LOCKS_FIELD]: nextLocks,
+        worldCupDailyLocksUpdatedAtMs: nowMs,
+        worldCupDailyLocksUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+    pendingOps += 1;
+    writes += createdLocks.length;
+
+    for (const lock of createdLocks) {
+      console.log("[worldCupGroupEngine] appearance lock created", {
+        roomId,
+        uid: user.uid,
+        playerId: lock.playerId,
+        playerName: lock.playerName || "",
+        fixtureId: lock.fixtureId,
+        starterIndex: lock.starterIndex,
+        lockedUntilMs: lock.lockedUntilMs,
+      });
+    }
+
+    if (pendingOps >= 400) await commitBatch();
+  }
+
+  await commitBatch();
+  return writes;
+}
+
 function rankLeaderboard(rows) {
   return [...rows]
     .sort((a, b) => {
@@ -628,35 +933,121 @@ function rankLeaderboard(rows) {
     .map((row, index) => ({ ...row, rank: index + 1 }));
 }
 
-async function writeWorldCupDailyStandings({ db, roomId, users, nowMs }) {
-  const resultsSnap = await db.collection(`rooms/${roomId}/dayResults`).get();
-  const finalResults = (resultsSnap.docs || [])
-    .map((doc) => doc.data() || {})
-    .filter((result) => String(result.status || "").toLowerCase() === "final");
+function worldCupBreakdownTotal(breakdown = {}) {
+  const explicitTotal = Number(breakdown?.total);
+  if (Number.isFinite(explicitTotal)) {
+    return explicitTotal;
+  }
 
-  const totalsByUid = {};
-  for (const result of finalResults) {
-    const scores = result.teamScoresByUserId || {};
-    for (const [uid, points] of Object.entries(scores)) {
-      totalsByUid[uid] = toNumber(totalsByUid[uid]) + toNumber(points);
+  if (Array.isArray(breakdown?.starters)) {
+    return breakdown.starters.reduce(
+      (sum, player) => sum + toNumber(player?.points),
+      0
+    );
+  }
+
+  return Object.values(breakdown?.perPlayer || {}).reduce((sum, player) => {
+    if (player?.counted === false) return sum;
+    return sum + toNumber(player?.points);
+  }, 0);
+}
+
+function worldCupDayScoresByUid(result = {}) {
+  const scores = { ...(result?.teamScoresByUserId || {}) };
+
+  for (const [uid, breakdown] of Object.entries(
+    result?.breakdownByUserId || {}
+  )) {
+    const cleanUid = String(uid || "");
+    if (!cleanUid) continue;
+
+    const hasSavedScore =
+      Object.prototype.hasOwnProperty.call(scores, cleanUid) &&
+      Number.isFinite(Number(scores[cleanUid]));
+    const breakdownScore = worldCupBreakdownTotal(breakdown);
+
+    if (!hasSavedScore) {
+      scores[cleanUid] = breakdownScore;
     }
   }
 
-  const finalDayCount = finalResults.length;
+  return scores;
+}
+
+function worldCupDayResultHasScore(result = {}) {
+  return Object.values(worldCupDayScoresByUid(result)).some(
+    (value) => toNumber(value) !== 0
+  );
+}
+
+function shouldIncludeWorldCupDayInStandings(result = {}) {
+  const status = String(result?.status || "").toLowerCase();
+  if (["final", "live", "resolving"].includes(status)) return true;
+  return worldCupDayResultHasScore(result);
+}
+
+async function writeWorldCupDailyStandings({ db, roomId, users, nowMs }) {
+  const resultsSnap = await db.collection(`rooms/${roomId}/dayResults`).get();
+  const resultByDayIndex = new Map();
+
+  for (const doc of resultsSnap.docs || []) {
+    const result = doc.data() || {};
+    const dayIndex = Number(result.dayIndex || doc.id);
+    if (!Number.isFinite(dayIndex) || dayIndex <= 0) continue;
+    resultByDayIndex.set(dayIndex, { ...result, dayIndex });
+  }
+
+  const includedResults = Array.from(resultByDayIndex.values())
+    .filter(shouldIncludeWorldCupDayInStandings)
+    .sort((a, b) => toNumber(a.dayIndex) - toNumber(b.dayIndex));
+
+  const totalsByUid = {};
+  const dayTotalsByUid = {};
+  const includedDayIndexes = [];
+
+  for (const result of includedResults) {
+    const dayIndex = Number(result.dayIndex || 0);
+    if (dayIndex) includedDayIndexes.push(dayIndex);
+
+    const scores = worldCupDayScoresByUid(result);
+    dayTotalsByUid[String(dayIndex || "unknown")] = scores;
+
+    for (const [uid, points] of Object.entries(scores)) {
+      const cleanUid = String(uid || "");
+      if (!cleanUid) continue;
+      totalsByUid[cleanUid] =
+        toNumber(totalsByUid[cleanUid]) + toNumber(points);
+    }
+  }
+
+  const finalDayCount = includedResults.filter(
+    (result) => String(result?.status || "").toLowerCase() === "final"
+  ).length;
   const leaderboard = rankLeaderboard(
     users.map((user) => ({
       uid: user.uid,
       userId: user.uid,
       displayName: user.displayName || "Manager",
+      name: user.displayName || "Manager",
       teamName: user.teamName || user.displayName || "Team",
       totalFantasyPoints: toNumber(totalsByUid[user.uid]),
-      daysPlayed: finalDayCount,
+      totalPoints: toNumber(totalsByUid[user.uid]),
+      daysPlayed: includedDayIndexes.length,
     }))
   );
 
   const payload = {
     mode: WORLD_CUP_GROUP_ENGINE,
     worldCupPhase: WORLD_CUP_GROUP_PHASE,
+    source: "world-cup-group-cumulative-standings",
+    includesLivePoints: includedResults.some((result) =>
+      ["live", "resolving"].includes(
+        String(result?.status || "").toLowerCase()
+      )
+    ),
+    includedDayIndexes,
+    dayTotalsByUid,
+    totalsByUid,
     leaderboard,
     standings: leaderboard,
     updatedAtMs: nowMs,
@@ -664,7 +1055,11 @@ async function writeWorldCupDailyStandings({ db, roomId, users, nowMs }) {
   };
 
   await db.doc(`rooms/${roomId}/standings/current`).set(payload, { merge: true });
-  return { leaderboard, finalDayCount };
+  return {
+    leaderboard,
+    finalDayCount,
+    includedDayCount: includedDayIndexes.length,
+  };
 }
 
 async function writeCompetitionState({ roomRef, room, patch, nowMs, setCompetitionState }) {
@@ -794,11 +1189,17 @@ async function runWorldCupGroupEngine({
     };
   }
 
-  const timezone = String(roomData?.competition?.timezone || roomData?.timezone || "America/Los_Angeles");
+  const timezone = String(
+    roomData?.competition?.timezone ||
+      roomData?.worldCup?.timezone ||
+      roomData?.competitionState?.timezone ||
+      roomData?.timezone ||
+      "America/Los_Angeles"
+  );
   const days = await loadDailyWindows(db, roomId);
   if (!days.length) throw new Error(`World Cup group room has no day windows: ${roomId}`);
 
-  const currentDay = selectCurrentDay(days, nowMs);
+  let currentDay = selectCurrentDay(days, nowMs);
   if (!currentDay || String(currentDay.status || "").toLowerCase() === "final") {
     const { users } = await loadRoomUsersLineups({
       db,
@@ -867,6 +1268,15 @@ async function runWorldCupGroupEngine({
     }
   }
 
+  currentDay = await ensureWorldCupFixtureStarterSnapshots({
+    db,
+    roomId,
+    currentDay,
+    fixtureIds,
+    fixturesById,
+    nowMs,
+  });
+
   console.log("[runWorldCupGroupEngine] global cache status", {
     roomId,
     dayIndex: currentDay?.dayIndex || null,
@@ -887,9 +1297,22 @@ async function runWorldCupGroupEngine({
     nowMs,
     statusByFixtureId
   );
-  const hasStartedOrFinishedFixture = fixtureIds.some((fixtureId) =>
-    hasFixtureStarted(statusByFixtureId[fixtureId] || fixturesById.get(fixtureId)?.statusShort || "")
-  );
+  const hasStartedOrFinishedFixture = fixtureIds.some((fixtureId) => {
+    const fixture = fixturesById.get(fixtureId) || {};
+    const statusShort =
+      statusByFixtureId[fixtureId] ||
+      fixture.statusShort ||
+      "";
+    const kickoffMs = kickoffMsFromFixture(fixture);
+    return (
+      hasFixtureStarted(statusShort) ||
+      (Number.isFinite(kickoffMs) && nowMs >= kickoffMs)
+    );
+  });
+  const effectiveStatusValue =
+    statusValue === "scheduled" && hasStartedOrFinishedFixture
+      ? "live"
+      : statusValue;
 
   if (statusValue === "scheduled" && !hasStartedOrFinishedFixture) {
     const fixtureCoverage = fixtureIds.map((fixtureId) => {
@@ -952,6 +1375,7 @@ async function runWorldCupGroupEngine({
       status: "scheduled",
       weekStatus: "scheduled",
       skippedReason: pollInfoForCurrentDay.reason,
+      pollReason: pollInfoForCurrentDay.reason,
       nextPollAtMs: pollInfoForCurrentDay.nextPollAtMs,
       nextKickoffMs: pollInfoForCurrentDay.nextKickoffMs,
       fixtureCount: fixtureIds.length,
@@ -964,6 +1388,7 @@ async function runWorldCupGroupEngine({
       missingGlobalSummaryFixtureIds,
       missingGlobalLiveFixtureIds,
       fixtureCoverage,
+      statusByFixtureId,
     };
   }
 
@@ -973,6 +1398,8 @@ async function runWorldCupGroupEngine({
   } = await loadStatsForDay({
     fixtureIds,
     statusByFixtureId,
+    fixturesById,
+    nowMs,
     globalPlayerStatsByFixtureId: globalCache.playerStatsByFixtureId || {},
     getFixturePlayersStatsMapCached,
     apiKey,
@@ -986,6 +1413,14 @@ async function runWorldCupGroupEngine({
       hasGlobalLivePayload: Boolean(globalCache.liveFixturesById?.[fixtureId]),
     };
   });
+  const hasStatsFromCoverage = fixtureCoverage.some(
+    (row) =>
+      Number(row?.rawStatsPlayerCount || row?.statsPlayerCount || 0) > 0
+  );
+  const writeStatusValue =
+    effectiveStatusValue === "scheduled" && hasStatsFromCoverage
+      ? "live"
+      : effectiveStatusValue;
   const directFallbackUsed = fixtureCoverage.some((row) => row.usedDirectFallback);
   const globalCacheAttempted = Boolean(useGlobalCache);
   const globalCacheFullyUsed =
@@ -1010,15 +1445,25 @@ async function runWorldCupGroupEngine({
   const startersByUserId = {};
   const benchByUserId = {};
   const benchScoresByUserId = {};
+  const lockCandidatesByUid = new Map();
 
   for (const user of users) {
     const starters = [];
     let starterTotal = 0;
+    const starterPlan = buildWorldCupUserStarterPlan({
+      user,
+      fixtureIds,
+      currentDay,
+      fixturesById,
+      playersById,
+    });
 
-    for (const player of user.starters || []) {
+    for (const player of starterPlan.starters) {
+      const playerId = toId(player?.id || player?.playerId);
+      const playerFixtureIds = starterPlan.fixtureIdsByPlayerId.get(playerId) || [];
       const result = buildPlayerEntriesForDay({
         player,
-        fixtureIds,
+        fixtureIds: playerFixtureIds,
         statsByFixtureId,
         fixturesById,
         playersById,
@@ -1031,11 +1476,48 @@ async function runWorldCupGroupEngine({
           counted: true,
         }))
       );
+
+      for (const entry of result.entries) {
+        if (!entry?.fixtureId || !hasScoringAppearance(entry.rawStats || entry.stats || {})) {
+          continue;
+        }
+
+        const fixture = fixturesById.get(String(entry.fixtureId)) || entry.fixture || {};
+        const matchMs = kickoffMsFromFixture(fixture);
+        if (!Number.isFinite(matchMs)) continue;
+
+        const entryPlayerId = toId(player?.id || player?.playerId || entry.playerId);
+        if (!entryPlayerId) continue;
+        const starterIndex = starterPlan.starterIndexByFixturePlayer.get(
+          `${entry.fixtureId}:${entryPlayerId}`
+        );
+        if (!Number.isInteger(starterIndex)) continue;
+
+        const lockWindow = buildWorldCupDailyLockWindow(matchMs, timezone);
+        const candidates = lockCandidatesByUid.get(user.uid) || [];
+        candidates.push({
+          playerId: entryPlayerId,
+          playerName: player?.name || entry.playerName || entry.name || "Unknown",
+          fixtureId: String(entry.fixtureId),
+          lockedAtMs: nowMs,
+          lockedUntilMs: lockWindow.lockedUntilMs,
+          matchDate: lockWindow.matchDate,
+          timezone: lockWindow.timezone,
+          starterIndex,
+          reason: "appearance",
+        });
+        lockCandidatesByUid.set(user.uid, candidates);
+      }
     }
 
     const bench = [];
     let benchTotal = 0;
-    for (const player of user.bench || []) {
+    const effectiveStarterIds = new Set(
+      starterPlan.starters.map((player) => toId(player?.id || player?.playerId))
+    );
+    for (const player of starterPlan.roster.filter(
+      (entry) => !effectiveStarterIds.has(toId(entry?.id || entry?.playerId))
+    )) {
       const result = buildPlayerEntriesForDay({
         player,
         fixtureIds,
@@ -1077,6 +1559,14 @@ async function runWorldCupGroupEngine({
     };
   }
 
+  const worldCupDailyLockWriteCount = await persistWorldCupDailyAppearanceLocks({
+    db,
+    roomId,
+    users,
+    lockCandidatesByUid,
+    nowMs,
+  });
+
   const dailyLeaderboard = rankLeaderboard(
     users.map((user) => ({
       uid: user.uid,
@@ -1096,7 +1586,7 @@ async function runWorldCupGroupEngine({
     endAtMs: currentDay.endAtMs || null,
     fixtureIds,
     fixtures: Array.isArray(currentDay.fixtures) ? currentDay.fixtures : [],
-    status: statusValue,
+    status: writeStatusValue,
     source: resultSource,
     globalCacheAttempted,
     globalCacheUsed: globalCacheAttempted,
@@ -1112,6 +1602,7 @@ async function runWorldCupGroupEngine({
     dailyLeaderboard,
     fixtureStatusById: statusByFixtureId,
     fixtureCoverage,
+    worldCupDailyLockWriteCount,
     updatedAtMs: nowMs,
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   };
@@ -1123,7 +1614,7 @@ async function runWorldCupGroupEngine({
 
   await db.doc(`rooms/${roomId}/days/${String(currentDay.dayIndex)}`).set(
     {
-      status: statusValue,
+      status: writeStatusValue,
       fixtureStatusById: statusByFixtureId,
       updatedAtMs: nowMs,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -1133,7 +1624,7 @@ async function runWorldCupGroupEngine({
 
   const daysAfter = days.map((day) =>
     Number(day.dayIndex) === Number(currentDay.dayIndex)
-      ? { ...day, status: statusValue }
+      ? { ...day, status: writeStatusValue }
       : day
   );
 
@@ -1169,6 +1660,7 @@ async function runWorldCupGroupEngine({
       missingGlobalSummaryFixtureIds,
       missingGlobalLiveFixtureIds,
       fixtureCoverage,
+      worldCupDailyLockWriteCount,
       dailyLeaderboard,
       breakdownByUserId,
       startersByUserId,
@@ -1177,21 +1669,14 @@ async function runWorldCupGroupEngine({
   }
 
   const nextDay =
-    statusValue === "final"
+    writeStatusValue === "final"
       ? daysAfter.find((day) => String(day.status || "").toLowerCase() !== "final")
       : currentDay;
-  const pollInfo =
-    statusValue === "live"
-      ? {
-          nextKickoffMs: null,
-          nextPollAtMs: nowMs + ACTIVE_POLL_MS,
-          reason: "world-cup-day-live",
-        }
-      : computeNextPollFromFixtures(
-          Array.isArray(nextDay?.fixtures) ? nextDay.fixtures : [],
-          nowMs,
-          statusValue === "final" ? {} : statusByFixtureId
-        );
+  const pollInfo = computeNextPollFromFixtures(
+    Array.isArray(nextDay?.fixtures) ? nextDay.fixtures : [],
+    nowMs,
+    writeStatusValue === "final" ? {} : statusByFixtureId
+  );
 
   await roomRef.set(
     {
@@ -1207,7 +1692,17 @@ async function runWorldCupGroupEngine({
     { merge: true }
   );
 
-  const weekStatus = statusValue === "final" ? "scheduled" : statusValue;
+  const pollReason = String(pollInfo?.reason || "");
+  const isActivelyPollingLive =
+    pollReason === "world-cup-day-live" ||
+    pollReason === "world-cup-live-status-force-1min-check" ||
+    pollReason === "world-cup-live-or-resolving-1min-check";
+  const weekStatus =
+    writeStatusValue === "final"
+      ? "scheduled"
+      : isActivelyPollingLive
+        ? "live"
+        : "scheduled";
   await writeCompetitionState({
     roomRef,
     room: roomData,
@@ -1228,8 +1723,10 @@ async function runWorldCupGroupEngine({
     roomId,
     dayIndex: Number(currentDay.dayIndex),
     label: currentDay.label || `Day ${currentDay.dayIndex}`,
-    status: statusValue,
+    status: writeStatusValue,
     weekStatus,
+    pollReason: pollInfo.reason,
+    optimizedPolling: true,
     nextPollAtMs: pollInfo.nextPollAtMs,
     nextKickoffMs: pollInfo.nextKickoffMs,
     fixtureCount: fixtureIds.length,
@@ -1249,6 +1746,8 @@ async function runWorldCupGroupEngine({
     missingGlobalSummaryFixtureIds,
     missingGlobalLiveFixtureIds,
     fixtureCoverage,
+    statusByFixtureId,
+    worldCupDailyLockWriteCount,
   };
 }
 

@@ -93,6 +93,7 @@ function RosterPlayerRow({
   compact = false,
   action = null,
   live = false,
+  appearanceLock = null,
   selected = false,
   swapTarget = false,
 }) {
@@ -120,6 +121,11 @@ function RosterPlayerRow({
         {live ? (
           <span className="rosterLivePill">LIVE</span>
         ) : null}
+        {appearanceLock ? (
+          <span className="rosterAppearanceLockPill">
+            Locked until {formatWorldCupLockUntil(appearanceLock)}
+          </span>
+        ) : null}
         <span className={`rosterPositionPill rosterPositionPill--${position}`}>{position}</span>
         {action}
       </div>
@@ -142,6 +148,35 @@ function roomNextKickoffMs(room = {}) {
   }
 
   return null;
+}
+
+function isWorldCupDailyRoom(room = {}) {
+  const phaseLabel = String(
+    room?.competitionState?.phaseLabel ||
+      room?.phaseLabel ||
+      room?.worldCup?.phaseLabel ||
+      ""
+  );
+  const phase = String(room?.worldCupPhase || room?.worldCup?.phase || "");
+
+  return (
+    room?.engineType === "worldCupDaily" ||
+    room?.worldCup?.engineType === "worldCupDaily" ||
+    phase === "group" ||
+    phase === "WorldCupGroup" ||
+    phaseLabel === "WorldCupGroup"
+  );
+}
+
+function formatWorldCupLockUntil(lock = {}) {
+  const lockedUntilMs = Number(lock?.lockedUntilMs || 0);
+  if (!Number.isFinite(lockedUntilMs) || lockedUntilMs <= 0) return "later";
+
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: String(lock?.timezone || "America/Los_Angeles"),
+    month: "short",
+    day: "numeric",
+  }).format(new Date(lockedUntilMs));
 }
 
 function getSubsLockPollDelay({ nextKickoffMs, roomActive, locked, nowMs }) {
@@ -667,6 +702,7 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, displayName,
 
   const [lineupDoc, setLineupDoc] = useState(undefined);
   const [pendingIn, setPendingIn] = useState(null); // bench player picked to sub in
+  const [lockClockMs, setLockClockMs] = useState(() => Date.now());
   const didInitLineup = useRef(false);
   const didRepairLineup = useRef(false);
 
@@ -675,6 +711,51 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, displayName,
     const ref = doc(db, "rooms", lineupRoomId, "lineups", manager.uid);
     return onSnapshot(ref, (snap) => setLineupDoc(snap.exists() ? snap.data() : null));
   }, [lineupRoomId, manager?.uid]);
+
+  const worldCupDailyRoom = isWorldCupDailyRoom(room);
+  useEffect(() => {
+    if (!worldCupDailyRoom) return undefined;
+    setLockClockMs(Date.now());
+    const intervalId = window.setInterval(() => setLockClockMs(Date.now()), 60 * 1000);
+    return () => window.clearInterval(intervalId);
+  }, [worldCupDailyRoom]);
+
+  const activeWorldCupLocksByPlayerId = useMemo(() => {
+    if (!worldCupDailyRoom) return {};
+    const raw =
+      lineupDoc?.worldCupDailyLocksByPlayerId &&
+      typeof lineupDoc.worldCupDailyLocksByPlayerId === "object"
+        ? lineupDoc.worldCupDailyLocksByPlayerId
+        : {};
+    const active = {};
+
+    for (const [key, lock] of Object.entries(raw)) {
+      const playerId = String(lock?.playerId || key || "").trim();
+      const lockedUntilMs = Number(lock?.lockedUntilMs || 0);
+      if (!playerId || !Number.isFinite(lockedUntilMs) || lockedUntilMs <= lockClockMs) {
+        continue;
+      }
+      active[playerId] = { ...lock, playerId, lockedUntilMs };
+    }
+
+    return active;
+  }, [lineupDoc?.worldCupDailyLocksByPlayerId, lockClockMs, worldCupDailyRoom]);
+  const activeWorldCupLockCount = Object.keys(activeWorldCupLocksByPlayerId).length;
+  const getWorldCupAppearanceLock = (playerOrId) => {
+    const playerId = String(
+      typeof playerOrId === "object"
+        ? keyOf(playerOrId)
+        : playerOrId || ""
+    ).trim();
+    return activeWorldCupLocksByPlayerId[playerId] || null;
+  };
+  const showWorldCupLockMessage = (lock) => {
+    if (!lock) return;
+    const playerName = lock.playerName || "This player";
+    alert(
+      `${playerName} is locked until ${formatWorldCupLockUntil(lock)} because they appeared in a World Cup Group Stage match.`
+    );
+  };
 
   const roomActive = ["live", "resolving"].includes(
     String(room?.competitionState?.weekStatus || "").toLowerCase()
@@ -875,19 +956,31 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, displayName,
         benchInId: null,
       });
 
-      await setDoc(
-        doc(db, "rooms", lineupRoomId, "lineups", targetUid),
-        {
-          uid: targetUid,
-          starters: clean,       // String IDs
-          startingXI,            // Objects
-          bench: benchKeys,      // String IDs for Bench (Cup/Regular)
-          benchXI,               // Objects for Bench
-          updatedAt: serverTimestamp(),
-          updatedBy: authUid,
-        },
-        { merge: true }
-      );
+      if (worldCupDailyRoom) {
+        const fn = httpsCallable(functions, "saveWorldCupDailyLineup");
+        await fn({
+          roomId: lineupRoomId,
+          targetUid,
+          starters: clean,
+          startingXI,
+          bench: benchKeys,
+          benchXI,
+        });
+      } else {
+        await setDoc(
+          doc(db, "rooms", lineupRoomId, "lineups", targetUid),
+          {
+            uid: targetUid,
+            starters: clean,       // String IDs
+            startingXI,            // Objects
+            bench: benchKeys,      // String IDs for Bench (Cup/Regular)
+            benchXI,               // Objects for Bench
+            updatedAt: serverTimestamp(),
+            updatedBy: authUid,
+          },
+          { merge: true }
+        );
+      }
     } catch (e) {
       const userMessage = friendlyErrorMessage(
         e,
@@ -982,6 +1075,7 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, displayName,
   useEffect(() => {
     if (!isMe || lockedNow) return;
     if (!lineupDoc) return;
+    if (activeWorldCupLockCount > 0) return;
     if (didRepairLineup.current) return;
 
     // only auto-repair once roster is complete
@@ -1012,7 +1106,7 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, displayName,
     didRepairLineup.current = true;
     saveStarters(repaired);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isMe, lockedNow, lineupDoc, picks, totalRounds, allKeys]);
+  }, [isMe, lockedNow, lineupDoc, picks, totalRounds, allKeys, activeWorldCupLockCount]);
 
   function onSubInClick(benchKey) {
     if (!isMe || lockedNow) return;
@@ -1044,6 +1138,12 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, displayName,
     if (!isMe || lockedNow) return;
     if (!pendingIn) return;
 
+    const appearanceLock = getWorldCupAppearanceLock(starterKey);
+    if (appearanceLock) {
+      showWorldCupLockMessage(appearanceLock);
+      return;
+    }
+
     const benchPick = pickByKey.get(pendingIn);
 
   
@@ -1064,6 +1164,7 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, displayName,
     if (!pendingIn) return null;
     const allowed = new Set();
     for (const starterKey of starters) {
+      if (getWorldCupAppearanceLock(starterKey)) continue;
       const next = starters.map((k) => (k === starterKey ? pendingIn : k));
       if (validateStarters(next).ok) allowed.add(starterKey);
     }
@@ -1167,6 +1268,12 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, displayName,
                 Subs locked (live match): {livePlayers.map((p) => p.name).join(", ")}
               </div>
             )}
+            {worldCupDailyRoom && activeWorldCupLockCount > 0 ? (
+              <div className="rosterAppearanceLockNotice">
+                {activeWorldCupLockCount} appeared starter
+                {activeWorldCupLockCount === 1 ? " is" : "s are"} locked in the same slot.
+              </div>
+            ) : null}
           </>
         )}
       </div>
@@ -1175,10 +1282,10 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, displayName,
       <div className="rosterShell grid grid-cols-2 gap-2 text-sm">
         {isMe ? (
           <>
-            <RosterStarterBlock title="ATT" list={startersByPos.ATT} pendingIn={!!pendingIn} locked={lockedNow} onPick={onStarterClick} keyOf={keyOf} isLivePick={isPickLive} pendingInPickLive={pendingIsLive} replaceable={replaceableStarters}/>
-            <RosterStarterBlock title="MID" list={startersByPos.MID} pendingIn={!!pendingIn} locked={lockedNow} onPick={onStarterClick} keyOf={keyOf} isLivePick={isPickLive} pendingInPickLive={pendingIsLive} replaceable={replaceableStarters}/>
-            <RosterStarterBlock title="DEF" list={startersByPos.DEF} pendingIn={!!pendingIn} locked={lockedNow} onPick={onStarterClick} keyOf={keyOf} isLivePick={isPickLive} pendingInPickLive={pendingIsLive} replaceable={replaceableStarters}/>
-            <RosterStarterBlock title="GK"  list={startersByPos.GK}  pendingIn={!!pendingIn} locked={lockedNow} onPick={onStarterClick} keyOf={keyOf} isLivePick={isPickLive} pendingInPickLive={pendingIsLive} replaceable={replaceableStarters}/>
+            <RosterStarterBlock title="ATT" list={startersByPos.ATT} pendingIn={!!pendingIn} locked={lockedNow} onPick={onStarterClick} keyOf={keyOf} isLivePick={isPickLive} pendingInPickLive={pendingIsLive} replaceable={replaceableStarters} getAppearanceLock={getWorldCupAppearanceLock} onLockedAttempt={showWorldCupLockMessage}/>
+            <RosterStarterBlock title="MID" list={startersByPos.MID} pendingIn={!!pendingIn} locked={lockedNow} onPick={onStarterClick} keyOf={keyOf} isLivePick={isPickLive} pendingInPickLive={pendingIsLive} replaceable={replaceableStarters} getAppearanceLock={getWorldCupAppearanceLock} onLockedAttempt={showWorldCupLockMessage}/>
+            <RosterStarterBlock title="DEF" list={startersByPos.DEF} pendingIn={!!pendingIn} locked={lockedNow} onPick={onStarterClick} keyOf={keyOf} isLivePick={isPickLive} pendingInPickLive={pendingIsLive} replaceable={replaceableStarters} getAppearanceLock={getWorldCupAppearanceLock} onLockedAttempt={showWorldCupLockMessage}/>
+            <RosterStarterBlock title="GK"  list={startersByPos.GK}  pendingIn={!!pendingIn} locked={lockedNow} onPick={onStarterClick} keyOf={keyOf} isLivePick={isPickLive} pendingInPickLive={pendingIsLive} replaceable={replaceableStarters} getAppearanceLock={getWorldCupAppearanceLock} onLockedAttempt={showWorldCupLockMessage}/>
 
             {/* SUB section becomes Bench */}
             <div className="col-span-2">
@@ -1354,20 +1461,38 @@ function BenchReadOnlyBlock({ title, list }) {
   );
 }
 
-function RosterStarterBlock({ title, list, pendingIn, locked, onPick, keyOf, isLivePick, pendingInPickLive, replaceable }) {
+function RosterStarterBlock({
+  title,
+  list,
+  pendingIn,
+  locked,
+  onPick,
+  keyOf,
+  isLivePick,
+  pendingInPickLive,
+  replaceable,
+  getAppearanceLock,
+  onLockedAttempt,
+}) {
   return (
     <div className={`rosterPositionGroup rosterPositionGroup--${title} border rounded p-2`}>
       <div className="text-xs font-semibold mb-2">{title}</div>
       <ul className="space-y-2">
         {list.map((p) => {
           const k = keyOf(p);
+          const appearanceLock = getAppearanceLock?.(p) || null;
           const illegalByFormation = !!pendingIn && !!replaceable && !replaceable.has(k);
-          const disabled = locked || !pendingIn || pendingInPickLive || illegalByFormation;
+          const disabled =
+            locked ||
+            Boolean(appearanceLock) ||
+            !pendingIn ||
+            pendingInPickLive ||
+            illegalByFormation;
 
           return (
             <li
               key={p.id || `${p.uid}-${p.turn}`}
-              className={`rosterPlayerAction ${locked ? "opacity-60" : ""} ${
+              className={`rosterPlayerAction ${locked || appearanceLock ? "opacity-60" : ""} ${
                 pendingIn
                   ? disabled
                     ? "opacity-50 cursor-not-allowed"
@@ -1375,7 +1500,9 @@ function RosterStarterBlock({ title, list, pendingIn, locked, onPick, keyOf, isL
                   : ""
               }`}
               title={
-                locked
+                appearanceLock
+                  ? `Locked until ${formatWorldCupLockUntil(appearanceLock)} after a World Cup appearance`
+                  : locked
                   ? "Lineups locked"
                   : pendingInPickLive
                   ? "Selected bench player is LIVE (can't sub in)"
@@ -1388,6 +1515,10 @@ function RosterStarterBlock({ title, list, pendingIn, locked, onPick, keyOf, isL
                   : undefined
               }
               onClick={() => {
+                if (appearanceLock) {
+                  onLockedAttempt?.(appearanceLock);
+                  return;
+                }
                 if (disabled) return;
                 onPick(k);
               }}
@@ -1395,6 +1526,7 @@ function RosterStarterBlock({ title, list, pendingIn, locked, onPick, keyOf, isL
               <RosterPlayerRow
                 player={p}
                 live={!!isLivePick?.(p)}
+                appearanceLock={appearanceLock}
                 swapTarget={!!pendingIn && !disabled}
               />
             </li>
