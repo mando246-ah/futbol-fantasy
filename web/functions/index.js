@@ -56,7 +56,11 @@ const {
   loadWorldCupGroupDailyWindows,
   writeWorldCupDailyWindowsForRoom,
 } = require("./worldCup/worldCupDailyWindows");
-const { runWorldCupGroupEngine } = require("./worldCup/worldCupGroupEngine");
+const {
+  runWorldCupGroupEngine,
+  recomputeWorldCupGroupDayFromSavedFixtures,
+  summarizeWorldCupRepairDiffs,
+} = require("./worldCup/worldCupGroupEngine");
 const {
   findWorldCupDailyLockViolation,
   formatWorldCupDailyLockDate,
@@ -88,6 +92,14 @@ const CUP_GLOBAL_DISCOVERY_RETRY_MS = 60 * 60 * 1000;
 const CUP_GLOBAL_DRAFT_RECHECK_MS = 10 * 60 * 1000;
 const CUP_GLOBAL_ACTIVE_RECHECK_MS = 60 * 1000;
 const CUP_GLOBAL_CACHE_REFRESH_DEDUPE_MS = 45 * 1000;
+const API_FOOTBALL_RUNTIME_PATH = "system/apiFootballRuntime";
+const API_FOOTBALL_MIN_COOLDOWN_MS = 60 * 60 * 1000;
+const API_FOOTBALL_SCHEDULED_RETRY_MS = 60 * 60 * 1000;
+const API_FOOTBALL_COOLDOWN_CODE = "api-football-cooldown";
+const API_FOOTBALL_COOLDOWN_MESSAGE =
+  "API-Football Safe Mode is enabled or quota cooldown is active. Try again after reset.";
+const FIXTURE_PLAYERS_REFRESH_LOCK_MS = 90 * 1000;
+const FIXTURE_PLAYERS_LOCK_WAIT_MS = 1200;
 const cupGlobalRefreshResultByKey = new Map();
 
 exports.trimRoomChatMessages = onDocumentCreated(
@@ -527,6 +539,219 @@ function requireDraftManagerCount(memberUids = [], room = {}) {
 
 //API
 
+function normalizeApiFootballRuntime(data = {}, nowMs = Date.now()) {
+  const cooldownUntilMs = Number(data?.cooldownUntilMs || 0);
+  const safeMode = data?.safeMode === true;
+  const cooldownActive =
+    Number.isFinite(cooldownUntilMs) && cooldownUntilMs > nowMs;
+
+  return {
+    ...data,
+    safeMode,
+    safeModeActive: safeMode,
+    cooldownUntilMs:
+      Number.isFinite(cooldownUntilMs) && cooldownUntilMs > 0
+        ? cooldownUntilMs
+        : 0,
+    cooldownActive,
+    blocked: safeMode || cooldownActive,
+    cooldownRemainingMs: cooldownActive
+      ? Math.max(0, cooldownUntilMs - nowMs)
+      : 0,
+    nowMs,
+  };
+}
+
+async function readApiFootballRuntimeStatus(nowMs = Date.now()) {
+  try {
+    const snap = await db.doc(API_FOOTBALL_RUNTIME_PATH).get();
+    const data = snap.exists ? snap.data() || {} : {};
+    return normalizeApiFootballRuntime(data, nowMs);
+  } catch (error) {
+    console.warn("[apiFootballGet] runtime guard read failed; allowing API call", {
+      message: error?.message || String(error),
+    });
+    return normalizeApiFootballRuntime(
+      {
+        runtimeReadError: String(error?.message || error),
+      },
+      nowMs
+    );
+  }
+}
+
+function createApiFootballCooldownError({
+  reason = "api-football-cooldown",
+  cooldownUntilMs = 0,
+  safeMode = false,
+  path = "",
+  status = null,
+} = {}) {
+  const err = new HttpsError(
+    "resource-exhausted",
+    API_FOOTBALL_COOLDOWN_MESSAGE,
+    {
+      apiFootballCode: API_FOOTBALL_COOLDOWN_CODE,
+      reason,
+      cooldownUntilMs:
+        Number.isFinite(Number(cooldownUntilMs)) && Number(cooldownUntilMs) > 0
+          ? Number(cooldownUntilMs)
+          : null,
+      safeMode: Boolean(safeMode),
+      path: String(path || ""),
+      status,
+    }
+  );
+
+  err.isApiFootballCooldown = true;
+  err.apiFootballCode = API_FOOTBALL_COOLDOWN_CODE;
+  err.cooldownUntilMs =
+    Number.isFinite(Number(cooldownUntilMs)) && Number(cooldownUntilMs) > 0
+      ? Number(cooldownUntilMs)
+      : null;
+  err.safeMode = Boolean(safeMode);
+  err.reason = reason;
+  return err;
+}
+
+function isApiFootballCooldownError(err) {
+  return (
+    err?.isApiFootballCooldown === true ||
+    err?.apiFootballCode === API_FOOTBALL_COOLDOWN_CODE ||
+    err?.details?.apiFootballCode === API_FOOTBALL_COOLDOWN_CODE ||
+    err?.customData?.details?.apiFootballCode === API_FOOTBALL_COOLDOWN_CODE
+  );
+}
+
+function apiFootballCooldownReason(err) {
+  const details = err?.details || err?.customData?.details || {};
+  if (details.safeMode === true || err?.safeMode === true) {
+    return "api-football-safe-mode";
+  }
+  return details.reason || err?.reason || "api-football-cooldown";
+}
+
+function getApiFootballCooldownRetryAtMs(err, nowMs = Date.now()) {
+  const details = err?.details || err?.customData?.details || {};
+  const cooldownUntilMs = Number(
+    err?.cooldownUntilMs || details?.cooldownUntilMs || 0
+  );
+
+  return Number.isFinite(cooldownUntilMs) && cooldownUntilMs > nowMs
+    ? cooldownUntilMs
+    : nowMs + API_FOOTBALL_SCHEDULED_RETRY_MS;
+}
+
+function isApiFootballQuotaOrRateLimit(status, text = "") {
+  const body = String(text || "").toLowerCase();
+  return (
+    Number(status) === 429 ||
+    body.includes("quota") ||
+    body.includes("rate limit") ||
+    body.includes("ratelimit") ||
+    body.includes("too many requests") ||
+    body.includes("limit reached") ||
+    body.includes("limit exceeded")
+  );
+}
+
+function apiFootballJsonQuotaText(json = {}) {
+  const candidates = [];
+  const errors = json?.errors;
+
+  if (typeof errors === "string") {
+    candidates.push(errors);
+  } else if (Array.isArray(errors)) {
+    candidates.push(...errors.map((value) => String(value || "")));
+  } else if (errors && typeof errors === "object") {
+    for (const [key, value] of Object.entries(errors)) {
+      candidates.push(key, String(value || ""));
+    }
+  }
+
+  candidates.push(
+    json?.message,
+    json?.error,
+    json?.reason,
+    json?.description
+  );
+
+  return candidates.filter(Boolean).join(" ").toLowerCase();
+}
+
+function apiFootballJsonIndicatesQuotaOrRateLimit(json = {}) {
+  const body = apiFootballJsonQuotaText(json);
+  if (!body) return false;
+
+  return (
+    body.includes("quota") ||
+    body.includes("rate limit") ||
+    body.includes("ratelimit") ||
+    body.includes("too many requests") ||
+    body.includes("daily limit") ||
+    body.includes("plan limit") ||
+    body.includes("limit reached") ||
+    body.includes("limit exceeded")
+  );
+}
+
+async function assertApiFootballRuntimeAllowsCall(path, nowMs = Date.now()) {
+  const runtime = await readApiFootballRuntimeStatus(nowMs);
+
+  if (runtime.safeMode === true) {
+    throw createApiFootballCooldownError({
+      reason: "api-football-safe-mode",
+      cooldownUntilMs: runtime.cooldownUntilMs || 0,
+      safeMode: true,
+      path,
+    });
+  }
+
+  if (runtime.cooldownActive === true) {
+    throw createApiFootballCooldownError({
+      reason: runtime.cooldownReason || "api-football-cooldown",
+      cooldownUntilMs: runtime.cooldownUntilMs,
+      safeMode: false,
+      path,
+    });
+  }
+
+  return runtime;
+}
+
+async function writeApiFootballCooldown({
+  path = "",
+  status = null,
+  text = "",
+  nowMs = Date.now(),
+} = {}) {
+  const cooldownUntilMs = nowMs + API_FOOTBALL_MIN_COOLDOWN_MS;
+  const cooldownReason =
+    Number(status) === 429
+      ? "api-football-rate-limit"
+      : "api-football-quota";
+
+  await db.doc(API_FOOTBALL_RUNTIME_PATH).set(
+    {
+      cooldownUntilMs,
+      cooldownReason,
+      lastCooldownStatus: status,
+      lastCooldownPath: String(path || ""),
+      lastCooldownBody: String(text || "").slice(0, 500),
+      updatedAtMs: nowMs,
+      updatedAt: FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  ).catch((error) => {
+    console.warn("[apiFootballGet] failed to write cooldown state", {
+      path,
+      status,
+      message: error?.message || String(error),
+    });
+  });
+
+  return { cooldownUntilMs, cooldownReason };
+}
 
 async function apiFootballGet(path, params, apiKey) {
   const url = new URL(`https://v3.football.api-sports.io/${path}`);
@@ -534,19 +759,55 @@ async function apiFootballGet(path, params, apiKey) {
     if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
   });
 
+  await assertApiFootballRuntimeAllowsCall(path);
+
   const res = await fetch(url.toString(), {
     headers: { "x-apisports-key": apiKey },
   });
 
   if (!res.ok) {
     const text = await res.text();
+    if (isApiFootballQuotaOrRateLimit(res.status, text)) {
+      const { cooldownUntilMs, cooldownReason } = await writeApiFootballCooldown({
+        path,
+        status: res.status,
+        text,
+      });
+
+      throw createApiFootballCooldownError({
+        reason: cooldownReason,
+        cooldownUntilMs,
+        safeMode: false,
+        path,
+        status: res.status,
+      });
+    }
+
     throw new Error(`API-Football ${res.status}: ${text}`);
   }
 
     // Some endpoints return 204 No Content (e.g., fixtures/players before kickoff)
   if (res.status === 204) return { response: [] };
 
-  return res.json();
+  const json = await res.json();
+  if (apiFootballJsonIndicatesQuotaOrRateLimit(json)) {
+    const text = apiFootballJsonQuotaText(json).slice(0, 500);
+    const { cooldownUntilMs, cooldownReason } = await writeApiFootballCooldown({
+      path,
+      status: res.status,
+      text,
+    });
+
+    throw createApiFootballCooldownError({
+      reason: cooldownReason,
+      cooldownUntilMs,
+      safeMode: false,
+      path,
+      status: res.status,
+    });
+  }
+
+  return json;
 }
 
 function isHost(room, uid) {
@@ -3185,18 +3446,44 @@ async function fetchNextRoundWindow({ league, season, timezone }, opts={}) {
 */
 }
 
-async function ensureDefaultLineupsForRoom(roomId, memberUids) {
-  // Load players to know positions (for GK preference)
-  const playersSnap = await db.collection(`rooms/${roomId}/players`).get();
+async function ensureDefaultLineupsForRoom(roomId, memberUids, options = {}) {
+  const preloadedPlayersById =
+    options?.preloadedPlayersById instanceof Map
+      ? options.preloadedPlayersById
+      : null;
+  const preloadedLineupsByUid =
+    options?.preloadedLineupsByUid instanceof Map
+      ? options.preloadedLineupsByUid
+      : null;
+  const preloadedPicks = Array.isArray(options?.preloadedPicks)
+    ? options.preloadedPicks
+    : null;
+
+  // Legacy callers still load the room pool. World Cup group polling passes
+  // targeted player metadata so it never scans the full player collection.
   const posById = new Map();
-  playersSnap.forEach((doc) => {
-    const d = doc.data() || {};
-    const pid = String(d.id ?? d.playerId ?? doc.id);
-    posById.set(pid, toPos(d.position || d.pos || d.role));
-  });
+  if (preloadedPlayersById) {
+    for (const [playerId, player] of preloadedPlayersById.entries()) {
+      const pid = String(player?.id ?? player?.playerId ?? playerId ?? "");
+      if (!pid) continue;
+      posById.set(pid, toPos(player?.position || player?.pos || player?.role));
+    }
+  } else {
+    const playersSnap = await db.collection(`rooms/${roomId}/players`).get();
+    playersSnap.forEach((doc) => {
+      const d = doc.data() || {};
+      const pid = String(d.id ?? d.playerId ?? doc.id);
+      posById.set(pid, toPos(d.position || d.pos || d.role));
+    });
+  }
 
   // Load picks to build roster per user (in pick order if available)
-  const picksSnap = await db.collection(`rooms/${roomId}/picks`).get();
+  const pickRows = preloadedPicks || (
+    await db.collection(`rooms/${roomId}/picks`).get()
+  ).docs.map((doc) => ({
+    id: doc.id,
+    data: doc.data() || {},
+  }));
   const rosterByUid = new Map();
 
   function inferOwnerUid(d) {
@@ -3218,28 +3505,53 @@ async function ensureDefaultLineupsForRoom(roomId, memberUids) {
     return Number.isFinite(num) ? num : ms;
   }
 
-  picksSnap.forEach((doc) => {
-    const d = doc.data() || {};
+  for (const row of pickRows) {
+    const d = row?.data || row || {};
     const uid = inferOwnerUid(d);
     const pid = String(d.playerId ?? d.pid ?? d.apiPlayerId ?? d.player?.id ?? d.player?.playerId ?? "");
-    if (!uid || !pid) return;
+    if (!uid || !pid) continue;
 
     const arr = rosterByUid.get(uid) || [];
     arr.push({ pid, order: pickOrder(d), pos: posById.get(pid) || "MID" });
     rosterByUid.set(uid, arr);
-  });
+  }
 
   const batch = db.batch();
   let writes = 0;
+  const initializedLineupsByUid = {};
 
   for (const uid of memberUids) {
     const lineupRef = db.doc(`rooms/${roomId}/lineups/${uid}`);
-    const snap = await lineupRef.get();
-    const existing = snap.exists ? (snap.data() || {}) : null;
+    let existing = null;
+    let lineupExists = false;
 
-    // only create if missing or no starters
-    const startersExisting = Array.isArray(existing?.starters) ? existing.starters : [];
-    if (snap.exists && startersExisting.length > 0) continue;
+    if (preloadedLineupsByUid) {
+      lineupExists = preloadedLineupsByUid.has(uid);
+      existing = lineupExists
+        ? preloadedLineupsByUid.get(uid) || {}
+        : null;
+    } else {
+      const snap = await lineupRef.get();
+      lineupExists = snap.exists;
+      existing = snap.exists ? (snap.data() || {}) : null;
+    }
+
+    // Only create if missing or no starters. Check raw arrays so legacy
+    // numeric/string IDs and newer nested lineup shapes are both preserved.
+    const hasExistingStarters = [
+      existing?.starters,
+      existing?.startingXI,
+      existing?.starting11,
+      existing?.starterIds,
+      existing?.startingIds,
+      existing?.lineup?.starters,
+      existing?.lineup?.startingXI,
+      existing?.lineup?.starting11,
+      existing?.currentLineup?.starters,
+      existing?.currentLineup?.startingXI,
+      existing?.currentLineup?.starting11,
+    ].some((candidate) => Array.isArray(candidate) && candidate.length > 0);
+    if (lineupExists && hasExistingStarters) continue;
 
     const roster = (rosterByUid.get(uid) || [])
       .sort((a, b) => a.order - b.order)
@@ -3267,22 +3579,34 @@ async function ensureDefaultLineupsForRoom(roomId, memberUids) {
     const starterSet = new Set(starters.map(String));
     const bench = uniq.filter((pid) => !starterSet.has(String(pid)));
 
-    batch.set(
-      lineupRef,
-      {
-        starters,
-        bench,
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        autoInit: true,
-      },
-      { merge: true }
-    );
+    const initializedLineup = {
+      starters,
+      bench,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      autoInit: true,
+    };
+
+    batch.set(lineupRef, initializedLineup, { merge: true });
+    initializedLineupsByUid[uid] = {
+      ...(existing || {}),
+      starters,
+      bench,
+      autoInit: true,
+    };
     writes++;
   }
 
   if (writes > 0) await batch.commit();
-  return { writes };
+  return {
+    writes,
+    initializedLineupsByUid,
+    usedPreloadedData: Boolean(
+      preloadedPlayersById &&
+      preloadedLineupsByUid &&
+      preloadedPicks
+    ),
+  };
 }
 
 function lineupEntryId(entry) {
@@ -4469,6 +4793,7 @@ exports.saveLineupSubstitution = onCall(
         "roomId, starterOutId, and benchInId are required."
       );
     }
+    const nowMs = Date.now();
 
     const roomRef = db.doc(`rooms/${roomId}`);
     const roomSnap = await roomRef.get();
@@ -4544,6 +4869,13 @@ exports.saveLineupSubstitution = onCall(
         );
       }
 
+      await assertWorldCupDailySubstitutionPlayersNotStarted({
+        roomId,
+        room,
+        playerIds: [starterOutId, benchInId],
+        nowMs,
+      });
+
       const sanitized = sanitizeLineupIdsAgainstOwnedRoster({
         starters,
         bench,
@@ -4563,20 +4895,46 @@ exports.saveLineupSubstitution = onCall(
     }
 
     if (!starters.includes(starterOutId)) {
-      throw new HttpsError("failed-precondition", "starterOutId is not in starters.");
+      throw new HttpsError(
+        "failed-precondition",
+        "Your lineup changed or is still syncing. Refresh the roster and try that substitution again.",
+        {
+          reason: "starter-out-not-in-starters",
+          roomId,
+          targetUid,
+          starterOutId,
+          benchInId,
+          savedStarters: savedStarterEntries.map(lineupEntryId).filter(Boolean),
+          savedBench: savedBenchEntries.map(lineupEntryId).filter(Boolean),
+          starters,
+          bench,
+          repairedBeforeSubstitution,
+          removedInvalidPlayerIds,
+          addedMissingOwnedPlayerIdsToBench,
+        }
+      );
     }
 
     if (!bench.includes(benchInId)) {
-      throw new HttpsError("failed-precondition", "benchInId is not in bench.");
+      throw new HttpsError(
+        "failed-precondition",
+        "Your lineup changed or is still syncing. Refresh the roster and try that substitution again.",
+        {
+          reason: "bench-in-not-in-bench",
+          roomId,
+          targetUid,
+          starterOutId,
+          benchInId,
+          savedStarters: savedStarterEntries.map(lineupEntryId).filter(Boolean),
+          savedBench: savedBenchEntries.map(lineupEntryId).filter(Boolean),
+          starters,
+          bench,
+          repairedBeforeSubstitution,
+          removedInvalidPlayerIds,
+          addedMissingOwnedPlayerIdsToBench,
+        }
+      );
     }
-
-    const nowMs = Date.now();
-    await assertWorldCupDailySubstitutionPlayersNotStarted({
-      roomId,
-      room,
-      playerIds: [starterOutId, benchInId],
-      nowMs,
-    });
 
     const nextStarters = starters.map((id) =>
       id === starterOutId ? benchInId : id
@@ -5078,7 +5436,11 @@ function buildPlayerStatsMapFromFixturePlayersResponse(responseArr, fixtureMeta)
 
       // ... (Keep your existing minutes/goals/passes logic here) ...
       const minutes = toNum(st?.games?.minutes);
-      const goals = toNum(st?.goals?.total);
+      const goalsTotal = toNum(st?.goals?.total);
+      const pensScored = toNum(st?.penalty?.scored);
+      // API-Football can report a live penalty before goals.total catches up.
+      // Math.max recovers that goal without double-counting once total includes it.
+      const goals = Math.max(goalsTotal, pensScored);
       const assists = toNum(st?.goals?.assists);
       const passesCompleted = toNum(st?.passes?.total); // Using Total Passes as discussed
       
@@ -5164,6 +5526,7 @@ function buildPlayerStatsMapFromFixturePlayersResponse(responseArr, fixtureMeta)
         minutes, 
         goals, 
         assists, 
+        pensScored,
 
         passesCompleted,
         saves,
@@ -5227,15 +5590,105 @@ function patchPlayerStatsWithFixtureMeta(playerStats = {}, fixtureMeta = {}) {
   return patched;
 }
 
-async function getFixturePlayersStatsMapCached({ fixtureId, apiKey, ttlMs, timeZone }) {
-  //const ref = db.collection("apiCache").doc(`fixturePlayers_${String(fixtureId)}`);
-  const ref = db.doc(`apiCache/fixturePlayers_${String(fixtureId)}`);
+function waitMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function incrementFixtureStatsDebug(statsDebug, key) {
+  if (!statsDebug || typeof statsDebug !== "object") return;
+  statsDebug[key] = Number(statsDebug[key] || 0) + 1;
+}
+
+function getFixturePlayersCacheStats(cacheDoc = {}) {
+  return cacheDoc?.playerStats && typeof cacheDoc.playerStats === "object"
+    ? cacheDoc.playerStats
+    : {};
+}
+
+function shouldUseFixturePlayersCache(cacheDoc = {}, fixtureMeta = {}, nowMs, ttlMs, forceRefresh) {
+  if (forceRefresh) return false;
+
+  const updatedAtMs = Number(cacheDoc?.updatedAtMs || 0);
+  if (!Number.isFinite(updatedAtMs) || updatedAtMs <= 0) return false;
+  if (nowMs - updatedAtMs >= Number(ttlMs || 0)) return false;
+  if (!cacheDoc || !cacheDoc.playerStats || typeof cacheDoc.playerStats !== "object") return false;
+
+  const cachedStats = getFixturePlayersCacheStats(cacheDoc);
+  const sample = Object.values(cachedStats)[0] || {};
+  const cachedShort = String(
+    sample?.statusShort ||
+      sample?.fixtureStatus ||
+      sample?.matchStatus ||
+      cacheDoc?.statusShort ||
+      ""
+  ).trim().toUpperCase();
+  const currentShort = String(
+    fixtureMeta?.statusShort ||
+      fixtureMeta?.fixtureStatus ||
+      fixtureMeta?.matchStatus ||
+      ""
+  ).trim().toUpperCase();
+  const statusChanged = Boolean(currentShort && cachedShort && currentShort !== cachedShort);
+  const becameFinal = isFinalStatusCode(currentShort) && cachedShort !== currentShort;
+
+  return !statusChanged && !becameFinal;
+}
+
+function hasNonEmptyFixturePlayersCache(cacheDoc = {}) {
+  return Object.keys(getFixturePlayersCacheStats(cacheDoc)).length > 0;
+}
+
+function patchFixturePlayersCache(cacheDoc = {}, fixtureMeta = {}) {
+  return patchPlayerStatsWithFixtureMeta(
+    getFixturePlayersCacheStats(cacheDoc),
+    fixtureMeta
+  );
+}
+
+function logFixturePlayersCacheDecision({
+  fixtureId,
+  source,
+  cacheHit = false,
+  staleCacheReturned = false,
+  lockAcquired = false,
+  skippedDueToFreshLock = false,
+  forceRefresh = false,
+  apiCallMade = false,
+  playerCount = 0,
+} = {}) {
+  console.log("[fixturePlayersCache]", {
+    fixtureId: String(fixtureId || ""),
+    source: source || "",
+    cacheHit,
+    staleCacheReturned,
+    lockAcquired,
+    skippedDueToFreshLock,
+    forceRefresh,
+    apiCallMade,
+    playerCount: Number(playerCount || 0),
+  });
+}
+
+async function getFixturePlayersStatsMapCached({
+  fixtureId,
+  apiKey,
+  ttlMs,
+  timeZone,
+  forceRefresh = false,
+  source = "",
+  statsDebug = null,
+}) {
+  const safeFixtureId = String(fixtureId || "").trim();
+  if (!safeFixtureId) return {};
+
+  //const ref = db.collection("apiCache").doc(`fixturePlayers_${safeFixtureId}`);
+  const ref = db.doc(`apiCache/fixturePlayers_${safeFixtureId}`);
   const now = Date.now();
-  const metaSnap = await db.doc(`apiCache/fixtureStatus_${String(fixtureId)}`).get();
+  const metaSnap = await db.doc(`apiCache/fixtureStatus_${safeFixtureId}`).get();
   const metaDoc = metaSnap.exists ? (metaSnap.data() || {}) : {};
 
   const fixtureMeta = {
-    fixtureId: String(fixtureId),
+    fixtureId: safeFixtureId,
     homeTeamId: metaDoc.homeTeamId ?? null,
     awayTeamId: metaDoc.awayTeamId ?? null,
     homeTeamName: metaDoc.homeTeamName || "",
@@ -5261,67 +5714,222 @@ async function getFixturePlayersStatsMapCached({ fixtureId, apiKey, ttlMs, timeZ
     const snap = await ref.get();
     if (snap.exists) {
       const d = snap.data() || {};
-      const updatedAtMs = Number(d.updatedAtMs || 0);
-      const cachedStats = d.playerStats || {};
-      const sample = Object.values(cachedStats)[0] || {};
-      const cachedShort = String(sample?.statusShort || sample?.fixtureStatus || sample?.matchStatus || "").trim().toUpperCase();
-      const currentShort = String(fixtureMeta?.statusShort || fixtureMeta?.fixtureStatus || fixtureMeta?.matchStatus || "").trim().toUpperCase();
-      const statusChanged = Boolean(currentShort && cachedShort && currentShort !== cachedShort);
-      const becameFinal = isFinalStatusCode(currentShort) && cachedShort !== currentShort;
 
-      if (
-        updatedAtMs &&
-        now - updatedAtMs < ttlMs &&
-        cachedStats &&
-        Object.keys(cachedStats).length > 0 &&
-        !statusChanged &&
-        !becameFinal
-      ) {
-        return patchPlayerStatsWithFixtureMeta(cachedStats, fixtureMeta);
+      if (shouldUseFixturePlayersCache(d, fixtureMeta, now, ttlMs, forceRefresh)) {
+        const cached = patchFixturePlayersCache(d, fixtureMeta);
+        incrementFixtureStatsDebug(statsDebug, "fixturePlayerStatsCacheHits");
+        logFixturePlayersCacheDecision({
+          fixtureId: safeFixtureId,
+          source,
+          cacheHit: true,
+          forceRefresh,
+          playerCount: Object.keys(cached || {}).length,
+        });
+        return cached;
       }
     }
   } catch (_) {}
 
-  // If fixture hasn't started yet, this can return 204 No Content (handled in apiFootballGet)
-  const json = await apiFootballGet("fixtures/players", { fixture: String(fixtureId) }, apiKey);
-  const fresh = buildPlayerStatsMapFromFixturePlayersResponse(json?.response || [], fixtureMeta);
+  const lockOwner = [
+    "fixturePlayers",
+    safeFixtureId,
+    Date.now(),
+    Math.random().toString(16).slice(2),
+  ].join(":");
+  let decision = { type: "unknown", cacheDoc: null };
 
-  // Sometimes the API returns 204/empty even when a fixture should have stats.
-  // Do NOT overwrite a previously cached non-empty map with an empty one.
-  if (!fresh || Object.keys(fresh).length === 0) {
-    try {
-      const snap2 = await ref.get();
-      if (snap2.exists) {
-        const d2 = snap2.data() || {};
-        const prev = d2.playerStats;
-        if (prev && Object.keys(prev).length > 0) {
-          const patchedPrev = patchPlayerStatsWithFixtureMeta(prev, fixtureMeta);
-          await ref.set(
-            {
-              updatedAtMs: now,
-              playerStats: patchedPrev,
-            },
-            { merge: true }
-          );
-          return patchedPrev;
-        }
-      }
-    } catch (_) {}
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    const cacheDoc = snap.exists ? (snap.data() || {}) : {};
+    const refreshStartedAtMs = Number(cacheDoc?.refreshStartedAtMs || 0);
+    const lockFresh =
+      cacheDoc?.refreshInProgress === true &&
+      Number.isFinite(refreshStartedAtMs) &&
+      now - refreshStartedAtMs < FIXTURE_PLAYERS_REFRESH_LOCK_MS;
+
+    if (shouldUseFixturePlayersCache(cacheDoc, fixtureMeta, now, ttlMs, forceRefresh)) {
+      decision = { type: "fresh-cache", cacheDoc };
+      return;
+    }
+
+    if (lockFresh) {
+      decision = { type: "fresh-lock", cacheDoc };
+      return;
+    }
+
+    tx.set(
+      ref,
+      {
+        refreshInProgress: true,
+        refreshStartedAtMs: now,
+        refreshOwner: lockOwner,
+        refreshSource: source || "",
+        refreshForceRefresh: Boolean(forceRefresh),
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+    decision = { type: "lock-acquired", cacheDoc };
+  });
+
+  if (decision.type === "fresh-cache") {
+    const cached = patchFixturePlayersCache(decision.cacheDoc, fixtureMeta);
+    incrementFixtureStatsDebug(statsDebug, "fixturePlayerStatsCacheHits");
+    logFixturePlayersCacheDecision({
+      fixtureId: safeFixtureId,
+      source,
+      cacheHit: true,
+      forceRefresh,
+      playerCount: Object.keys(cached || {}).length,
+    });
+    return cached;
   }
 
-  const patchedFresh = patchPlayerStatsWithFixtureMeta(fresh, fixtureMeta);
-  await ref.set(
-    {
-      updatedAtMs: now,
-      playerStats: patchedFresh,
-    },
-    { merge: true }
-  );
+  if (decision.type === "fresh-lock") {
+    incrementFixtureStatsDebug(statsDebug, "fixturePlayerStatsLockSkips");
+    await waitMs(FIXTURE_PLAYERS_LOCK_WAIT_MS);
 
-  return patchedFresh;
+    let rereadDoc = null;
+    try {
+      const rereadSnap = await ref.get();
+      rereadDoc = rereadSnap.exists ? (rereadSnap.data() || {}) : null;
+    } catch (_) {}
+
+    if (
+      rereadDoc &&
+      shouldUseFixturePlayersCache(rereadDoc, fixtureMeta, Date.now(), ttlMs, false)
+    ) {
+      const cached = patchFixturePlayersCache(rereadDoc, fixtureMeta);
+      incrementFixtureStatsDebug(statsDebug, "fixturePlayerStatsCacheHits");
+      logFixturePlayersCacheDecision({
+        fixtureId: safeFixtureId,
+        source,
+        cacheHit: true,
+        skippedDueToFreshLock: true,
+        forceRefresh,
+        playerCount: Object.keys(cached || {}).length,
+      });
+      return cached;
+    }
+
+    const staleDoc = hasNonEmptyFixturePlayersCache(rereadDoc || {})
+      ? rereadDoc
+      : decision.cacheDoc;
+
+    if (hasNonEmptyFixturePlayersCache(staleDoc || {})) {
+      const stale = patchFixturePlayersCache(staleDoc, fixtureMeta);
+      incrementFixtureStatsDebug(statsDebug, "fixturePlayerStatsStaleReturns");
+      logFixturePlayersCacheDecision({
+        fixtureId: safeFixtureId,
+        source,
+        staleCacheReturned: true,
+        skippedDueToFreshLock: true,
+        forceRefresh,
+        playerCount: Object.keys(stale || {}).length,
+      });
+      return stale;
+    }
+
+    logFixturePlayersCacheDecision({
+      fixtureId: safeFixtureId,
+      source,
+      skippedDueToFreshLock: true,
+      forceRefresh,
+      playerCount: 0,
+    });
+    return {};
+  }
+
+  let lockReleased = false;
+  try {
+    incrementFixtureStatsDebug(statsDebug, "fixturePlayerStatsApiCalls");
+    logFixturePlayersCacheDecision({
+      fixtureId: safeFixtureId,
+      source,
+      lockAcquired: true,
+      forceRefresh,
+      apiCallMade: true,
+    });
+
+    // If fixture hasn't started yet, this can return 204 No Content (handled in apiFootballGet)
+    const json = await apiFootballGet("fixtures/players", { fixture: safeFixtureId }, apiKey);
+    const fresh = buildPlayerStatsMapFromFixturePlayersResponse(json?.response || [], fixtureMeta);
+
+    // Sometimes the API returns 204/empty even when a fixture should have stats.
+    // Do NOT overwrite a previously cached non-empty map with an empty one.
+    if (!fresh || Object.keys(fresh).length === 0) {
+      const snap2 = await ref.get().catch(() => null);
+      const d2 = snap2?.exists ? (snap2.data() || {}) : {};
+      const prev = d2.playerStats;
+
+      if (prev && Object.keys(prev).length > 0) {
+        const patchedPrev = patchPlayerStatsWithFixtureMeta(prev, fixtureMeta);
+        await ref.set(
+          {
+            updatedAtMs: Date.now(),
+            playerStats: patchedPrev,
+            statusShort: fixtureMeta.statusShort || null,
+            lastApiResponseEmpty: true,
+            refreshInProgress: false,
+            refreshCompletedAtMs: Date.now(),
+            refreshOwner: FieldValue.delete(),
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+        lockReleased = true;
+        return patchedPrev;
+      }
+    }
+
+    const patchedFresh = patchPlayerStatsWithFixtureMeta(fresh, fixtureMeta);
+    await ref.set(
+      {
+        updatedAtMs: Date.now(),
+        playerStats: patchedFresh,
+        statusShort: fixtureMeta.statusShort || null,
+        lastApiResponseEmpty: Object.keys(patchedFresh || {}).length === 0,
+        refreshInProgress: false,
+        refreshCompletedAtMs: Date.now(),
+        refreshOwner: FieldValue.delete(),
+        refreshError: FieldValue.delete(),
+        refreshErrorAtMs: FieldValue.delete(),
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+    lockReleased = true;
+
+    return patchedFresh;
+  } catch (error) {
+    await ref.set(
+      {
+        refreshInProgress: false,
+        refreshError: String(error?.message || error).slice(0, 500),
+        refreshErrorCode: error?.code || null,
+        refreshErrorAtMs: Date.now(),
+        refreshOwner: FieldValue.delete(),
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    ).catch(() => {});
+    lockReleased = true;
+    throw error;
+  } finally {
+    if (!lockReleased) {
+      await ref.set(
+        {
+          refreshInProgress: false,
+          refreshOwner: FieldValue.delete(),
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      ).catch(() => {});
+    }
+  }
 }
 
-async function getFixtureStatusMap({ fixtureIds, timezone, apiKey }) {
+async function getFixtureStatusMap({ fixtureIds, timezone, apiKey, forceRefresh = false }) {
   const ids = [...new Set((fixtureIds || []).map((x) => String(x)).filter(Boolean))];
   const out = {};
   if (!ids.length) return out;
@@ -5349,6 +5957,11 @@ async function getFixtureStatusMap({ fixtureIds, timezone, apiKey }) {
   await Promise.all(
     ids.map(async (id) => {
       try {
+        if (forceRefresh) {
+          missing.push(id);
+          return;
+        }
+
         const ref = db.doc(`apiCache/fixtureStatus_${id}`);
         const snap = await ref.get();
         if (!snap.exists) {
@@ -6028,6 +6641,7 @@ function mergeGlobalRawPlayerStats(prev = {}, next = {}, fixtureId = "") {
     "goalsConceded",
     "yellow",
     "red",
+    "pensScored",
     "pensSaved",
     "pensMissed",
     "pensCommitted",
@@ -7286,6 +7900,13 @@ async function pollGlobalSeasonLiveFixturesOnce({ seasonTarget, apiKey, nowMs })
   const detailsByFixtureId = await loadFixtureStatusDetailsMap(fixtureIds);
 
   let payloadCount = 0;
+  const fixtureStatsDebug = {
+    uniqueFixtureStatsChecked: 0,
+    fixturePlayerStatsCacheHits: 0,
+    fixturePlayerStatsApiCalls: 0,
+    fixturePlayerStatsLockSkips: 0,
+    fixturePlayerStatsStaleReturns: 0,
+  };
 
   for (const fixtureId of fixtureIds) {
     const detail = detailsByFixtureId[fixtureId] || {};
@@ -7297,12 +7918,15 @@ async function pollGlobalSeasonLiveFixturesOnce({ seasonTarget, apiKey, nowMs })
     let payloadBytesEstimate = 0;
 
     if (shouldFetchPlayers) {
+      fixtureStatsDebug.uniqueFixtureStatsChecked += 1;
       const ttlMs = isInPlay(short) ? 60 * 1000 : 60 * 60 * 1000;
       rawStatsByPlayerId = await getFixturePlayersStatsMapCached({
         fixtureId,
         apiKey,
         ttlMs,
         timeZone: timezone,
+        source: "pollGlobalSeasonLiveFixturesOnce",
+        statsDebug: fixtureStatsDebug,
       });
       fantasyByPlayerId = buildGlobalFantasyByPlayerId(rawStatsByPlayerId);
 
@@ -7376,6 +8000,11 @@ async function pollGlobalSeasonLiveFixturesOnce({ seasonTarget, apiKey, nowMs })
   return {
     fixtureCount: fixtureIds.length,
     payloadCount,
+    uniqueFixtureStatsChecked: fixtureStatsDebug.uniqueFixtureStatsChecked,
+    fixturePlayerStatsCacheHits: fixtureStatsDebug.fixturePlayerStatsCacheHits,
+    fixturePlayerStatsApiCalls: fixtureStatsDebug.fixturePlayerStatsApiCalls,
+    fixturePlayerStatsLockSkips: fixtureStatsDebug.fixturePlayerStatsLockSkips,
+    fixturePlayerStatsStaleReturns: fixtureStatsDebug.fixturePlayerStatsStaleReturns,
   };
 }
 
@@ -8274,7 +8903,13 @@ async function computeAndWriteLiveWeek({ roomId, weekIndex, apiKey }) {
     const statusUpdatedAtMs = Number(fixtureDetail.updatedAtMs);
 
     const ttlMs = inPlay ? LIVE_TTL_MS : (isFinished(short) ? FINISHED_TTL_MS : LIVE_TTL_MS);
-    const map = await getFixturePlayersStatsMapCached({ fixtureId: fid, apiKey, ttlMs, timeZone: timezone });
+    const map = await getFixturePlayersStatsMapCached({
+      fixtureId: fid,
+      apiKey,
+      ttlMs,
+      timeZone: timezone,
+      source: "computeAndWriteLiveWeek",
+    });
 
     for (const [pidRaw, st] of Object.entries(map || {})) {
       const pid = String(pidRaw);
@@ -8283,7 +8918,7 @@ async function computeAndWriteLiveWeek({ roomId, weekIndex, apiKey }) {
       const prev = aggStatsByPlayerId[pid] || {
         minutes: 0, passesCompleted: 0, goals: 0, assists: 0,
         saves: 0, goalsConceded: 0, yellow: 0, red: 0,
-        pensSaved: 0, pensMissed: 0, pensCommitted: 0,
+        pensScored: 0, pensSaved: 0, pensMissed: 0, pensCommitted: 0,
         rating: 0,
 
         tackles: 0,
@@ -8328,6 +8963,7 @@ async function computeAndWriteLiveWeek({ roomId, weekIndex, apiKey }) {
         yellow: prev.yellow + (st.yellow || 0),
         red: prev.red + (st.red || 0),
 
+        pensScored: (prev.pensScored || 0) + (st.pensScored || 0),
         pensSaved: prev.pensSaved + (st.pensSaved || 0),
         pensMissed: prev.pensMissed + (st.pensMissed || 0),
         pensCommitted: (prev.pensCommitted || 0) + (st.pensCommitted || 0), 
@@ -8999,7 +9635,8 @@ async function fetchAggregatedStats(fixtureIds, apiKey, timezone = "America/Los_
         fixtureId: fId, 
         apiKey, 
         ttlMs: 60 * 1000,
-        timeZone: timezone
+        timeZone: timezone,
+        source: "fetchAggregatedStats"
     });
 
     // We need the fixture status. Since your cache function returns a map of players, 
@@ -9026,7 +9663,7 @@ async function fetchAggregatedStats(fixtureIds, apiKey, timezone = "America/Los_
             aggStatsByPlayerId[pid] = {
                 minutes: 0, goals: 0, assists: 0, passesCompleted: 0,
                 saves: 0, goalsConceded: 0, yellow: 0, red: 0,
-                pensSaved: 0, pensMissed: 0, cleanSheet: false, ownGoals: 0,
+                pensScored: 0, pensSaved: 0, pensMissed: 0, cleanSheet: false, ownGoals: 0,
                 teamName: "", opponentName: "",
                 matchStatus: "NS", isLive: false
             };
@@ -9048,6 +9685,7 @@ async function fetchAggregatedStats(fixtureIds, apiKey, timezone = "America/Los_
             goalsConceded: prev.goalsConceded + (st.goalsConceded || 0),
             yellow: prev.yellow + (st.yellow || 0),
             red: prev.red + (st.red || 0),
+            pensScored: (prev.pensScored || 0) + (st.pensScored || 0),
             pensSaved: prev.pensSaved + (st.pensSaved || 0),
             pensMissed: prev.pensMissed + (st.pensMissed || 0),
             cleanSheet: prev.cleanSheet || st.cleanSheet || false,
@@ -9683,9 +10321,14 @@ async function loadOwnerActionRoom(roomId) {
 
 function isOwnerWorldCupGroupRoom(room) {
   const competitionState = getCompetitionState(room);
+  const worldCupPhase = String(
+    room?.worldCupPhase || room?.worldCup?.phase || ""
+  ).trim().toLowerCase();
+
   return (
     room?.engineType === "worldCupDaily" ||
     room?.worldCup?.engineType === "worldCupDaily" ||
+    worldCupPhase === WORLD_CUP_GROUP_PHASE ||
     room?.competitionState?.phaseLabel === "WorldCupGroup" ||
     competitionState?.phaseLabel === "WorldCupGroup"
   );
@@ -9857,8 +10500,86 @@ function handleOwnerActionError(functionName, err) {
   });
 
   if (err instanceof HttpsError) throw err;
+  if (isApiFootballCooldownError(err)) {
+    throw createApiFootballCooldownError({
+      reason: apiFootballCooldownReason(err),
+      cooldownUntilMs: getApiFootballCooldownRetryAtMs(err, Date.now()),
+      safeMode: err?.safeMode === true,
+    });
+  }
   throw new HttpsError("internal", err?.message || `${functionName} failed.`);
 }
+
+exports.ownerGetApiFootballRuntimeStatus = onCall(
+  { region: "us-west2" },
+  async (request) => {
+    const functionName = "ownerGetApiFootballRuntimeStatus";
+    try {
+      requireOwnerActionUid(request);
+      return {
+        ok: true,
+        path: API_FOOTBALL_RUNTIME_PATH,
+        runtime: await readApiFootballRuntimeStatus(Date.now()),
+      };
+    } catch (err) {
+      handleOwnerActionError(functionName, err);
+    }
+  }
+);
+
+exports.ownerSetApiFootballSafeMode = onCall(
+  { region: "us-west2" },
+  async (request) => {
+    const functionName = "ownerSetApiFootballSafeMode";
+    const nowMs = Date.now();
+
+    try {
+      const uid = requireOwnerActionUid(request);
+      const enabled = request.data?.enabled;
+      if (typeof enabled !== "boolean") {
+        throw new HttpsError(
+          "invalid-argument",
+          "enabled must be true or false."
+        );
+      }
+
+      const reason = String(request.data?.reason || "").trim().slice(0, 240);
+      const cooldownMinutesRaw = Number(request.data?.cooldownMinutes);
+      const hasCooldownMinutes =
+        Number.isFinite(cooldownMinutesRaw) && cooldownMinutesRaw > 0;
+      const clearCooldown = request.data?.clearCooldown === true;
+      const payload = {
+        safeMode: enabled,
+        safeModeReason:
+          reason || (enabled ? "Owner enabled safe mode." : "Owner disabled safe mode."),
+        safeModeUpdatedByUid: uid,
+        safeModeUpdatedAtMs: nowMs,
+        updatedAtMs: nowMs,
+        updatedAt: FieldValue.serverTimestamp(),
+      };
+
+      if (enabled && hasCooldownMinutes) {
+        payload.cooldownUntilMs =
+          nowMs + Math.round(cooldownMinutesRaw * 60 * 1000);
+        payload.cooldownReason =
+          reason || "Owner enabled API-Football safe mode cooldown.";
+      } else if (!enabled && clearCooldown) {
+        payload.cooldownUntilMs = FieldValue.delete();
+        payload.cooldownReason = FieldValue.delete();
+      }
+
+      await db.doc(API_FOOTBALL_RUNTIME_PATH).set(payload, { merge: true });
+
+      return {
+        ok: true,
+        path: API_FOOTBALL_RUNTIME_PATH,
+        runtime: await readApiFootballRuntimeStatus(nowMs),
+      };
+    } catch (err) {
+      handleOwnerActionError(functionName, err);
+    }
+  }
+);
 
 function summarizeRegularGlobalResult(result, extras = {}) {
   return {
@@ -10796,6 +11517,13 @@ exports.ownerRefreshCupGlobalFixtureCache = onCall(
       let writtenSummaryCount = 0;
       let writtenLiveFixtureCount = 0;
       const statusByFixtureId = {};
+      const fixtureStatsDebug = {
+        uniqueFixtureStatsChecked: 0,
+        fixturePlayerStatsCacheHits: 0,
+        fixturePlayerStatsApiCalls: 0,
+        fixturePlayerStatsLockSkips: 0,
+        fixturePlayerStatsStaleReturns: 0,
+      };
 
       for (const fixtureId of fixtureIds) {
         const detail = detailsByFixtureId[String(fixtureId)] || null;
@@ -10822,16 +11550,21 @@ exports.ownerRefreshCupGlobalFixtureCache = onCall(
           statusUpdatedAtMs: nowMs,
         };
 
-        const playersResponse = await apiFootballGet(
-          "fixtures/players",
-          { fixture: String(fixtureId) },
-          apiKey
-        );
-        let rawStatsByPlayerId = patchPlayerStatsWithFixtureMeta(
-          buildPlayerStatsMapFromFixturePlayersResponse(playersResponse?.response || [], fixtureMeta),
+        fixtureStatsDebug.uniqueFixtureStatsChecked += 1;
+        let rawStatsByPlayerId = await getFixturePlayersStatsMapCached({
+          fixtureId,
+          apiKey,
+          ttlMs: isInPlay(statusShort) ? 60 * 1000 : 60 * 60 * 1000,
+          timeZone: timezone,
+          forceRefresh: true,
+          source: functionName,
+          statsDebug: fixtureStatsDebug,
+        });
+        rawStatsByPlayerId = patchPlayerStatsWithFixtureMeta(
+          rawStatsByPlayerId || {},
           fixtureMeta
         );
-        let rawStatsSource = "api-football";
+        let rawStatsSource = "api-football-cache";
 
         if (!rawStatsByPlayerId || Object.keys(rawStatsByPlayerId).length === 0) {
           const existingLiveSnap = await getSeasonLiveFixtureRef(
@@ -10948,6 +11681,11 @@ exports.ownerRefreshCupGlobalFixtureCache = onCall(
         missingFixtureIds,
         writtenSummaryCount,
         writtenLiveFixtureCount,
+        uniqueFixtureStatsChecked: fixtureStatsDebug.uniqueFixtureStatsChecked,
+        fixturePlayerStatsCacheHits: fixtureStatsDebug.fixturePlayerStatsCacheHits,
+        fixturePlayerStatsApiCalls: fixtureStatsDebug.fixturePlayerStatsApiCalls,
+        fixturePlayerStatsLockSkips: fixtureStatsDebug.fixturePlayerStatsLockSkips,
+        fixturePlayerStatsStaleReturns: fixtureStatsDebug.fixturePlayerStatsStaleReturns,
       };
     } catch (err) {
       handleOwnerActionError(functionName, err);
@@ -11426,6 +12164,737 @@ exports.ownerRunWorldCupGroupEngineNow = onCall(
         teamScoresByUserId: result?.teamScoresByUserId || {},
         dailyLeaderboard: result?.dailyLeaderboard || [],
         standingsPreview: result?.standingsPreview || result?.leaderboard || [],
+      };
+    } catch (err) {
+      handleOwnerActionError(functionName, err);
+    }
+  }
+);
+
+function ownerRepairStringList(values = []) {
+  return [...new Set(
+    (Array.isArray(values) ? values : [])
+      .map((value) => String(value || "").trim())
+      .filter(Boolean)
+  )];
+}
+
+function ownerSavedWorldCupDayFixtureIds(day = {}) {
+  const ids = [
+    ...(Array.isArray(day.fixtureIds) ? day.fixtureIds : []),
+    ...(Array.isArray(day.fixtures)
+      ? day.fixtures.map((fixture) =>
+          fixture?.fixtureId ?? fixture?.id ?? fixture?.fixture?.id
+        )
+      : []),
+  ];
+
+  return ownerRepairStringList(ids);
+}
+
+function ownerWorldCupDayHasStarterSnapshots(day = {}) {
+  const snapshots =
+    day?.starterSnapshotsByFixtureId &&
+    typeof day.starterSnapshotsByFixtureId === "object"
+      ? day.starterSnapshotsByFixtureId
+      : {};
+
+  for (const snapshot of Object.values(snapshots)) {
+    if (!snapshot || typeof snapshot !== "object") continue;
+    const startersByUserId =
+      snapshot.startersByUserId &&
+      typeof snapshot.startersByUserId === "object"
+        ? snapshot.startersByUserId
+        : {};
+
+    if (Object.values(startersByUserId).some((starters) =>
+      Array.isArray(starters) && starters.length > 0
+    )) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function ownerWorldCupDayHasScoringEvidence(day = {}) {
+  const fixtureStatusById =
+    day?.fixtureStatusById && typeof day.fixtureStatusById === "object"
+      ? day.fixtureStatusById
+      : {};
+  const dayStatusDecision =
+    day?.dayStatusDecision && typeof day.dayStatusDecision === "object"
+      ? day.dayStatusDecision
+      : {};
+
+  return (
+    Boolean(day.scoredAtMs || day.lastScoredAtMs || day.repairedAtMs) ||
+    Boolean(day.allFixturesFinalSeenAtMs || day.finalStatusFirstSeenAtMs) ||
+    Boolean(dayStatusDecision.reason || dayStatusDecision.repairMode) ||
+    Object.values(fixtureStatusById).some((status) => {
+      const short = String(status || "").trim();
+      return hasFixtureStarted(short) || isFinished(short);
+    })
+  );
+}
+
+function ownerWorldCupDayRepairEligibility({ day = {}, dayResult = null }) {
+  const dayIndex = Number(day.dayIndex || day.id || 0);
+  const fixtureIds = ownerSavedWorldCupDayFixtureIds(day);
+  const dayResultExists = Boolean(dayResult);
+  const hasStarterSnapshots = ownerWorldCupDayHasStarterSnapshots(day);
+  const status = String(day.status || "").toLowerCase();
+  const statusLooksScored = ["live", "resolving", "final"].includes(status);
+  const hasScoringEvidence =
+    statusLooksScored && ownerWorldCupDayHasScoringEvidence(day);
+  const eligible =
+    fixtureIds.length > 0 &&
+    (dayResultExists || hasStarterSnapshots || hasScoringEvidence);
+
+  return {
+    dayIndex,
+    fixtureIds,
+    eligible,
+    dayResultExists,
+    hasStarterSnapshots,
+    statusLooksScored,
+    hasScoringEvidence,
+    skippedReason: eligible
+      ? ""
+      : fixtureIds.length
+        ? "no-prior-result-or-starter-snapshot"
+        : "no-saved-fixture-ids",
+  };
+}
+
+function ownerRepairRoomSeasonContext(room = {}) {
+  const context = deriveRoomSeasonContext(room) || {};
+  const competition = room?.competition || {};
+
+  return {
+    seasonKey: String(context.seasonKey || room?.seasonKey || "").trim(),
+    competitionKey: String(
+      context.competitionKey || room?.competitionKey || ""
+    ).trim(),
+    competitionType: String(
+      context.competitionType || room?.competitionType || ""
+    ).trim(),
+    league: String(context.league || competition.league || "").trim(),
+    season: String(context.season || competition.season || "").trim(),
+    timezone: String(
+      competition.timezone ||
+        room?.worldCup?.timezone ||
+        room?.competitionState?.timezone ||
+        room?.timezone ||
+        "America/Los_Angeles"
+    ),
+  };
+}
+
+function ownerRepairRequestedFilters(requestData = {}) {
+  return {
+    seasonKey: String(requestData.seasonKey || "").trim(),
+    competitionKey: String(requestData.competitionKey || "").trim(),
+    competitionType: String(requestData.competitionType || "").trim(),
+    league: String(requestData.league || "").trim(),
+    season: String(requestData.season || "").trim(),
+  };
+}
+
+function ownerRepairRoomRejectReason(room = {}, requestData = {}) {
+  if (!isOwnerWorldCupGroupRoom(room)) return "not-world-cup-group";
+
+  const context = ownerRepairRoomSeasonContext(room);
+  const expected = ownerRepairRequestedFilters(requestData);
+
+  // For World Cup Group repair, competitionKey/competitionType/seasonKey are
+  // helpful discovery hints only. Older rooms can be missing or use slightly
+  // different values, so only league/season reject when both sides are present.
+  for (const key of ["league", "season"]) {
+    const expectedValue = String(expected[key] || "").trim().toLowerCase();
+    const actualValue = String(context[key] || "").trim().toLowerCase();
+    if (expectedValue && actualValue && expectedValue !== actualValue) {
+      return `${key}-mismatch`;
+    }
+  }
+
+  return "";
+}
+
+function ownerRepairRoomMatchesCompetition(room = {}, requestData = {}) {
+  return !ownerRepairRoomRejectReason(room, requestData);
+}
+
+function ownerCreateRepairMatchDebug(requestData = {}, requestedRoomIds = []) {
+  return {
+    requestedFilters: ownerRepairRequestedFilters(requestData),
+    requestedRoomCount: requestedRoomIds.length,
+    roomsScanned: 0,
+    worldCupGroupCandidates: 0,
+    matchedRoomCount: 0,
+    rejectCountsByReason: {},
+    scanSources: {},
+    missingRequestedRoomIds: [],
+    sampleRejectedRooms: [],
+  };
+}
+
+function ownerRecordRepairRoomMatchDebug({
+  debug,
+  roomId,
+  room = {},
+  source = "unknown",
+  rejectReason = "",
+}) {
+  if (!debug) return;
+  debug.roomsScanned += 1;
+  debug.scanSources[source] = Number(debug.scanSources[source] || 0) + 1;
+
+  if (isOwnerWorldCupGroupRoom(room)) {
+    debug.worldCupGroupCandidates += 1;
+  }
+
+  if (!rejectReason) {
+    debug.matchedRoomCount += 1;
+    return;
+  }
+
+  debug.rejectCountsByReason[rejectReason] =
+    Number(debug.rejectCountsByReason[rejectReason] || 0) + 1;
+
+  if (debug.sampleRejectedRooms.length < 12) {
+    const context = ownerRepairRoomSeasonContext(room);
+    debug.sampleRejectedRooms.push({
+      roomId,
+      reason: rejectReason,
+      engineType: room?.engineType || "",
+      worldCupPhase: room?.worldCupPhase || room?.worldCup?.phase || "",
+      phaseLabel:
+        room?.competitionState?.phaseLabel ||
+        getCompetitionState(room)?.phaseLabel ||
+        "",
+      league: context.league || "",
+      season: context.season || "",
+      seasonKey: context.seasonKey || "",
+      competitionKey: context.competitionKey || "",
+      competitionType: context.competitionType || "",
+    });
+  }
+}
+
+async function ownerLoadWorldCupRepairRooms(requestData = {}) {
+  const requestedRoomIds = ownerRepairStringList(requestData.roomIds);
+  const rooms = [];
+  const debug = ownerCreateRepairMatchDebug(requestData, requestedRoomIds);
+
+  function considerRoom(roomId, room, source) {
+    const rejectReason = ownerRepairRoomRejectReason(room, requestData);
+    ownerRecordRepairRoomMatchDebug({
+      debug,
+      roomId,
+      room,
+      source,
+      rejectReason,
+    });
+
+    if (rejectReason) return;
+    rooms.push({ roomId, room });
+  }
+
+  if (requestedRoomIds.length) {
+    const chunkSize = 300;
+    for (let index = 0; index < requestedRoomIds.length; index += chunkSize) {
+      const chunk = requestedRoomIds.slice(index, index + chunkSize);
+      const snaps = await db.getAll(
+        ...chunk.map((roomId) => db.doc(`rooms/${roomId}`))
+      );
+
+      for (let i = 0; i < snaps.length; i += 1) {
+        const snap = snaps[i];
+        if (!snap.exists) {
+          debug.missingRequestedRoomIds.push(chunk[i]);
+          continue;
+        }
+        const room = snap.data() || {};
+        considerRoom(snap.id, room, "requested-roomIds");
+      }
+    }
+
+    return { rooms, debug };
+  }
+
+  const seasonKey = String(requestData.seasonKey || "").trim();
+  const scannedRoomIds = new Set();
+
+  async function scanRoomsSnapshot(snapshotPromise, source) {
+    const roomsSnap = await snapshotPromise;
+    for (const roomDoc of roomsSnap.docs || []) {
+      if (scannedRoomIds.has(roomDoc.id)) continue;
+      scannedRoomIds.add(roomDoc.id);
+      const room = roomDoc.data() || {};
+      considerRoom(roomDoc.id, room, source);
+    }
+  }
+
+  if (seasonKey) {
+    await scanRoomsSnapshot(
+      db.collection("rooms").where("seasonKey", "==", seasonKey).limit(300).get(),
+      "seasonKey"
+    );
+  }
+
+  if (!rooms.length) {
+    await scanRoomsSnapshot(
+      db.collection("rooms").limit(1000).get(),
+      seasonKey ? "fallback-all-rooms" : "all-rooms"
+    );
+  }
+
+  return { rooms, debug };
+}
+
+async function ownerLoadWorldCupRepairDaysForRooms(roomEntries = []) {
+  const roomsWithDays = [];
+  const uniqueFixtureIds = new Set();
+
+  for (const entry of roomEntries) {
+    const [daysSnap, dayResultsSnap] = await Promise.all([
+      db
+        .collection(`rooms/${entry.roomId}/days`)
+        .get()
+        .catch(() => ({ docs: [] })),
+      db
+        .collection(`rooms/${entry.roomId}/dayResults`)
+        .get()
+        .catch(() => ({ docs: [] })),
+    ]);
+    const dayResultsByIndex = new Map();
+    for (const resultDoc of dayResultsSnap.docs || []) {
+      const result = resultDoc.data() || {};
+      const dayIndex = Number(result.dayIndex || resultDoc.id);
+      if (!Number.isFinite(dayIndex) || dayIndex <= 0) continue;
+      dayResultsByIndex.set(String(dayIndex), {
+        id: resultDoc.id,
+        ...result,
+      });
+    }
+
+    const days = (daysSnap.docs || [])
+      .map((dayDoc) => ({ id: dayDoc.id, ...(dayDoc.data() || {}) }))
+      .sort((a, b) => Number(a.dayIndex || a.id || 0) - Number(b.dayIndex || b.id || 0));
+    const eligibleDays = [];
+    const skippedDayIndexes = [];
+
+    for (const day of days) {
+      const dayIndex = Number(day.dayIndex || day.id || 0);
+      const eligibility = ownerWorldCupDayRepairEligibility({
+        day,
+        dayResult: dayResultsByIndex.get(String(dayIndex)) || null,
+      });
+
+      if (!eligibility.eligible) {
+        if (eligibility.fixtureIds.length) {
+          skippedDayIndexes.push(dayIndex || day.id);
+        }
+        continue;
+      }
+
+      eligibleDays.push({
+        ...day,
+        repairEligibility: eligibility,
+      });
+
+      for (const fixtureId of eligibility.fixtureIds) {
+        uniqueFixtureIds.add(fixtureId);
+      }
+    }
+
+    roomsWithDays.push({
+      ...entry,
+      days: eligibleDays,
+      daysFound: days.length,
+      daysEligible: eligibleDays.length,
+      daysSkippedNoPriorResult: skippedDayIndexes.length,
+      skippedDayIndexes,
+      savedFixtureCount: eligibleDays.reduce(
+        (sum, day) => sum + ownerSavedWorldCupDayFixtureIds(day).length,
+        0
+      ),
+    });
+  }
+
+  return {
+    roomsWithDays,
+    fixtureIds: [...uniqueFixtureIds],
+  };
+}
+
+async function ownerRefreshWorldCupRepairFixtureCache({
+  fixtureIds,
+  roomEntries,
+  requestData,
+  apiKey,
+  nowMs,
+}) {
+  const ids = ownerRepairStringList(fixtureIds);
+  const firstContext = ownerRepairRoomSeasonContext(roomEntries?.[0]?.room || {});
+  const timezone = String(
+    requestData.timezone ||
+      firstContext.timezone ||
+      "America/Los_Angeles"
+  );
+  const seasonKey = String(
+    requestData.seasonKey ||
+      firstContext.seasonKey ||
+      ""
+  ).trim();
+  const statusByFixtureId = ids.length
+    ? await getFixtureStatusMap({
+        fixtureIds: ids,
+        timezone,
+        apiKey,
+        forceRefresh: true,
+      })
+    : {};
+  const globalPlayerStatsByFixtureId = {};
+  let refreshedStatsCount = 0;
+
+  for (const fixtureId of ids) {
+    const short = statusByFixtureId[fixtureId] || "";
+    if (!hasFixtureStarted(short) && !isFinished(short)) {
+      globalPlayerStatsByFixtureId[fixtureId] = {};
+      continue;
+    }
+
+    const rawStatsByPlayerId = await getFixturePlayersStatsMapCached({
+      fixtureId,
+      apiKey,
+      ttlMs: isInPlay(short) ? 60 * 1000 : 60 * 60 * 1000,
+      timeZone: timezone,
+      forceRefresh: true,
+      source: "ownerRefreshWorldCupRepairFixtureCache",
+    });
+    globalPlayerStatsByFixtureId[fixtureId] = rawStatsByPlayerId || {};
+    refreshedStatsCount += 1;
+  }
+
+  let globalLiveRefresh = null;
+  if (seasonKey && ids.length) {
+    globalLiveRefresh = await pollGlobalSeasonLiveFixturesOnce({
+      seasonTarget: {
+        seasonKey,
+        competitionKey:
+          requestData.competitionKey || firstContext.competitionKey || "",
+        competitionType:
+          requestData.competitionType || firstContext.competitionType || "",
+        league: requestData.league || firstContext.league || "",
+        season: requestData.season || firstContext.season || "",
+        timezone,
+        fixtureIds: ids,
+        roomIds: roomEntries.map((entry) => entry.roomId),
+      },
+      apiKey,
+      nowMs,
+    });
+  }
+
+  return {
+    fixtureCount: ids.length,
+    statusByFixtureId,
+    globalPlayerStatsByFixtureId,
+    refreshedStatusCount: Object.keys(statusByFixtureId || {}).length,
+    refreshedStatsCount,
+    seasonKey,
+    timezone,
+    globalLiveRefresh,
+  };
+}
+
+exports.ownerRepairCompetitionWorldCupGroupPoints = onCall(
+  { region: "us-west2", secrets: [APIFOOTBALL_KEY], timeoutSeconds: 540, memory: "1GiB" },
+  async (request) => {
+    const functionName = "ownerRepairCompetitionWorldCupGroupPoints";
+    const nowMs = Date.now();
+
+    try {
+      const uid = requireOwnerActionUid(request);
+      const dryRun = request.data?.dryRun !== false;
+      const forceRefresh = request.data?.forceRefresh === true;
+      const requestData = {
+        competitionKey: request.data?.competitionKey,
+        competitionType: request.data?.competitionType,
+        league: request.data?.league,
+        season: request.data?.season,
+        seasonKey: request.data?.seasonKey,
+        timezone: request.data?.timezone,
+        roomIds: request.data?.roomIds,
+      };
+      const {
+        rooms: roomEntries,
+        debug: roomMatchDebug,
+      } = await ownerLoadWorldCupRepairRooms(requestData);
+
+      if (!roomEntries.length) {
+        throw new HttpsError(
+          "failed-precondition",
+          "No World Cup group rooms matched this repair request.",
+          {
+            repairRoomMatchDebug: roomMatchDebug,
+          }
+        );
+      }
+
+      const { roomsWithDays, fixtureIds } =
+        await ownerLoadWorldCupRepairDaysForRooms(roomEntries);
+      const daysFound = roomsWithDays.reduce(
+        (sum, entry) => sum + Number(entry.daysFound || 0),
+        0
+      );
+      const daysEligible = roomsWithDays.reduce(
+        (sum, entry) => sum + Number(entry.daysEligible || 0),
+        0
+      );
+      const daysSkippedNoPriorResult = roomsWithDays.reduce(
+        (sum, entry) => sum + Number(entry.daysSkippedNoPriorResult || 0),
+        0
+      );
+      const skippedDayIndexes = roomsWithDays.flatMap((entry) =>
+        (entry.skippedDayIndexes || []).map((dayIndex) =>
+          `${entry.roomId}:${dayIndex}`
+        )
+      );
+
+      if (!fixtureIds.length) {
+        return {
+          ok: true,
+          mode: "world-cup-group-points-repair",
+          dryRun,
+          forceRefresh,
+          competitionKey: String(requestData.competitionKey || ""),
+          competitionType: String(requestData.competitionType || ""),
+          league: String(requestData.league || ""),
+          season: String(requestData.season || ""),
+          seasonKey: String(requestData.seasonKey || ""),
+          checkedRoomCount: roomEntries.length,
+          repairRoomMatchDebug: roomMatchDebug,
+          eligibleRoomCount: roomsWithDays.length,
+          repairedRoomCount: 0,
+          changedRoomCount: 0,
+          changedDayCount: 0,
+          changedUserCount: 0,
+          totalPointDelta: 0,
+          totalAbsPointDelta: 0,
+          fixtureCount: 0,
+          refreshedFixtureCount: 0,
+          refreshedStatusCount: 0,
+          refreshedStatsCount: 0,
+          daysFound,
+          daysEligible,
+          daysSkippedNoPriorResult,
+          skippedDayIndexes,
+          skippedReason: "no-repair-eligible-world-cup-days",
+          errors: [],
+          roomSummaries: roomsWithDays.map((entry) => ({
+            roomId: entry.roomId,
+            name: entry.room?.name || entry.room?.roomName || "",
+            code: entry.room?.code || entry.room?.roomCode || "",
+            daysFound: entry.daysFound,
+            daysEligible: entry.daysEligible,
+            daysSkippedNoPriorResult: entry.daysSkippedNoPriorResult,
+            skippedDayIndexes: entry.skippedDayIndexes || [],
+            checkedDayCount: 0,
+            changedDayCount: 0,
+            changedUserCount: 0,
+            totalPointDelta: 0,
+            totalAbsPointDelta: 0,
+            days: [],
+          })),
+        };
+      }
+
+      logOwnerAction(functionName, {
+        uid,
+        dryRun,
+        forceRefresh,
+        roomCount: roomEntries.length,
+        fixtureCount: fixtureIds.length,
+        daysFound,
+        daysEligible,
+        daysSkippedNoPriorResult,
+        seasonKey: requestData.seasonKey || "",
+        repairRoomMatchDebug: roomMatchDebug,
+      });
+
+      const refreshResult = forceRefresh
+        ? await ownerRefreshWorldCupRepairFixtureCache({
+            fixtureIds,
+            roomEntries,
+            requestData,
+            apiKey: APIFOOTBALL_KEY.value(),
+            nowMs,
+          })
+        : {
+            fixtureCount: fixtureIds.length,
+            statusByFixtureId: {},
+            globalPlayerStatsByFixtureId: {},
+            refreshedStatusCount: 0,
+            refreshedStatsCount: 0,
+            seasonKey: String(requestData.seasonKey || "").trim(),
+            timezone: String(requestData.timezone || "America/Los_Angeles"),
+            globalLiveRefresh: null,
+          };
+      const roomSummaries = [];
+      const daySummaries = [];
+      const errors = [];
+
+      for (const entry of roomsWithDays) {
+        const roomDaySummaries = [];
+
+        try {
+          for (const day of entry.days) {
+            const dayFixtureIds = ownerSavedWorldCupDayFixtureIds(day);
+            if (!dayFixtureIds.length) continue;
+
+            const result = await recomputeWorldCupGroupDayFromSavedFixtures({
+              db,
+              roomId: entry.roomId,
+              room: entry.room,
+              dayIndex: Number(day.dayIndex || day.id || 0),
+              dayDoc: day,
+              apiKey: APIFOOTBALL_KEY.value(),
+              nowMs,
+              dryRun,
+              statusOverrideByFixtureId: refreshResult.statusByFixtureId,
+              globalPlayerStatsOverrideByFixtureId:
+                refreshResult.globalPlayerStatsByFixtureId,
+              getFixtureStatusMap,
+              getFixturePlayersStatsMapCached,
+              setCompetitionState,
+            });
+
+            roomDaySummaries.push(result);
+            daySummaries.push(result);
+          }
+
+          const repairSummary = summarizeWorldCupRepairDiffs(roomDaySummaries);
+          roomSummaries.push({
+            roomId: entry.roomId,
+            name: entry.room?.name || entry.room?.roomName || "",
+            code: entry.room?.code || entry.room?.roomCode || "",
+            dayCount: entry.daysFound,
+            daysFound: entry.daysFound,
+            daysEligible: entry.daysEligible,
+            daysSkippedNoPriorResult: entry.daysSkippedNoPriorResult,
+            skippedDayIndexes: entry.skippedDayIndexes || [],
+            checkedDayCount: roomDaySummaries.length,
+            changedDayCount: repairSummary.changedDayCount,
+            changedUserCount: repairSummary.changedUserCount,
+            totalPointDelta: repairSummary.totalPointDelta,
+            totalAbsPointDelta: repairSummary.totalAbsPointDelta,
+            finalResultsUpdated: roomDaySummaries.some(
+              (day) => day.finalResultsUpdated
+            ),
+            days: roomDaySummaries.map((day) => ({
+              dayIndex: day.dayIndex,
+              label: day.label,
+              status: day.status,
+              fixtureCount: day.fixtureCount,
+              userCount: day.userCount,
+              changed: day.changed,
+              scoreDiffs: day.scoreDiffs || [],
+              readCounts: day.readCounts || {},
+            })),
+          });
+        } catch (err) {
+          errors.push({
+            roomId: entry.roomId,
+            message: err?.message || String(err),
+            code: err?.code || "",
+          });
+          console.error(`[${functionName}] room repair failed`, {
+            roomId: entry.roomId,
+            code: err?.code,
+            message: err?.message,
+            stack: err?.stack,
+          });
+        }
+      }
+
+      const summary = summarizeWorldCupRepairDiffs(daySummaries);
+      const auditPayload = {
+        mode: "world-cup-group-points-repair",
+        uid,
+        dryRun,
+        forceRefresh,
+        competitionKey: String(requestData.competitionKey || ""),
+        competitionType: String(requestData.competitionType || ""),
+        league: String(requestData.league || ""),
+        season: String(requestData.season || ""),
+        seasonKey: String(
+          requestData.seasonKey || refreshResult.seasonKey || ""
+        ),
+        requestedRoomIds: ownerRepairStringList(requestData.roomIds),
+        checkedRoomCount: roomEntries.length,
+        repairRoomMatchDebug: roomMatchDebug,
+        eligibleRoomCount: roomsWithDays.length,
+        fixtureCount: fixtureIds.length,
+        daysFound,
+        daysEligible,
+        daysSkippedNoPriorResult,
+        skippedDayIndexes,
+        refreshedStatusCount: refreshResult.refreshedStatusCount,
+        refreshedStatsCount: refreshResult.refreshedStatsCount,
+        changedRoomCount: summary.changedRoomCount,
+        changedDayCount: summary.changedDayCount,
+        changedUserCount: summary.changedUserCount,
+        totalPointDelta: summary.totalPointDelta,
+        totalAbsPointDelta: summary.totalAbsPointDelta,
+        errors,
+        roomSummaries,
+        createdAtMs: nowMs,
+        createdAt: FieldValue.serverTimestamp(),
+      };
+      let auditPath = "";
+
+      if (!dryRun) {
+        const auditRef = await db.collection("adminRepairs").add(auditPayload);
+        auditPath = `adminRepairs/${auditRef.id}`;
+      }
+
+      return {
+        ok: true,
+        mode: "world-cup-group-points-repair",
+        dryRun,
+        forceRefresh,
+        competitionKey: auditPayload.competitionKey,
+        competitionType: auditPayload.competitionType,
+        league: auditPayload.league,
+        season: auditPayload.season,
+        seasonKey: auditPayload.seasonKey,
+        checkedRoomCount: roomEntries.length,
+        repairRoomMatchDebug: roomMatchDebug,
+        eligibleRoomCount: roomsWithDays.length,
+        repairedRoomCount: dryRun ? 0 : summary.changedRoomCount,
+        changedRoomCount: summary.changedRoomCount,
+        changedDayCount: summary.changedDayCount,
+        changedUserCount: summary.changedUserCount,
+        totalPointDelta: summary.totalPointDelta,
+        totalAbsPointDelta: summary.totalAbsPointDelta,
+        fixtureCount: fixtureIds.length,
+        daysFound,
+        daysEligible,
+        daysSkippedNoPriorResult,
+        skippedDayIndexes,
+        refreshedFixtureCount: forceRefresh ? fixtureIds.length : 0,
+        refreshedStatusCount: refreshResult.refreshedStatusCount,
+        refreshedStatsCount: refreshResult.refreshedStatsCount,
+        writtenSummaryCount:
+          refreshResult.globalLiveRefresh?.fixtureCount ?? null,
+        writtenLiveFixtureCount:
+          refreshResult.globalLiveRefresh?.payloadCount ?? null,
+        auditPath,
+        errors,
+        roomSummaries,
       };
     } catch (err) {
       handleOwnerActionError(functionName, err);
@@ -12565,12 +14034,20 @@ exports.getOwnerSiteStatus = onCall(
 
       const nowMs = Date.now();
       const liveSinceMs = nowMs - LIVE_USER_WINDOW_MS;
-      const [roomsSnap, queueSnap, membersSnap, livePresenceSnap, authUserCount] = await Promise.all([
+      const [
+        roomsSnap,
+        queueSnap,
+        membersSnap,
+        livePresenceSnap,
+        authUserCount,
+        apiFootballRuntime,
+      ] = await Promise.all([
         db.collection("rooms").limit(1000).get(),
         db.collection("tournamentPollQueue").limit(1000).get(),
         db.collectionGroup("members").limit(12000).get(),
         db.collection("sitePresence").where("lastSeenAtMs", ">=", liveSinceMs).limit(1000).get(),
         countFirebaseAuthUsers(),
+        readApiFootballRuntimeStatus(nowMs),
       ]);
       const liveUserCount = livePresenceSnap.size;
 
@@ -12778,6 +14255,7 @@ exports.getOwnerSiteStatus = onCall(
         authUserCount,
         liveUserCount,
         liveUserWindowMs: LIVE_USER_WINDOW_MS,
+        apiFootballRuntime,
         roomLimit: 1000,
         scannedRoomCount: roomsSnap.size,
         queueTaskCount: queueSnap.size,
@@ -13068,9 +14546,35 @@ exports.pollGlobalSeasonLiveFixtures = onSchedule(
         });
 
         console.log(
-          `[pollGlobalSeasonLiveFixtures] season=${seasonTarget.seasonKey} fixtures=${result.fixtureCount} payloads=${result.payloadCount}`
+          `[pollGlobalSeasonLiveFixtures] season=${seasonTarget.seasonKey} fixtures=${result.fixtureCount} payloads=${result.payloadCount} statChecks=${result.uniqueFixtureStatsChecked || 0} statApiCalls=${result.fixturePlayerStatsApiCalls || 0} lockSkips=${result.fixturePlayerStatsLockSkips || 0}`
         );
       } catch (e) {
+        if (isApiFootballCooldownError(e)) {
+          const retryAtMs = getApiFootballCooldownRetryAtMs(e, nowMs);
+          const reason = apiFootballCooldownReason(e);
+          console.warn("[pollGlobalSeasonLiveFixtures] API-Football guarded; sleeping targets", {
+            seasonKey: seasonTarget?.seasonKey || "unknown",
+            reason,
+            retryAtMs,
+            roomIds: seasonTarget?.roomIds || [],
+          });
+
+          await Promise.all(
+            (Array.isArray(seasonTarget?.roomIds) ? seasonTarget.roomIds : [])
+              .map((roomId) =>
+                upsertTournamentPollTask({
+                  roomId,
+                  phase: "GlobalSeason",
+                  nextPollAtMs: retryAtMs,
+                  reason,
+                  nowMs,
+                }).catch(() => {})
+              )
+          );
+
+          continue;
+        }
+
         console.error(
           `[pollGlobalSeasonLiveFixtures] Failed season=${seasonTarget?.seasonKey || "unknown"}`,
           e
@@ -13722,6 +15226,10 @@ exports.pollLiveTournamentWeeks = onSchedule(
                   reason: "cup-global-auto-apply",
                 });
               } catch (refreshError) {
+                if (isApiFootballCooldownError(refreshError)) {
+                  throw refreshError;
+                }
+
                 console.warn("[pollLiveTournamentWeeks] Cup global cache refresh failed; using existing cache", {
                   roomId,
                   code: refreshError?.code,
@@ -13897,23 +15405,30 @@ exports.pollLiveTournamentWeeks = onSchedule(
 
               continue;
             } catch (err) {
+              const apiFootballGuarded = isApiFootballCooldownError(err);
               const retryAtMs =
-                (
+                apiFootballGuarded
+                  ? getApiFootballCooldownRetryAtMs(err, nowMs)
+                  : (
                   cupGlobalWindowStarted ||
                   ["live", "resolving"].includes(weekStatus)
                 )
                   ? nowMs + TOURNAMENT_ACTIVE_POLL_MS
                   : nowMs + TOURNAMENT_PREGAME_POLL_MS;
+              const retryReason = apiFootballGuarded
+                ? apiFootballCooldownReason(err)
+                : "cup-global-auto-apply-error";
               console.warn("[pollLiveTournamentWeeks] Cup global auto apply failed", {
                 roomId,
                 code: err?.code,
                 message: err?.message,
                 retryAtMs,
+                apiFootballGuarded,
               });
               await db.doc(`rooms/${roomId}/cup/current`).set(
                 {
                   source: "global-live-fixtures",
-                  globalApplyStatus: "error",
+                  globalApplyStatus: retryReason,
                   globalApplyError: String(err?.message || err),
                   globalApplyErrorCode: err?.code || null,
                   globalApplyErrorAtMs: nowMs,
@@ -13952,9 +15467,13 @@ exports.pollLiveTournamentWeeks = onSchedule(
                 roomId,
                 phase,
                 nextPollAtMs: retryAtMs,
-                reason: "cup-global-auto-apply-error",
+                reason: retryReason,
                 nowMs,
               }).catch(() => {});
+
+              if (apiFootballGuarded) {
+                continue;
+              }
 
               if (room?.globalPipeline?.cupLegacyFallback !== true) {
                 continue;
@@ -14618,14 +16137,27 @@ exports.pollLiveTournamentWeeks = onSchedule(
           ),
         ]);
       } catch (e) {
-        console.error(`Error processing room ${roomId}`, e);
+        const apiFootballGuarded = isApiFootballCooldownError(e);
+        const retryAtMs = apiFootballGuarded
+          ? getApiFootballCooldownRetryAtMs(e, nowMs)
+          : nowMs + TOURNAMENT_UNKNOWN_RECHECK_MS;
+        const retryReason = apiFootballGuarded
+          ? apiFootballCooldownReason(e)
+          : `error: ${String(e?.message || e).slice(0, 120)}`;
+
+        console.error(`Error processing room ${roomId}`, {
+          code: e?.code,
+          message: e?.message,
+          apiFootballGuarded,
+          retryAtMs,
+        });
 
         // Avoid hammering a broken room every minute.
         await upsertTournamentPollTask({
           roomId,
           phase: "",
-          nextPollAtMs: nowMs + TOURNAMENT_UNKNOWN_RECHECK_MS,
-          reason: `error: ${String(e?.message || e).slice(0, 120)}`,
+          nextPollAtMs: retryAtMs,
+          reason: retryReason,
           nowMs,
         });
       }

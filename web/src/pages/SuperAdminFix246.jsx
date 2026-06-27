@@ -28,6 +28,19 @@ function formatWhen(ms) {
   });
 }
 
+function formatDurationMs(ms) {
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n <= 0) return "0m";
+
+  const totalMinutes = Math.ceil(n / 60000);
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+
+  if (hours > 0 && minutes > 0) return `${hours}h ${minutes}m`;
+  if (hours > 0) return `${hours}h`;
+  return `${minutes}m`;
+}
+
 function formatCountMap(map = {}) {
   return Object.entries(map || {})
     .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0))
@@ -85,6 +98,54 @@ function getRoomTypeFlags(room = {}) {
   const isRegularRoom = !isCupRoom && !isWorldCupGroupRoom;
 
   return { isWorldCupGroupRoom, isWorldCupRoom, isCupRoom, isRegularRoom };
+}
+
+function groupLooksWorldCupGroup(group = {}) {
+  if (group.countsByEngineType?.worldCupDaily) return true;
+  if (group.countsByPhaseLabel?.WorldCupGroup) return true;
+  if (group.countsByWorldCupPhase?.group || group.countsByWorldCupPhase?.WorldCupGroup) {
+    return true;
+  }
+
+  return (group.rooms || []).some((room) => getRoomTypeFlags(room).isWorldCupGroupRoom);
+}
+
+function groupActionKey(group = {}) {
+  return String(
+    group.groupKey ||
+      group.seasonKey ||
+      `${group.competitionKey || "competition"}:${group.league || "league"}:${group.season || "season"}`
+  );
+}
+
+function buildWorldCupGroupRepairPayload(group = {}, dryRun = true) {
+  const visibleRoomIds = (group.rooms || [])
+    .map((room) => room.roomId)
+    .filter(Boolean);
+  const includeRoomIds =
+    visibleRoomIds.length > 0 &&
+    Number(visibleRoomIds.length) === Number(group.roomCount || visibleRoomIds.length);
+
+  const payload = {
+    competitionKey: group.competitionKey || "",
+    competitionType: group.competitionType || "",
+    league: group.league || "",
+    season: group.season || "",
+    seasonKey: group.seasonKey || "",
+    ...(includeRoomIds ? { roomIds: visibleRoomIds } : {}),
+    dryRun,
+    forceRefresh: !dryRun,
+  };
+
+  console.log("[SuperAdminFix246 World Cup group repair payload]", {
+    groupKey: group.groupKey || "",
+    groupRoomCount: group.roomCount || 0,
+    visibleRoomIdCount: visibleRoomIds.length,
+    includeRoomIds,
+    payload,
+  });
+
+  return payload;
 }
 
 function getWorldCupPlayerRepairActions() {
@@ -515,8 +576,14 @@ function renderActionResult(resultWrapper) {
     "targetUid",
     "mode",
     "message",
+    "error",
+    "competitionKey",
+    "competitionType",
+    "league",
+    "season",
     "seasonKey",
     "dryRun",
+    "forceRefresh",
     "forceApiRefresh",
     "refreshed",
     "wasStale",
@@ -533,7 +600,21 @@ function renderActionResult(resultWrapper) {
     "windowKey",
     "historyDocId",
     "fixtureCount",
+    "refreshedFixtureCount",
+    "refreshedStatusCount",
+    "refreshedStatsCount",
     "refreshedCount",
+    "checkedRoomCount",
+    "eligibleRoomCount",
+    "repairedRoomCount",
+    "changedRoomCount",
+    "changedDayCount",
+    "daysFound",
+    "daysEligible",
+    "daysSkippedNoPriorResult",
+    "changedUserCount",
+    "totalPointDelta",
+    "totalAbsPointDelta",
     "latestFetchedCount",
     "beforeCount",
     "afterCount",
@@ -566,6 +647,8 @@ function renderActionResult(resultWrapper) {
     "historyLabel",
     "historyFixtureCount",
     "noFixtureIdsReason",
+    "skippedReason",
+    "skippedDayIndexes",
     "fixtureIds",
     "missingFixtureIds",
     "writtenSummaryCount",
@@ -583,6 +666,7 @@ function renderActionResult(resultWrapper) {
     "replayTestMode",
     "replayHistoryLabel",
     "auditPath",
+    "repairRoomMatchDebug",
     "currentStarters",
     "currentBench",
     "ownedPlayerIds",
@@ -634,6 +718,11 @@ function renderActionResult(resultWrapper) {
         {Array.isArray(result?.statMismatches) && (
           <span>
             <b>statMismatches:</b> {result.statMismatches.length}
+          </span>
+        )}
+        {Array.isArray(result?.roomSummaries) && (
+          <span>
+            <b>roomSummaries:</b> {result.roomSummaries.length} rooms, logged to console
           </span>
         )}
       </div>
@@ -1027,7 +1116,11 @@ export default function SuperAdminFix246() {
   const [actionBusyKey, setActionBusyKey] = useState("");
   const [actionResultByRoomId, setActionResultByRoomId] = useState({});
   const [actionErrorByRoomId, setActionErrorByRoomId] = useState({});
+  const [groupActionBusyKey, setGroupActionBusyKey] = useState("");
+  const [groupActionResultByKey, setGroupActionResultByKey] = useState({});
+  const [groupActionErrorByKey, setGroupActionErrorByKey] = useState({});
   const [lineupRepairInputByRoomId, setLineupRepairInputByRoomId] = useState({});
+  const [apiRuntimeBusy, setApiRuntimeBusy] = useState(false);
 
   async function loadStatus() {
     setLoading(true);
@@ -1056,6 +1149,56 @@ export default function SuperAdminFix246() {
   }, [isOwner]);
 
   const groups = useMemo(() => status?.groups || [], [status]);
+
+  async function runApiFootballSafeModeAction(enabled, options = {}) {
+    const defaultReason = enabled
+      ? "Emergency quota protection"
+      : "Owner disabled API safe mode";
+    const reason = window.prompt(
+      enabled
+        ? "Reason for enabling API-Football Safe Mode:"
+        : "Reason for disabling API-Football Safe Mode:",
+      defaultReason
+    );
+
+    if (reason === null) return;
+
+    const clearCooldown = Boolean(options.clearCooldown);
+    if (
+      clearCooldown &&
+      !window.confirm("Also clear the current API-Football cooldown?")
+    ) {
+      return;
+    }
+
+    setApiRuntimeBusy(true);
+    setError("");
+
+    try {
+      const fn = httpsCallable(functions, "ownerSetApiFootballSafeMode");
+      const payload = {
+        enabled,
+        reason: String(reason || defaultReason).trim(),
+        ...(enabled ? { cooldownMinutes: 60 } : {}),
+        ...(clearCooldown ? { clearCooldown: true } : {}),
+      };
+      const res = await fn(payload);
+      const runtime = res?.data?.runtime || null;
+
+      setStatus((prev) =>
+        prev && runtime
+          ? { ...prev, apiFootballRuntime: runtime }
+          : prev
+      );
+
+      await loadStatus();
+    } catch (err) {
+      console.error("[SuperAdminFix246 API runtime action failed]", err);
+      setError(err?.message || "Could not update API-Football Safe Mode.");
+    } finally {
+      setApiRuntimeBusy(false);
+    }
+  }
 
   async function runOwnerRoomAction(room, actionKey, label, callableName, payloadBuilder, options = {}) {
     if (!room?.roomId) return;
@@ -1096,6 +1239,74 @@ export default function SuperAdminFix246() {
       }));
     } finally {
       setActionBusyKey("");
+    }
+  }
+
+  async function runOwnerGroupRepairAction(group, dryRun) {
+    const key = groupActionKey(group);
+    const actionKey = dryRun ? "dryRunRepairPoints" : "applyRepairPoints";
+    const label = dryRun ? "Dry Run Repair Points" : "Apply Repair Points";
+
+    if (!dryRun) {
+      const confirmed = window.confirm(
+        "This will recalculate and overwrite results for this competition group using only each room's saved fixture IDs. Continue?"
+      );
+      if (!confirmed) return;
+    }
+
+    const busyKey = `${key}:${actionKey}`;
+    setGroupActionBusyKey(busyKey);
+    setGroupActionErrorByKey((prev) => ({ ...prev, [key]: "" }));
+    let payload = null;
+
+    try {
+      payload = buildWorldCupGroupRepairPayload(group, dryRun);
+      const fn = httpsCallable(functions, "ownerRepairCompetitionWorldCupGroupPoints");
+      const res = await fn(payload);
+
+      console.log("[SuperAdminFix246 group repair result]", actionKey, res.data);
+
+      setGroupActionResultByKey((prev) => ({
+        ...prev,
+        [key]: {
+          actionKey,
+          label,
+          callableName: "ownerRepairCompetitionWorldCupGroupPoints",
+          payload,
+          data: res?.data || {},
+        },
+      }));
+
+      await loadStatus();
+    } catch (err) {
+      const details = err?.details || err?.customData?.details || null;
+      console.error("[SuperAdminFix246 group repair failed]", actionKey, {
+        error: err,
+        details,
+        payload,
+      });
+      setGroupActionErrorByKey((prev) => ({
+        ...prev,
+        [key]: err?.message || String(err),
+      }));
+      if (details) {
+        setGroupActionResultByKey((prev) => ({
+          ...prev,
+          [key]: {
+            actionKey,
+            label,
+            callableName: "ownerRepairCompetitionWorldCupGroupPoints",
+            payload,
+            data: {
+              ok: false,
+              error: err?.message || String(err),
+              ...details,
+            },
+          },
+        }));
+      }
+    } finally {
+      setGroupActionBusyKey("");
     }
   }
 
@@ -1313,6 +1524,86 @@ export default function SuperAdminFix246() {
 
       {status && (
         <>
+          {(() => {
+            const apiRuntime = status?.apiFootballRuntime || {};
+            const apiBlocked = Boolean(apiRuntime.blocked);
+            const cooldownActive = Boolean(apiRuntime.cooldownActive);
+            const safeModeActive = Boolean(apiRuntime.safeMode);
+            const cooldownUntilMs = Number(apiRuntime.cooldownUntilMs || 0);
+
+            return (
+              <section
+                className={`ownerApiRuntime ${
+                  apiBlocked ? "ownerApiRuntime--blocked" : ""
+                }`}
+                aria-label="API-Football runtime controls"
+              >
+                <div>
+                  <p className="ownerEyebrow">Emergency API guard</p>
+                  <h2>API-Football Safe Mode</h2>
+                  <p>
+                    Safe Mode freezes API-Football updates but protects quota.
+                    Normal cached room data, lineups, drafts, and standings still load.
+                  </p>
+                  <div className="ownerApiRuntimeMeta">
+                    <span>
+                      Status: <b>{apiBlocked ? "Guard active" : "Normal"}</b>
+                    </span>
+                    <span>
+                      Safe mode: <b>{safeModeActive ? "On" : "Off"}</b>
+                    </span>
+                    <span>
+                      Cooldown:{" "}
+                      <b>
+                        {cooldownActive
+                          ? `${formatDurationMs(apiRuntime.cooldownRemainingMs)} remaining`
+                          : "Inactive"}
+                      </b>
+                    </span>
+                    {cooldownUntilMs > 0 ? (
+                      <span>Cooldown until: <b>{formatWhen(cooldownUntilMs)}</b></span>
+                    ) : null}
+                  </div>
+                  {apiRuntime.safeModeReason ? (
+                    <small>Reason: {apiRuntime.safeModeReason}</small>
+                  ) : null}
+                  {apiRuntime.cooldownReason ? (
+                    <small>Cooldown reason: {apiRuntime.cooldownReason}</small>
+                  ) : null}
+                </div>
+
+                <div className="ownerApiRuntimeActions">
+                  <button
+                    type="button"
+                    className="ownerActionBtn ownerActionBtn--danger"
+                    disabled={apiRuntimeBusy}
+                    onClick={() => runApiFootballSafeModeAction(true)}
+                  >
+                    {apiRuntimeBusy ? "Updating..." : "Enable API Safe Mode"}
+                  </button>
+                  <button
+                    type="button"
+                    className="ownerActionBtn ownerActionBtn--shadow"
+                    disabled={apiRuntimeBusy || !safeModeActive}
+                    onClick={() => runApiFootballSafeModeAction(false)}
+                  >
+                    Disable Safe Mode
+                  </button>
+                  <button
+                    type="button"
+                    className="ownerActionBtn"
+                    disabled={apiRuntimeBusy || (!safeModeActive && !cooldownActive)}
+                    onClick={() =>
+                      runApiFootballSafeModeAction(false, { clearCooldown: true })
+                    }
+                  >
+                    Disable & Clear Cooldown
+                  </button>
+                </div>
+              </section>
+            );
+          })()}
+
           <section className="ownerSummaryGrid" aria-label="Owner status summary">
             <div className="ownerSummaryCard">
               <span>Rooms scanned</span>
@@ -1356,6 +1647,17 @@ export default function SuperAdminFix246() {
                 label: "UNKNOWN",
                 className: "idle",
               };
+              const repairableWorldCupGroup = groupLooksWorldCupGroup(group);
+              const currentGroupActionKey = groupActionKey(group);
+              const groupBusy = groupActionBusyKey.startsWith(`${currentGroupActionKey}:`);
+              const dryRunBusy =
+                groupActionBusyKey === `${currentGroupActionKey}:dryRunRepairPoints`;
+              const applyBusy =
+                groupActionBusyKey === `${currentGroupActionKey}:applyRepairPoints`;
+              const latestGroupResult =
+                groupActionResultByKey[currentGroupActionKey] || null;
+              const latestGroupError =
+                groupActionErrorByKey[currentGroupActionKey] || "";
 
               return (
               <article className="ownerGroupCard" key={group.groupKey}>
@@ -1386,6 +1688,47 @@ export default function SuperAdminFix246() {
                     <span className="ownerGroupRoomCount">{group.roomCount} rooms</span>
                   </div>
                 </header>
+
+                {repairableWorldCupGroup ? (
+                  <div className="ownerGroupActions">
+                    <div className="ownerGroupActionCopy">
+                      <strong>World Cup Group points repair</strong>
+                      <span>
+                        Recalculates this competition group using only each room's saved day fixture IDs.
+                      </span>
+                    </div>
+                    <div className="ownerActionGrid">
+                      <button
+                        type="button"
+                        className="ownerActionBtn ownerActionBtn--shadow"
+                        disabled={groupBusy}
+                        onClick={() => runOwnerGroupRepairAction(group, true)}
+                      >
+                        {dryRunBusy ? "Running..." : "Dry Run Repair Points"}
+                        <span className="ownerActionMuted">
+                          Preview score diffs and refresh shared cache.
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        className="ownerActionBtn ownerActionBtn--apply"
+                        disabled={groupBusy}
+                        onClick={() => runOwnerGroupRepairAction(group, false)}
+                      >
+                        {applyBusy ? "Running..." : "Apply Repair Points"}
+                        <span className="ownerActionMuted">
+                          Overwrite day results, standings, and completed final results.
+                        </span>
+                      </button>
+                    </div>
+                    {latestGroupError ? (
+                      <div className="ownerActionError">
+                        Group repair failed: {latestGroupError}
+                      </div>
+                    ) : null}
+                    {renderActionResult(latestGroupResult)}
+                  </div>
+                ) : null}
 
                 <div className="ownerGroupMetrics">
                   <span>Scheduled: <b>{group.scheduledCount}</b></span>

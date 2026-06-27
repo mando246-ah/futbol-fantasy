@@ -8,12 +8,15 @@ import { scorePlayerFromCore, toCorePos } from "../../tournament/logic/scoringCo
 import { auth, db } from "../../firebase";
 import { buildTournamentPlayerResolver } from "./tournamentPlayerResolver";
 import { useTargetedTournamentPlayers } from "./useTargetedTournamentPlayers";
+import stadiumBg from "../../assets/stadium.png";
 
 import "./TournamentPage.css";
 import "./WorldCupTournamentPage.css";
 import { Avatar, AvatarImage, AvatarFallback } from "../../components/ui/avatar";
 import FlagIcon from "../../components/FlagIcon";
 import FinalResultsCard from "../../components/ui/FinalResultsCard";
+import FieldPlayerCard from "../../components/ui/FieldPlayerCard";
+import FieldPlayerDetailsPanel from "../../components/ui/FieldPlayerDetailsPanel";
 
 const SCORING_DISPLAY = [
   { label: "Appearance", detail: "+1 (any minutes)" },
@@ -48,6 +51,22 @@ const SCORING_DISPLAY = [
 ];
 
 const WORLD_CUP_UI_RESET_BEFORE_NEXT_DAY_MS = 60 * 60 * 1000;
+const WORLD_CUP_ROSTER_VIEW_MODE_KEY = "worldcupRosterViewMode";
+
+function loadWorldCupRosterViewMode() {
+  if (typeof window === "undefined") return "legacy";
+
+  try {
+    const savedMode = window.localStorage.getItem(
+      WORLD_CUP_ROSTER_VIEW_MODE_KEY
+    );
+    return savedMode === "field" || savedMode === "legacy"
+      ? savedMode
+      : "legacy";
+  } catch {
+    return "legacy";
+  }
+}
 
 const WORLD_CUP_FLAG_MARQUEE = [
   "United States",
@@ -155,6 +174,162 @@ function fmtDT(v) {
   return new Date(ms).toLocaleString(LOCALE, OPTS);
 }
 
+function fieldDashboardFixtureId(fixture = {}) {
+  return String(
+    fixture?.fixtureId ??
+      fixture?.id ??
+      fixture?.fixture?.id ??
+      ""
+  ).trim();
+}
+
+function fieldDashboardKickoffMs(fixture = {}) {
+  const raw =
+    fixture?.kickoffMs ??
+    fixture?.kickoffAtMs ??
+    fixture?.startAtMs ??
+    fixture?.fixture?.timestamp ??
+    fixture?.timestamp ??
+    null;
+  const n = Number(raw);
+  if (Number.isFinite(n) && n > 0) {
+    return n < 100000000000 ? n * 1000 : n;
+  }
+
+  const parsed = Date.parse(
+    fixture?.fixture?.date ||
+      fixture?.date ||
+      fixture?.kickoff ||
+      fixture?.startAt ||
+      ""
+  );
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function fieldDashboardGameStatus(statusValue) {
+  const status = String(statusValue || "").trim().toUpperCase();
+  if (["FT", "AET", "PEN"].includes(status)) {
+    return { label: status, tone: "final" };
+  }
+  if (["1H", "HT", "2H", "ET", "BT", "P", "INT", "LIVE"].includes(status)) {
+    return { label: status === "LIVE" ? "LIVE" : status, tone: "live" };
+  }
+  if (["PST", "SUSP", "ABD", "CANC", "AWD", "WO"].includes(status)) {
+    return { label: status, tone: "alert" };
+  }
+  return { label: "", tone: "scheduled" };
+}
+
+function fieldDashboardTimeLabel(kickoffMs) {
+  if (!Number.isFinite(Number(kickoffMs)) || Number(kickoffMs) <= 0) {
+    return "Time TBD";
+  }
+
+  return new Date(Number(kickoffMs)).toLocaleTimeString("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  });
+}
+
+function buildFieldDashboardGames(day = {}, result = {}) {
+  const dayFixtures = Array.isArray(day?.fixtures) ? day.fixtures : [];
+  const resultFixtures = Array.isArray(result?.fixtures) ? result.fixtures : [];
+  const sourceFixtures = dayFixtures.length ? dayFixtures : resultFixtures;
+  const coverageByFixtureId = new Map(
+    (Array.isArray(result?.fixtureCoverage) ? result.fixtureCoverage : [])
+      .map((row) => [fieldDashboardFixtureId(row), row])
+      .filter(([fixtureId]) => fixtureId)
+  );
+  const playerStatsByFixtureId = new Map();
+
+  for (const userBreakdown of Object.values(result?.breakdownByUserId || {})) {
+    for (const entry of Object.values(userBreakdown?.perPlayer || {})) {
+      const stats = entry?.stats || entry?.rawStats || {};
+      const fixtureId = fieldDashboardFixtureId({
+        fixtureId: entry?.fixtureId || stats?.fixtureId,
+      });
+      if (fixtureId && !playerStatsByFixtureId.has(fixtureId)) {
+        playerStatsByFixtureId.set(fixtureId, stats);
+      }
+    }
+  }
+
+  return sourceFixtures
+    .map((fixture, index) => {
+      const fixtureId = fieldDashboardFixtureId(fixture);
+      const coverage = coverageByFixtureId.get(fixtureId) || {};
+      const stats = playerStatsByFixtureId.get(fixtureId) || {};
+      const statusShort =
+        result?.fixtureStatusById?.[fixtureId] ||
+        coverage?.statusShort ||
+        stats?.statusShort ||
+        stats?.fixtureStatus ||
+        fixture?.statusShort ||
+        "";
+      const kickoffMs =
+        fieldDashboardKickoffMs(fixture) ||
+        fieldDashboardKickoffMs(stats);
+      const homeScore = Number(
+        stats?.goalsHome ??
+          stats?.homeGoals ??
+          stats?.homeScore ??
+          fixture?.goalsHome
+      );
+      const awayScore = Number(
+        stats?.goalsAway ??
+          stats?.awayGoals ??
+          stats?.awayScore ??
+          fixture?.goalsAway
+      );
+      const hasScore =
+        Number.isFinite(homeScore) &&
+        Number.isFinite(awayScore);
+
+      return {
+        fixtureId: fixtureId || `field-dashboard-game-${index}`,
+        kickoffMs,
+        homeTeam:
+          fixture?.homeTeam ||
+          fixture?.homeTeamName ||
+          fixture?.teams?.home?.name ||
+          stats?.homeTeamName ||
+          "Home",
+        awayTeam:
+          fixture?.awayTeam ||
+          fixture?.awayTeamName ||
+          fixture?.teams?.away?.name ||
+          stats?.awayTeamName ||
+          "Away",
+        homeScore: hasScore ? homeScore : null,
+        awayScore: hasScore ? awayScore : null,
+        status: fieldDashboardGameStatus(statusShort),
+      };
+    })
+    .sort(
+      (a, b) =>
+        Number(a.kickoffMs || Number.MAX_SAFE_INTEGER) -
+        Number(b.kickoffMs || Number.MAX_SAFE_INTEGER)
+    );
+}
+
+function fieldDashboardBreakdownTotal(breakdown = {}) {
+  const explicitTotal = Number(breakdown?.total);
+  if (Number.isFinite(explicitTotal)) return explicitTotal;
+
+  if (Array.isArray(breakdown?.starters)) {
+    return breakdown.starters.reduce(
+      (sum, player) => sum + Number(player?.points || 0),
+      0
+    );
+  }
+
+  return Object.values(breakdown?.perPlayer || {}).reduce((sum, player) => {
+    if (player?.counted === false) return sum;
+    return sum + Number(player?.points || 0);
+  }, 0);
+}
+
 const DISPLAY_POS_ORDER = { ATT: 0, MID: 1, DEF: 2, GK: 3 };
 
 function normalizeDisplayPos(pos) {
@@ -173,6 +348,75 @@ function sortPlayersForDisplay(list = []) {
     if (aRank !== bRank) return aRank - bRank;
     return (a.name || "").localeCompare(b.name || "");
   });
+}
+
+const WORLD_CUP_FIELD_ROW_Y = {
+  ATT: 16,
+  MID: 40,
+  DEF: 64,
+  GK: 88,
+};
+
+function spreadWorldCupFieldRow(count) {
+  const presets = {
+    1: [50],
+    2: [38, 62],
+    3: [25, 50, 75],
+    4: [18, 39, 61, 82],
+    5: [12, 31, 50, 69, 88],
+  };
+  if (presets[count]) return presets[count];
+  if (count <= 0) return [];
+
+  const start = 10;
+  const end = 90;
+  const step = (end - start) / Math.max(1, count - 1);
+  return Array.from({ length: count }, (_, index) => start + step * index);
+}
+
+function buildWorldCupFieldLayout(starters = []) {
+  const groups = {
+    ATT: [],
+    MID: [],
+    DEF: [],
+    GK: [],
+  };
+
+  for (const player of Array.isArray(starters) ? starters : []) {
+    const normalized = normalizeDisplayPos(player?.position);
+    const position = groups[normalized] ? normalized : "MID";
+    groups[position].push(player);
+  }
+
+  const positionedPlayers = [];
+  for (const position of ["ATT", "MID", "DEF", "GK"]) {
+    const row = groups[position];
+    const xPositions = spreadWorldCupFieldRow(row.length);
+    row.forEach((player, index) => {
+      positionedPlayers.push({
+        player,
+        position,
+        x: xPositions[index],
+        y: WORLD_CUP_FIELD_ROW_Y[position],
+      });
+    });
+  }
+
+  return {
+    formation: `${groups.DEF.length}-${groups.MID.length}-${groups.ATT.length}`,
+    positionedPlayers,
+  };
+}
+
+function getFieldPlayerKey(player = {}) {
+  return String(
+    player?.id ??
+      player?.playerId ??
+      player?.apiPlayerId ??
+      player?.fixturePlayerId ??
+      player?.name ??
+      ""
+  ).trim();
 }
 
 function hasBreakdownMap(breakdown) {
@@ -1048,6 +1292,124 @@ function getDisplayOpponentName(player = {}, entry = null, stats = null) {
   );
 }
 
+const FIELD_PLAYER_STAT_ORDER = [
+  "position",
+  "rating",
+  "minutes",
+  "goals",
+  "assists",
+  "shotsOnTarget",
+  "passesCompleted",
+  "tackles",
+  "duelsWon",
+  "dribblesSuccess",
+  "saves",
+  "goalsConceded",
+  "cleanSheet",
+  "yellow",
+  "red",
+  "foulsCommitted",
+  "offsides",
+  "sixtyPlus",
+  "appearance",
+  "kickoffMs",
+  "kickoffAtMs",
+];
+
+const FIELD_PLAYER_HIDDEN_STAT_KEYS = new Set([
+  "isLive",
+  "teamId",
+  "fixtureId",
+  "fixtureStatus",
+  "matchStatus",
+  "statusShort",
+  "statusLong",
+  "elapsed",
+  "extra",
+  "statusUpdatedAtMs",
+  "timerUpdatedAtMs",
+  "teamScore",
+  "opponentScore",
+  "teamGoals",
+  "opponentGoals",
+  "goalsHome",
+  "goalsAway",
+  "homeTeamId",
+  "awayTeamId",
+  "homeTeamName",
+  "awayTeamName",
+  "homeTeamLogo",
+  "awayTeamLogo",
+]);
+
+function sortFieldPlayerStatKeys(source = {}) {
+  return Object.keys(source || {}).sort((a, b) => {
+    const indexA = FIELD_PLAYER_STAT_ORDER.indexOf(a);
+    const indexB = FIELD_PLAYER_STAT_ORDER.indexOf(b);
+    if (indexA !== -1 && indexB !== -1) return indexA - indexB;
+    if (indexA !== -1) return -1;
+    if (indexB !== -1) return 1;
+    return a.localeCompare(b);
+  });
+}
+
+function formatFieldPlayerStatValue(key, value) {
+  if (key === "kickoffMs" || key === "kickoffAtMs") {
+    const ms = Number(value);
+    if (!Number.isFinite(ms) || ms <= 0) return "Not set";
+    return new Date(ms).toLocaleTimeString("en-US", {
+      hour: "numeric",
+      minute: "2-digit",
+      hour12: true,
+    });
+  }
+
+  return String(value);
+}
+
+function buildFieldPlayerRawStatRows(stats = {}) {
+  const isLive = isPlayerLiveFromStats(stats);
+  const minutes = Number(stats?.minutes ?? stats?.minutesPlayed ?? 0);
+  const keys = sortFieldPlayerStatKeys(stats);
+  const displayKeys =
+    isLive && minutes === 0 && !keys.includes("minutes")
+      ? ["minutes", ...keys]
+      : keys;
+
+  return displayKeys.flatMap((key) => {
+    if (FIELD_PLAYER_HIDDEN_STAT_KEYS.has(key)) return [];
+
+    const value = key === "minutes" ? minutes : stats?.[key];
+    const isEmpty =
+      value == null || value === false || value === 0 || value === "0";
+    if (isEmpty && !(key === "minutes" && isLive && minutes === 0)) return [];
+
+    return [{
+      key,
+      label: prettyStatLabel(key),
+      value,
+      formattedValue: formatFieldPlayerStatValue(key, value),
+    }];
+  });
+}
+
+function buildFieldPlayerBreakdownRows(breakdown = {}) {
+  return sortFieldPlayerStatKeys(breakdown).flatMap((key) => {
+    const value = breakdown?.[key];
+    if (value == null || value === 0 || value === "0") return [];
+
+    const numericValue = Number(value);
+    return [{
+      key,
+      label: prettyStatLabel(key),
+      value,
+      formattedValue: Number.isFinite(numericValue)
+        ? `${numericValue > 0 ? "+" : ""}${numericValue}`
+        : String(value),
+    }];
+  });
+}
+
 function PlayerIdentity({ name, country, club }) {
   return (
     <div className="tpPlayerInfo">
@@ -1646,6 +2008,46 @@ export default function WorldCupTournamentPage() {
   const marqueeFlags = [...WORLD_CUP_FLAG_MARQUEE, ...WORLD_CUP_FLAG_MARQUEE];
   const [myUid, setMyUid] = useState(auth.currentUser?.uid || null);
   const [nowMs, setNowMs] = useState(() => Date.now());
+  const [rosterViewMode, setRosterViewMode] = useState(
+    loadWorldCupRosterViewMode
+  );
+  const [selectedFieldPlayerId, setSelectedFieldPlayerId] = useState(null);
+
+  const selectRosterViewMode = (nextMode) => {
+    const safeMode = nextMode === "field" ? "field" : "legacy";
+    setRosterViewMode(safeMode);
+    if (safeMode !== "field") setSelectedFieldPlayerId(null);
+
+    try {
+      window.localStorage.setItem(
+        WORLD_CUP_ROSTER_VIEW_MODE_KEY,
+        safeMode
+      );
+    } catch {
+      // The view still changes for this session if storage is unavailable.
+    }
+  };
+
+  useEffect(() => {
+    if (rosterViewMode !== "field") {
+      setSelectedFieldPlayerId(null);
+    }
+  }, [rosterViewMode]);
+
+  useEffect(() => {
+    if (rosterViewMode !== "field" || !selectedFieldPlayerId) {
+      return undefined;
+    }
+
+    const closeOnEscape = (event) => {
+      if (event.key === "Escape") {
+        setSelectedFieldPlayerId(null);
+      }
+    };
+
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [rosterViewMode, selectedFieldPlayerId]);
   
 
   // Cup-specific State
@@ -3430,7 +3832,70 @@ export default function WorldCupTournamentPage() {
   const myBench = sortPlayersForDisplay(getResolvedRoster(myUid, 'bench'));
   const myRoundTotal = sumDisplayedPoints(myStarters);
   const myBenchTotal = sumDisplayedPoints(myBench);
+  const myFieldLayout = buildWorldCupFieldLayout(myStarters);
+  const selectedFieldPlayer = selectedFieldPlayerId
+    ? myStarters.find(
+        (player) =>
+          getFieldPlayerKey(player) === String(selectedFieldPlayerId)
+      ) || null
+    : null;
+  const selectedFieldPlayerStats =
+    selectedFieldPlayer?.stats ||
+    selectedFieldPlayer?.rawStats ||
+    {};
+  const selectedFieldPlayerBreakdown =
+    selectedFieldPlayer?.breakdown ||
+    selectedFieldPlayer?.pointsBreakdown ||
+    selectedFieldPlayer?.scoringBreakdown ||
+    {};
+  const selectedFieldPlayerIsLive =
+    isPlayerLiveFromStats(selectedFieldPlayerStats);
+  const selectedFieldPlayerPoints = Number.isFinite(
+    Number(
+      selectedFieldPlayer?.points ??
+        selectedFieldPlayer?.totalPoints ??
+        selectedFieldPlayer?.total
+    )
+  )
+    ? Number(
+        selectedFieldPlayer?.points ??
+          selectedFieldPlayer?.totalPoints ??
+          selectedFieldPlayer?.total
+      )
+    : 0;
+  const selectedFieldPlayerRawRows =
+    buildFieldPlayerRawStatRows(selectedFieldPlayerStats);
+  const selectedFieldPlayerBreakdownRows =
+    buildFieldPlayerBreakdownRows(selectedFieldPlayerBreakdown);
   const otherUsers = users.filter(u => u.userId !== myUid);
+  const fieldDashboardGames = buildFieldDashboardGames(
+    isWorldCupGroupRoom
+      ? (worldCupDisplayDay || currentDayDoc || activeWorldCupResult || {})
+      : { fixtures: cupDoc?.currentWindowFixtures || [] },
+    isWorldCupGroupRoom ? (activeWorldCupResult || {}) : (cupDoc || {})
+  );
+  const fieldDashboardManagers = otherUsers
+    .map((manager) => {
+      const uid = String(manager?.userId || "");
+      const breakdown = currentBreakdownByUserId?.[uid] || {};
+      const savedDayScore = activeWorldCupResult?.teamScoresByUserId?.[uid];
+      const points = Number.isFinite(Number(savedDayScore))
+        ? Number(savedDayScore)
+        : fieldDashboardBreakdownTotal(breakdown);
+
+      return {
+        ...manager,
+        userId: uid,
+        points,
+      };
+    })
+    .sort((a, b) => {
+      const pointsDiff = Number(b.points || 0) - Number(a.points || 0);
+      if (pointsDiff) return pointsDiff;
+      return String(a.displayName || a.name || "").localeCompare(
+        String(b.displayName || b.name || "")
+      );
+    });
   const isLineupLoading = (uid) => Boolean(stagedLineups.loadingByUid?.[String(uid || "")]);
 
     const roomNextLabel =
@@ -3585,8 +4050,278 @@ export default function WorldCupTournamentPage() {
           {/* YOUR ROSTER */}
           {!showFinalPodium && (
             <div className="tpCard tpFull">
-              <h3 className="tpCardTitle">Your Roster</h3>
-              <div className="tpLineups tpLineupsSingle">
+              <div className="wcRosterViewHeader">
+                <h3 className="tpCardTitle wcRosterViewTitle">Your Roster</h3>
+                <div
+                  className="wcRosterViewSwitch"
+                  role="group"
+                  aria-label="Roster display mode"
+                >
+                  <button
+                    type="button"
+                    className={`wcRosterViewButton ${
+                      rosterViewMode === "legacy" ? "is-active" : ""
+                    }`}
+                    aria-pressed={rosterViewMode === "legacy"}
+                    onClick={() => selectRosterViewMode("legacy")}
+                  >
+                    Legacy View
+                  </button>
+                  <button
+                    type="button"
+                    className={`wcRosterViewButton ${
+                      rosterViewMode === "field" ? "is-active" : ""
+                    }`}
+                    aria-pressed={rosterViewMode === "field"}
+                    onClick={() => selectRosterViewMode("field")}
+                  >
+                    Field View
+                  </button>
+                </div>
+              </div>
+
+              {rosterViewMode === "field" && (
+                <>
+                  <div
+                    className={`wcFieldViewShell ${
+                      selectedFieldPlayer ? "has-selected-player" : ""
+                    }`}
+                  >
+                    <div className="wcFieldViewMain">
+                      <div className="wcLineupBreakout">
+                    <section className="wcLineupFieldCard" aria-labelledby="wc-lineup-field-title">
+                      <div className="wcLineupFieldHeader">
+                        <div>
+                          <div className="wcLineupFieldEyebrow">Your matchday shape</div>
+                          <h4 id="wc-lineup-field-title" className="wcLineupFieldTitle">
+                            Starting XI Field View
+                          </h4>
+                        </div>
+                        <span className="wcLineupFormation">
+                          Formation: {myFieldLayout.formation}
+                        </span>
+                      </div>
+
+                      <div className="wcLineupPitchViewport">
+                        <div
+                          className="wcLineupPitch"
+                          style={{ "--wc-stadium-bg": `url("${stadiumBg}")` }}
+                        >
+                          {myFieldLayout.positionedPlayers.map((item, index) => {
+                            const player = item.player;
+                            const displayTeamName = getDisplayTeamName(
+                              player,
+                              player,
+                              player.stats
+                            );
+                            const displayCountry = getPlayerCountry(player, player);
+                            const isLiveNow = isPlayerLiveFromStats(player.stats);
+                            const points = Number.isFinite(Number(player.points))
+                              ? Number(player.points)
+                              : 0;
+                            const fieldPlayerKey = getFieldPlayerKey(player);
+
+                            return (
+                              <div
+                                className="wcLineupPlayerSlot"
+                                key={`${fieldPlayerKey || "field-player"}-${index}`}
+                                style={{
+                                  "--wc-player-x": `${item.x}%`,
+                                  "--wc-player-y": `${item.y}%`,
+                                }}
+                              >
+                                <FieldPlayerCard
+                                  player={player}
+                                  position={item.position}
+                                  statusLabel={isLiveNow ? "Live" : "Idle"}
+                                  isLive={isLiveNow}
+                                  isSelected={
+                                    Boolean(fieldPlayerKey) &&
+                                    selectedFieldPlayerId === fieldPlayerKey
+                                  }
+                                  onClick={
+                                    fieldPlayerKey
+                                      ? () => setSelectedFieldPlayerId(
+                                          (current) =>
+                                            current === fieldPlayerKey
+                                              ? null
+                                              : fieldPlayerKey
+                                        )
+                                      : undefined
+                                  }
+                                  points={points}
+                                  name={player.name || "Unknown player"}
+                                  club={displayTeamName || "Unknown club"}
+                                  country={displayCountry}
+                                />
+                              </div>
+                            );
+                          })}
+
+                          {!myFieldLayout.positionedPlayers.length && (
+                            <div className="wcLineupPitchEmpty">
+                              Your starting XI will appear here.
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                      </section>
+                    </div>
+
+                    {!selectedFieldPlayer ? (
+                      <div className="wcFieldPlayerDetailsHint">
+                        Select one of your Starting XI cards to view raw stats and
+                        the existing points breakdown.
+                      </div>
+                    ) : null}
+                  </div>
+
+                  {selectedFieldPlayer ? (
+                    <aside
+                      className="wcFieldViewDetailsRail"
+                      aria-label="Selected player details"
+                      onClick={() => setSelectedFieldPlayerId(null)}
+                    >
+                      <div
+                        className="wcFieldViewDetailsSurface"
+                        onClick={(event) => event.stopPropagation()}
+                      >
+                        <FieldPlayerDetailsPanel
+                          player={selectedFieldPlayer}
+                          isOpen
+                          onClose={() => setSelectedFieldPlayerId(null)}
+                          position={normalizeDisplayPos(
+                            selectedFieldPlayer.position
+                          )}
+                          club={getDisplayTeamName(
+                            selectedFieldPlayer,
+                            selectedFieldPlayer,
+                            selectedFieldPlayerStats
+                          )}
+                          country={getPlayerCountry(
+                            selectedFieldPlayer,
+                            selectedFieldPlayer
+                          )}
+                          isLive={selectedFieldPlayerIsLive}
+                          totalPoints={selectedFieldPlayerPoints}
+                          rawStatsRows={selectedFieldPlayerRawRows}
+                          breakdownRows={selectedFieldPlayerBreakdownRows}
+                        />
+                      </div>
+                    </aside>
+                  ) : null}
+                </div>
+
+                  <section
+                    className="wcFieldDashboard"
+                    aria-labelledby="wc-field-dashboard-title"
+                  >
+                    <div className="wcFieldDashboardHeader">
+                      <div>
+                        <div className="wcFieldDashboardEyebrow">
+                          Current matchday
+                        </div>
+                        <h4
+                          id="wc-field-dashboard-title"
+                          className="wcFieldDashboardTitle"
+                        >
+                          Daily Results
+                        </h4>
+                      </div>
+                      <span className="wcFieldDashboardDayLabel">
+                        {currentWindowLabel}
+                      </span>
+                    </div>
+
+                    <div className="wcFieldDashboardGrid">
+                      <article className="wcFieldDashboardCard">
+                        <div className="wcFieldDashboardCardHeader">
+                          <span className="wcFieldDashboardIcon" aria-hidden="true">
+                            ⚽
+                          </span>
+                          <h5>Today&apos;s Games</h5>
+                          <span className="wcFieldDashboardCount">
+                            {fieldDashboardGames.length}
+                          </span>
+                        </div>
+
+                        <div className="wcFieldGameList">
+                          {fieldDashboardGames.map((game) => {
+                            const hasScore =
+                              game.homeScore != null && game.awayScore != null;
+                            const statusLabel =
+                              game.status.label ||
+                              fieldDashboardTimeLabel(game.kickoffMs);
+
+                            return (
+                              <div className="wcFieldGameRow" key={game.fixtureId}>
+                                <div className="wcFieldGameTeams">
+                                  <span>{game.homeTeam}</span>
+                                  <span>{game.awayTeam}</span>
+                                </div>
+                                <div className="wcFieldGameResult">
+                                  {hasScore && (
+                                    <strong>
+                                      {game.homeScore} - {game.awayScore}
+                                    </strong>
+                                  )}
+                                  <span
+                                    className={`wcFieldGameStatus wcFieldGameStatus--${game.status.tone}`}
+                                  >
+                                    {statusLabel}
+                                  </span>
+                                </div>
+                              </div>
+                            );
+                          })}
+
+                          {!fieldDashboardGames.length && (
+                            <div className="wcFieldDashboardEmpty">
+                              No games are available for this day yet.
+                            </div>
+                          )}
+                        </div>
+                      </article>
+
+                      <article className="wcFieldDashboardCard">
+                        <div className="wcFieldDashboardCardHeader">
+                          <span className="wcFieldDashboardIcon" aria-hidden="true">
+                            ◉
+                          </span>
+                          <h5>Other Managers</h5>
+                          <span className="wcFieldDashboardCount">
+                            {fieldDashboardManagers.length}
+                          </span>
+                        </div>
+
+                        <div className="wcFieldManagerList">
+                          {fieldDashboardManagers.map((manager, index) => (
+                            <div
+                              className="wcFieldManagerRow"
+                              key={manager.userId}
+                            >
+                              <span className="wcFieldManagerRank">
+                                {index + 1}
+                              </span>
+                              <UserChip user={manager} />
+                              <strong>{Number(manager.points || 0)} pts</strong>
+                            </div>
+                          ))}
+
+                          {!fieldDashboardManagers.length && (
+                            <div className="wcFieldDashboardEmpty">
+                              No other managers are in this room.
+                            </div>
+                          )}
+                        </div>
+                      </article>
+                    </div>
+                  </section>
+                </>
+              )}
+
+              {rosterViewMode === "legacy" && (
+                <div className="tpLineups tpLineupsSingle">
                 <div className="tpSide tpSideMe tpSideSolo">
                   <div className="tpLineupHead">
                     <span className="tpLineupName"><UserChip user={userById[myUid] || { userId: myUid, name: "You" }} /></span>
@@ -3685,7 +4420,8 @@ export default function WorldCupTournamentPage() {
                     </details>
                 
                 </div>
-              </div>
+                </div>
+              )}
             </div>
           )}
 

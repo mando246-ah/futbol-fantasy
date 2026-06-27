@@ -1,0 +1,256 @@
+.fieldPlayerCard {
+  position: relative;
+  width: min(var(--field-player-card-w, 150px), var(--field-player-card-max-w, 210px));
+  aspect-ratio: 433 / 577;
+  container-type: inline-size;
+  background-color: transparent;
+  color: #f8fafc;
+  filter: drop-shadow(0 10px 12px rgba(0, 0, 0, 0.58));
+  transition: filter 180ms ease, transform 180ms ease;
+}
+
+.fieldPlayerCardFrame {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: fill;
+  pointer-events: none;
+  user-select: none;
+}
+
+.fieldPlayerCard:hover {
+  transform: translateY(-2%) scale(1.035);
+  filter:
+    drop-shadow(0 12px 14px rgba(0, 0, 0, 0.66))
+    drop-shadow(0 0 10px rgba(52, 211, 153, 0.28));
+}
+
+.fieldPlayerCard--interactive {
+  cursor: pointer;
+}
+
+.fieldPlayerCard--interactive:focus-visible {
+  outline: 2px solid rgba(250, 204, 21, 0.92);
+  outline-offset: 4px;
+  border-radius: 18%;
+}
+
+.fieldPlayerCard--selected,
+.fieldPlayerCard--selected:hover {
+  transform: translateY(-2%) scale(1.045);
+  filter:
+    drop-shadow(0 12px 16px rgba(0, 0, 0, 0.65))
+    drop-shadow(0 0 18px rgba(250, 204, 21, 0.55))
+    drop-shadow(0 0 28px rgba(16, 185, 129, 0.35));
+}
+
+.fieldPlayerCard--live {
+  filter:
+    drop-shadow(0 11px 14px rgba(0, 0, 0, 0.62))
+    drop-shadow(0 0 8px rgba(45, 255, 190, 0.72))
+    drop-shadow(0 0 20px rgba(16, 185, 129, 0.48));
+  animation: fieldPlayerCardLivePulse 1.8s ease-in-out infinite;
+}
+
+.fieldPlayerCard--live:hover {
+  filter:
+    drop-shadow(0 13px 15px rgba(0, 0, 0, 0.68))
+    drop-shadow(0 0 10px rgba(94, 255, 211, 0.86))
+    drop-shadow(0 0 26px rgba(16, 185, 129, 0.58));
+}
+
+.fieldPlayerCard--live.fieldPlayerCard--selected {
+  animation: fieldPlayerCardSelectedLivePulse 1.8s ease-in-out infinite;
+}
+
+.fieldPlayerCardPosition,
+.fieldPlayerCardStatus,
+.fieldPlayerCardName,
+.fieldPlayerCardClub,
+.fieldPlayerCardCountry,
+.fieldPlayerCardPoints {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  text-align: center;
+  text-shadow: 0 1px 5px rgba(0, 0, 0, 0.96);
+}
+
+.fieldPlayerCardPosition {
+  top: 22%;
+  left: 20%;
+  width: 26%;
+  height: 8%;
+  justify-content: flex-start;
+  color: #2cf0bd;
+  font-size: clamp(0.48rem, 9cqw, 0.96rem);
+  font-weight: 950;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.fieldPlayerCardStatus {
+  top: 22%;
+  right: 14%;
+  width: 31%;
+  height: 9.5%;
+  color: #94a3b8;
+  font-size: clamp(0.48rem, 8cqw, 0.75rem);
+  font-weight: 950;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.fieldPlayerCard--live .fieldPlayerCardStatus {
+  color: #baffec;
+  background: rgba(5, 46, 36, 0.78);
+  border: 1px solid rgba(52, 255, 196, 0.82);
+  border-radius: 999px;
+  box-shadow:
+    0 0 8px rgba(45, 255, 190, 0.72),
+    inset 0 0 8px rgba(45, 255, 190, 0.18);
+  text-shadow:
+    0 0 7px rgba(45, 255, 190, 0.84),
+    0 1px 5px rgba(0, 0, 0, 0.96);
+}
+
+.fieldPlayerCardName {
+  top: 53%;
+  right: 8%;
+  left: 8%;
+  height: 15%;
+  overflow: hidden;
+  color: #ffffff;
+  font-size: clamp(0.52rem, 9.2cqw, 0.85rem);
+  font-weight: 950;
+  line-height: 0.92;
+  text-transform: uppercase;
+}
+
+.fieldPlayerCardClub {
+  top: 67.2%;
+  right: 13%;
+  left: 13%;
+  height: 6%;
+  overflow: hidden;
+  color: #2cf0bd;
+  font-size: clamp(0.46rem, 7.2cqw, 0.8rem);
+  font-weight: 850;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fieldPlayerCardCountry {
+  top: 70.2%;
+  right: 11%;
+  left: 11%;
+  height: 7%;
+  gap: 4%;
+  overflow: hidden;
+  color: #f8fafc;
+  font-size: clamp(0.44rem, 6.7cqw, 0.74rem);
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.fieldPlayerCardCountry img {
+  flex: 0 0 auto;
+  width: 1.45em;
+  height: 0.96em;
+  border-radius: 1px;
+}
+
+.fieldPlayerCardCountry span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fieldPlayerCardPoints {
+  right: 21%;
+  bottom:8%;
+  left: 21%;
+  height: 9.5%;
+  gap: 0.22em;
+  color: #ffffff;
+  font-size: clamp(0.5rem, 8.7cqw, 0.96rem);
+  font-weight: 900;
+  letter-spacing: 0.025em;
+  text-transform: uppercase;
+}
+
+.fieldPlayerCardPoints strong {
+  font-size: 1.16em;
+}
+
+@keyframes fieldPlayerCardLivePulse {
+  0%,
+  100% {
+    filter:
+      drop-shadow(0 11px 14px rgba(0, 0, 0, 0.62))
+      drop-shadow(0 0 7px rgba(45, 255, 190, 0.62))
+      drop-shadow(0 0 17px rgba(16, 185, 129, 0.4));
+  }
+
+  50% {
+    filter:
+      drop-shadow(0 11px 14px rgba(0, 0, 0, 0.62))
+      drop-shadow(0 0 11px rgba(94, 255, 211, 0.88))
+      drop-shadow(0 0 26px rgba(16, 185, 129, 0.58));
+  }
+}
+
+@keyframes fieldPlayerCardSelectedLivePulse {
+  0%,
+  100% {
+    filter:
+      drop-shadow(0 12px 16px rgba(0, 0, 0, 0.65))
+      drop-shadow(0 0 16px rgba(250, 204, 21, 0.5))
+      drop-shadow(0 0 21px rgba(45, 255, 190, 0.68));
+  }
+
+  50% {
+    filter:
+      drop-shadow(0 12px 16px rgba(0, 0, 0, 0.65))
+      drop-shadow(0 0 22px rgba(250, 204, 21, 0.68))
+      drop-shadow(0 0 30px rgba(94, 255, 211, 0.82));
+  }
+}
+
+@media (max-width: 760px) {
+  .fieldPlayerCard {
+    filter: drop-shadow(0 7px 8px rgba(0, 0, 0, 0.56));
+  }
+
+  .fieldPlayerCard:hover {
+    transform: none;
+    filter: drop-shadow(0 7px 8px rgba(0, 0, 0, 0.56));
+  }
+
+  .fieldPlayerCard--live,
+  .fieldPlayerCard--live:hover {
+    filter:
+      drop-shadow(0 8px 9px rgba(0, 0, 0, 0.6))
+      drop-shadow(0 0 7px rgba(45, 255, 190, 0.76))
+      drop-shadow(0 0 15px rgba(16, 185, 129, 0.5));
+  }
+
+  .fieldPlayerCard--selected,
+  .fieldPlayerCard--selected:hover {
+    transform: none;
+    filter:
+      drop-shadow(0 8px 10px rgba(0, 0, 0, 0.62))
+      drop-shadow(0 0 12px rgba(250, 204, 21, 0.58))
+      drop-shadow(0 0 18px rgba(16, 185, 129, 0.38));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fieldPlayerCard--live,
+  .fieldPlayerCard--live.fieldPlayerCard--selected {
+    animation: none;
+  }
+}

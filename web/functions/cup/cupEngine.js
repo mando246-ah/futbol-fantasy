@@ -1411,6 +1411,7 @@ async function runCupEngine({
         apiKey,
         ttlMs: isInPlay(short) ? 60 * 1000 : 10 * 60 * 1000,
         timeZone: timezone,
+        source: "cup-engine-live",
       });
 
       await enrichStatsMapWithScores(fixtureId, statsMap, apiFootballGet, apiKey);
@@ -1540,6 +1541,7 @@ async function runCupEngine({
         apiKey,
         ttlMs: 60 * 60 * 1000,
         timeZone: timezone,
+        source: "cup-engine-final",
       });
 
       await enrichStatsMapWithScores(fixtureId, statsMap, apiFootballGet, apiKey);

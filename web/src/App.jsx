@@ -21,6 +21,7 @@ import PrivacyPage from "./pages/Legal/PrivacyPage";
 import CopyrightPage from "./pages/Legal/CopyrightPage";
 import DataDeletionPage from "./pages/Legal/DataDeletionPage";
 import RoomChatBubble from "./components/RoomChatBubble";
+import AppUpdateBanner from "./components/AppUpdateBanner";
 //import TournamentPage from "./pages/TournamentPage/TournamentPage";
 import TournamentRouter from "./pages/TournamentPage/TournamentRouter";
 import {
@@ -558,6 +559,7 @@ export default function App() {
       <AnalyticsRouteTracker />
       <PresenceTracker user={user} displayName={displayName} photoURL={photoURL} />
       <RoomChatRouteMount user={user} displayName={displayName} />
+      <AppUpdateBanner />
       <Routes>
         <Route element={<AppLayout user={user} displayName={displayName} photoURL={photoURL} />}>
           <Route path="/" element={<Home user={user} />} />

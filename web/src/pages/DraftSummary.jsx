@@ -36,6 +36,88 @@ const SUBS_LOCK_PREGAME_POLL_MS = 3 * 60 * 1000;
 const SUBS_LOCK_LIVE_POLL_MS = 60 * 1000;
 const SUBS_LOCK_IDLE_POLL_MS = 15 * 60 * 1000;
 const SUBS_LOCK_POST_MS = 3 * 60 * 60 * 1000;
+const LINEUP_SYNC_MESSAGE =
+  "Your lineup changed or is still syncing. Refresh the roster and try that substitution again.";
+const WORLD_CUP_KICKOFF_LOCK_MESSAGE =
+  "This player cannot be moved because their World Cup Group Stage match has already kicked off.";
+
+function stripCallableErrorPrefix(value) {
+  return String(value || "")
+    .replace(/^FirebaseError:\s*/i, "")
+    .replace(/^\[functions\/[^\]]+\]\s*/i, "")
+    .replace(/^functions\/[a-z-]+:\s*/i, "")
+    .trim();
+}
+
+function lineupErrorMessage(error, fallback) {
+  const details = error?.details;
+  const candidates = [
+    typeof details === "string" ? details : "",
+    details?.userMessage,
+    details?.message,
+    error?.message,
+  ]
+    .map(stripCallableErrorPrefix)
+    .filter(Boolean);
+
+  for (const message of candidates) {
+    const normalized = message.toLowerCase();
+
+    if (
+      message === WORLD_CUP_KICKOFF_LOCK_MESSAGE ||
+      (
+        normalized.includes("world cup group stage") &&
+        (
+          normalized.includes("kicked off") ||
+          normalized.includes("locked until") ||
+          normalized.includes("matches are live or resolving")
+        )
+      )
+    ) {
+      return message;
+    }
+
+    if (
+      normalized.includes("starteroutid is not in starters") ||
+      normalized.includes("benchinid is not in bench") ||
+      normalized.includes("lineup starter fields are out of sync") ||
+      normalized.includes("lineup changed") ||
+      normalized.includes("still syncing") ||
+      normalized.includes("out of sync")
+    ) {
+      return LINEUP_SYNC_MESSAGE;
+    }
+  }
+
+  return friendlyErrorMessage(error, fallback);
+}
+
+function lineupEntryKey(entry) {
+  if (entry == null) return "";
+  if (typeof entry === "string" || typeof entry === "number") {
+    return String(entry).trim();
+  }
+
+  return String(
+    entry.id ??
+      entry.playerId ??
+      entry.pid ??
+      entry.apiPlayerId ??
+      entry.player?.id ??
+      entry.player?.playerId ??
+      entry.name ??
+      ""
+  ).trim();
+}
+
+function lineupIdsFromCandidates(...candidates) {
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) {
+      return candidate.map(lineupEntryKey).filter(Boolean);
+    }
+  }
+  return null;
+}
 
 
 function memberUidOf(member) {
@@ -703,8 +785,12 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, displayName,
   const [lineupDoc, setLineupDoc] = useState(undefined);
   const [pendingIn, setPendingIn] = useState(null); // bench player picked to sub in
   const [lockClockMs, setLockClockMs] = useState(() => Date.now());
+  const [lineupSavePending, setLineupSavePending] = useState(false);
+  const [lineupSyncNotice, setLineupSyncNotice] = useState("");
   const didInitLineup = useRef(false);
   const didRepairLineup = useRef(false);
+  const pendingLineupSaveRef = useRef(null);
+  const lineupSaveFallbackTimerRef = useRef(null);
 
   useEffect(() => {
     if (!lineupRoomId || !manager?.uid) return;
@@ -842,19 +928,99 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, displayName,
   const sameKeyOrder = (a = [], b = []) =>
   a.length === b.length && a.every((v, i) => v === b[i]);
 
+  const savedStarterIds = useMemo(
+    () => lineupIdsFromCandidates(lineupDoc?.starters, lineupDoc?.startingXI),
+    [lineupDoc]
+  );
+  const savedBenchIds = useMemo(
+    () => lineupIdsFromCandidates(lineupDoc?.bench, lineupDoc?.benchXI),
+    [lineupDoc]
+  );
+
   const starters = useMemo(() => {
-    const saved = Array.isArray(lineupDoc?.starters) ? lineupDoc.starters : null;
-    const base = saved && saved.length ? saved : buildDefaultXI(allKeys);
+    const base = savedStarterIds && savedStarterIds.length
+      ? savedStarterIds
+      : buildDefaultXI(allKeys);
 
     const set = new Set(allKeys);
     return base.filter((k) => set.has(k)).slice(0, STARTING_CAP);
-  }, [lineupDoc, allKeys, pickByKey]);
+  }, [savedStarterIds, allKeys, pickByKey]);
 
 
   const benchKeys = useMemo(() => {
+    const rosterSet = new Set(allKeys);
+    if (Array.isArray(savedBenchIds)) {
+      return savedBenchIds.filter((k) => rosterSet.has(k));
+    }
+
     const s = new Set(starters);
     return allKeys.filter((k) => !s.has(k));
-  }, [allKeys, starters]);
+  }, [allKeys, starters, savedBenchIds]);
+
+  const savedLineupCoversRoster = useMemo(() => {
+    if (!Array.isArray(savedStarterIds) || !Array.isArray(savedBenchIds)) return false;
+
+    const rosterSet = new Set(allKeys);
+    const savedIds = [...savedStarterIds, ...savedBenchIds].filter(Boolean);
+    const savedSet = new Set(savedIds);
+    return (
+      savedIds.length === savedSet.size &&
+      savedSet.size === rosterSet.size &&
+      allKeys.every((id) => savedSet.has(id))
+    );
+  }, [allKeys, savedStarterIds, savedBenchIds]);
+
+  const visibleStartersMatchSaved =
+    Array.isArray(savedStarterIds) && sameKeyOrder(starters, savedStarterIds);
+  const visibleBenchMatchSaved =
+    Array.isArray(savedBenchIds) && sameKeyOrder(benchKeys, savedBenchIds);
+  const lineupSyncing = Boolean(
+    isMe &&
+      (
+        lineupDoc === undefined ||
+        lineupDoc === null ||
+        lineupSavePending ||
+        !Array.isArray(savedStarterIds) ||
+        savedStarterIds.length === 0 ||
+        !Array.isArray(savedBenchIds) ||
+        !visibleStartersMatchSaved ||
+        !visibleBenchMatchSaved ||
+        !savedLineupCoversRoster
+      )
+  );
+
+  useEffect(() => {
+    if (!pendingIn) return;
+    if (!lineupSyncing && benchKeys.includes(pendingIn)) return;
+    setPendingIn(null);
+  }, [benchKeys, lineupSyncing, pendingIn]);
+
+  useEffect(() => {
+    return () => {
+      if (lineupSaveFallbackTimerRef.current) {
+        window.clearTimeout(lineupSaveFallbackTimerRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!lineupSavePending) return;
+    const expected = pendingLineupSaveRef.current;
+    if (!expected || !Array.isArray(savedStarterIds) || !Array.isArray(savedBenchIds)) return;
+
+    if (
+      sameKeyOrder(savedStarterIds, expected.starters) &&
+      sameKeyOrder(savedBenchIds, expected.bench)
+    ) {
+      pendingLineupSaveRef.current = null;
+      setLineupSavePending(false);
+      setLineupSyncNotice("");
+      if (lineupSaveFallbackTimerRef.current) {
+        window.clearTimeout(lineupSaveFallbackTimerRef.current);
+        lineupSaveFallbackTimerRef.current = null;
+      }
+    }
+  }, [lineupSavePending, savedStarterIds, savedBenchIds]);
 
   // Build a quick lookup of LIVE players returned by getUserLockStatus
   const liveLookup = useMemo(() => {
@@ -944,6 +1110,21 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, displayName,
       };
     });
 
+    pendingLineupSaveRef.current = {
+      starters: clean.map(String),
+      bench: benchKeys.map(String),
+    };
+    setLineupSavePending(true);
+    setLineupSyncNotice("");
+    if (lineupSaveFallbackTimerRef.current) {
+      window.clearTimeout(lineupSaveFallbackTimerRef.current);
+    }
+    lineupSaveFallbackTimerRef.current = window.setTimeout(() => {
+      if (!pendingLineupSaveRef.current) return;
+      setLineupSavePending(false);
+      setLineupSyncNotice("Your lineup is still syncing. Refresh the roster and try again.");
+    }, 15000);
+
     try {
       console.log("[substitution] save attempt", {
         roomId: lineupRoomId,
@@ -982,7 +1163,7 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, displayName,
         );
       }
     } catch (e) {
-      const userMessage = friendlyErrorMessage(
+      const userMessage = lineupErrorMessage(
         e,
         "Could not save the lineup. Please refresh and try again."
       );
@@ -998,6 +1179,13 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, displayName,
           benchCount: benchKeys.length,
         },
       });
+      pendingLineupSaveRef.current = null;
+      setLineupSavePending(false);
+      if (lineupSaveFallbackTimerRef.current) {
+        window.clearTimeout(lineupSaveFallbackTimerRef.current);
+        lineupSaveFallbackTimerRef.current = null;
+      }
+      setLineupSyncNotice(userMessage);
       devError("[Lineup] save failed", e);
       alert(userMessage);
     }
@@ -1005,6 +1193,7 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, displayName,
 
   async function saveSwapSubstitution(starterOutId, benchInId) {
     if (!isMe || lockedNow) return;
+    if (lineupSyncing) return;
 
     if (!authUid) {
       throw new Error("Sign in required.");
@@ -1034,7 +1223,7 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, displayName,
         benchInId,
       });
     } catch (e) {
-      const userMessage = friendlyErrorMessage(
+      const userMessage = lineupErrorMessage(
         e,
         "Could not save that substitution. Please refresh and try again."
       );
@@ -1048,6 +1237,12 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, displayName,
           targetUid,
           starterOutId,
           benchInId,
+          renderedStarters: starters,
+          renderedBench: benchKeys,
+          savedStarters: savedStarterIds || [],
+          savedBench: savedBenchIds || [],
+          lineupSyncing,
+          lineupSavePending,
         },
       });
       devError("[Lineup] substitution failed", e);
@@ -1092,24 +1287,44 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, displayName,
     const savedIsValid =
       saved.length === STARTING_CAP && validateStarters(saved).ok;
 
-    if (savedIsValid) return;
+    const savedLineupFullySynced =
+      savedIsValid &&
+      savedLineupCoversRoster &&
+      visibleStartersMatchSaved &&
+      visibleBenchMatchSaved;
 
-    const repaired = buildDefaultXI(allKeys);
+    if (savedLineupFullySynced) return;
+
+    const repaired = savedIsValid ? saved : buildDefaultXI(allKeys);
 
     // safety check: only save if the repaired XI is truly valid
     if (repaired.length !== STARTING_CAP) return;
     if (!validateStarters(repaired).ok) return;
 
     // avoid pointless rewrite
-    if (sameKeyOrder(saved, repaired)) return;
+    if (sameKeyOrder(saved, repaired) && savedLineupFullySynced) return;
 
     didRepairLineup.current = true;
     saveStarters(repaired);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isMe, lockedNow, lineupDoc, picks, totalRounds, allKeys, activeWorldCupLockCount]);
+  }, [
+    isMe,
+    lockedNow,
+    lineupDoc,
+    picks,
+    totalRounds,
+    allKeys,
+    activeWorldCupLockCount,
+    savedLineupCoversRoster,
+    visibleStartersMatchSaved,
+    visibleBenchMatchSaved,
+    savedStarterIds,
+    savedBenchIds,
+  ]);
 
   function onSubInClick(benchKey) {
     if (!isMe || lockedNow) return;
+    if (lineupSyncing) return;
 
     const benchPick = pickByKey.get(benchKey);
     if (isPickLive(benchPick)) {
@@ -1136,6 +1351,7 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, displayName,
 
   async function onStarterClick(starterKey) {
     if (!isMe || lockedNow) return;
+    if (lineupSyncing) return;
     if (!pendingIn) return;
 
     const appearanceLock = getWorldCupAppearanceLock(starterKey);
@@ -1274,6 +1490,11 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, displayName,
                 {activeWorldCupLockCount === 1 ? " is" : "s are"} locked in the same slot.
               </div>
             ) : null}
+            {lineupSyncing ? (
+              <div className="mt-2 text-xs text-amber-600">
+                {lineupSyncNotice || "Roster syncing - substitutions will be available in a moment."}
+              </div>
+            ) : null}
           </>
         )}
       </div>
@@ -1282,10 +1503,10 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, displayName,
       <div className="rosterShell grid grid-cols-2 gap-2 text-sm">
         {isMe ? (
           <>
-            <RosterStarterBlock title="ATT" list={startersByPos.ATT} pendingIn={!!pendingIn} locked={lockedNow} onPick={onStarterClick} keyOf={keyOf} isLivePick={isPickLive} pendingInPickLive={pendingIsLive} replaceable={replaceableStarters} getAppearanceLock={getWorldCupAppearanceLock} onLockedAttempt={showWorldCupLockMessage}/>
-            <RosterStarterBlock title="MID" list={startersByPos.MID} pendingIn={!!pendingIn} locked={lockedNow} onPick={onStarterClick} keyOf={keyOf} isLivePick={isPickLive} pendingInPickLive={pendingIsLive} replaceable={replaceableStarters} getAppearanceLock={getWorldCupAppearanceLock} onLockedAttempt={showWorldCupLockMessage}/>
-            <RosterStarterBlock title="DEF" list={startersByPos.DEF} pendingIn={!!pendingIn} locked={lockedNow} onPick={onStarterClick} keyOf={keyOf} isLivePick={isPickLive} pendingInPickLive={pendingIsLive} replaceable={replaceableStarters} getAppearanceLock={getWorldCupAppearanceLock} onLockedAttempt={showWorldCupLockMessage}/>
-            <RosterStarterBlock title="GK"  list={startersByPos.GK}  pendingIn={!!pendingIn} locked={lockedNow} onPick={onStarterClick} keyOf={keyOf} isLivePick={isPickLive} pendingInPickLive={pendingIsLive} replaceable={replaceableStarters} getAppearanceLock={getWorldCupAppearanceLock} onLockedAttempt={showWorldCupLockMessage}/>
+            <RosterStarterBlock title="ATT" list={startersByPos.ATT} pendingIn={!!pendingIn} locked={lockedNow} syncing={lineupSyncing} onPick={onStarterClick} keyOf={keyOf} isLivePick={isPickLive} pendingInPickLive={pendingIsLive} replaceable={replaceableStarters} getAppearanceLock={getWorldCupAppearanceLock} onLockedAttempt={showWorldCupLockMessage}/>
+            <RosterStarterBlock title="MID" list={startersByPos.MID} pendingIn={!!pendingIn} locked={lockedNow} syncing={lineupSyncing} onPick={onStarterClick} keyOf={keyOf} isLivePick={isPickLive} pendingInPickLive={pendingIsLive} replaceable={replaceableStarters} getAppearanceLock={getWorldCupAppearanceLock} onLockedAttempt={showWorldCupLockMessage}/>
+            <RosterStarterBlock title="DEF" list={startersByPos.DEF} pendingIn={!!pendingIn} locked={lockedNow} syncing={lineupSyncing} onPick={onStarterClick} keyOf={keyOf} isLivePick={isPickLive} pendingInPickLive={pendingIsLive} replaceable={replaceableStarters} getAppearanceLock={getWorldCupAppearanceLock} onLockedAttempt={showWorldCupLockMessage}/>
+            <RosterStarterBlock title="GK"  list={startersByPos.GK}  pendingIn={!!pendingIn} locked={lockedNow} syncing={lineupSyncing} onPick={onStarterClick} keyOf={keyOf} isLivePick={isPickLive} pendingInPickLive={pendingIsLive} replaceable={replaceableStarters} getAppearanceLock={getWorldCupAppearanceLock} onLockedAttempt={showWorldCupLockMessage}/>
 
             {/* SUB section becomes Bench */}
             <div className="col-span-2">
@@ -1294,6 +1515,7 @@ function ManagerRosterCard({ manager, picks, totalRounds, photoURL, displayName,
                 list={benchPicks}
                 pendingKey={pendingIn}
                 locked={lockedNow}
+                syncing={lineupSyncing}
                 onSubIn={onSubInClick}
                 keyOf={keyOf}
                 isLivePick={isPickLive}
@@ -1466,6 +1688,7 @@ function RosterStarterBlock({
   list,
   pendingIn,
   locked,
+  syncing,
   onPick,
   keyOf,
   isLivePick,
@@ -1484,6 +1707,7 @@ function RosterStarterBlock({
           const illegalByFormation = !!pendingIn && !!replaceable && !replaceable.has(k);
           const disabled =
             locked ||
+            syncing ||
             Boolean(appearanceLock) ||
             !pendingIn ||
             pendingInPickLive ||
@@ -1504,6 +1728,8 @@ function RosterStarterBlock({
                   ? `Locked until ${formatWorldCupLockUntil(appearanceLock)} after a World Cup appearance`
                   : locked
                   ? "Lineups locked"
+                  : syncing
+                  ? "Roster syncing - substitutions will be available in a moment"
                   : pendingInPickLive
                   ? "Selected bench player is LIVE (can't sub in)"
                   : isLivePick?.(p)
@@ -1538,7 +1764,7 @@ function RosterStarterBlock({
   );
 }
 
-function RosterBenchBlock({ title, list, pendingKey, locked, onSubIn, keyOf, isLivePick }) {
+function RosterBenchBlock({ title, list, pendingKey, locked, syncing, onSubIn, keyOf, isLivePick }) {
   const selectedPick = pendingKey
     ? list.find((p) => keyOf(p) === pendingKey)
     : null;
@@ -1570,11 +1796,13 @@ function RosterBenchBlock({ title, list, pendingKey, locked, onSubIn, keyOf, isL
                 action={
                   <button
                     type="button"
-                    className={`rosterSubButton subInButton border rounded px-2 py-1 text-xs ${locked ? "opacity-50 cursor-not-allowed" : ""}`}
-                    disabled={locked || live}
+                    className={`rosterSubButton subInButton border rounded px-2 py-1 text-xs ${locked || syncing ? "opacity-50 cursor-not-allowed" : ""}`}
+                    disabled={locked || syncing || live}
                     title={
                       locked
                         ? "Lineups locked while games are live"
+                        : syncing
+                        ? "Roster syncing - substitutions will be available in a moment"
                         : live
                         ? "This player is LIVE (can't sub in)"
                         : "Move to starting lineup"

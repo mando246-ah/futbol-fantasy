@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import {
   auth,
   db,
@@ -43,17 +43,20 @@ import FlagIcon from "@/components/FlagIcon";
 import {
   friendlyErrorMessage,
   reportClientError,
+  shouldReportClientError,
 } from "../utils/errorReporter";
 import { devError, devWarn } from "../utils/devLogger";
 import {
-  matchesNormalizedSearch,
-  matchesPlayerSearch,
+  buildPlayerSearchText,
+  createSearchTextMatcher,
   normalizeSearchText,
 } from "../utils/playerSearch";
+import notificationSound from "../assets/notification.wav";
 
 
 // ----- Config -----
 const TURN_SECONDS = 60;
+const DRAFT_TURN_SOUND_STORAGE_KEY = "futbolFantasyDraftTurnSoundEnabled";
 // TODO: enforce this in backend/Firebase rules too before public launch.
 const MAX_ROOM_MANAGERS = 10;
 
@@ -406,6 +409,8 @@ export default function DraftWithPresence() {
   const [search, setSearch] = useState("");
   const [allPicksPos, setAllPicksPos] = useState("ALL");
   const [allPicksQuery, setAllPicksQuery] = useState("");
+  const deferredSearch = useDeferredValue(search);
+  const deferredAllPicksQuery = useDeferredValue(allPicksQuery);
   const [memberLabelByUid, setMemberLabelByUid] = useState({});
 
   // User in room 
@@ -573,6 +578,30 @@ useEffect(() => {
   const [timeLeft, setTimeLeft] = useState(TURN_SECONDS);
   const triedAutoRef = useRef(false);
   const [ clockNow, setClockNow] = useState(Date.now());
+  const [turnSoundEnabled, setTurnSoundEnabled] = useState(() => {
+    if (typeof window === "undefined") return false;
+    return (
+      window.localStorage.getItem(DRAFT_TURN_SOUND_STORAGE_KEY) === "true"
+    );
+  });
+  const [turnSoundUnlocked, setTurnSoundUnlocked] = useState(false);
+  const [turnSoundHint, setTurnSoundHint] = useState("");
+  const turnSoundAudioRef = useRef(null);
+  const previousCanPickNowRef = useRef(false);
+  const lastPlayedTurnKeyRef = useRef("");
+
+  useEffect(() => {
+    if (typeof Audio === "undefined") return undefined;
+
+    const audio = new Audio(notificationSound);
+    audio.volume = 0.5;
+    turnSoundAudioRef.current = audio;
+
+    return () => {
+      audio.pause();
+      turnSoundAudioRef.current = null;
+    };
+  }, []);
 
   //Live Listener
   const [poolPlayers, setPoolPlayers] = useState([]);
@@ -1092,18 +1121,12 @@ useEffect(() => {
 
   const requiredSlot = null;
 
-  const [posFilterState, searchState] = [posFilter, search]; // just to keep deps short
+  const [posFilterState, searchState] = [posFilter, deferredSearch]; // just to keep deps short
   const pickedIds = useMemo(() => new Set(picks.map(p => String(p.playerId))), [picks]);
   const loadingPlayers = !!roomId && poolPlayers.length === 0;
 
-  // All Picks filtering + suggestions (player OR manager)
-  const filteredPicks = useMemo(() => {
-    const q = allPicksQuery.trim();
-
-    return (picks || []).filter((p) => {
-      if (allPicksPos !== "ALL" && p.position !== allPicksPos) return false;
-      if (!q) return true;
-
+  const allPickSearchRows = useMemo(() => {
+    return (picks || []).map((p) => {
       const pickedPlayer =
         p?.player && typeof p.player === "object"
           ? {
@@ -1122,45 +1145,59 @@ useEffect(() => {
         .filter(Boolean)
         .join(" ");
 
-      return (
-        matchesPlayerSearch(pickedPlayer, q) ||
-        matchesNormalizedSearch(managerSearchText, q)
-      );
+      return {
+        pick: p,
+        playerLabel: String(
+          p.playerName ||
+            p.player?.playerName ||
+            p.player?.name ||
+            p.name ||
+            ""
+        ),
+        managerLabel: String(managerLabel(p.uid, p.displayName || "")),
+        playerSearchText: buildPlayerSearchText(pickedPlayer),
+        managerSearchText: normalizeSearchText(managerSearchText),
+      };
     });
-  }, [picks, allPicksQuery, allPicksPos, profilesByUid, memberLabelByUid]);
+  }, [picks, profilesByUid, memberLabelByUid]);
+
+  // All Picks filtering + suggestions (player OR manager)
+  const filteredPicks = useMemo(() => {
+    const q = normalizeSearchText(deferredAllPicksQuery);
+    const matchesQuery = createSearchTextMatcher(q);
+
+    return allPickSearchRows
+      .filter(({ pick: p, playerSearchText, managerSearchText }) => {
+        if (allPicksPos !== "ALL" && p.position !== allPicksPos) return false;
+        if (!q) return true;
+
+        return (
+          matchesQuery(playerSearchText) ||
+          matchesQuery(managerSearchText)
+        );
+      })
+      .map(({ pick }) => pick);
+  }, [allPickSearchRows, deferredAllPicksQuery, allPicksPos]);
 
   const allPicksSuggestions = useMemo(() => {
-    const q = normalizeSearchText(allPicksQuery);
+    const q = normalizeSearchText(deferredAllPicksQuery);
     if (!q) return [];
 
     const set = new Set();
+    const matchesQuery = createSearchTextMatcher(q);
 
-    for (const p of picks || []) {
-      const pickedPlayer =
-        p?.player && typeof p.player === "object"
-          ? {
-              ...p,
-              ...p.player,
-              playerName:
-                p.playerName || p.player?.playerName || p.player?.name || "",
-            }
-          : p;
-      const player = String(
-        p.playerName ||
-          p.player?.playerName ||
-          p.player?.name ||
-          p.name ||
-          ""
-      );
-      const manager = String(managerLabel(p.uid, p.displayName || ""));
-
-      if (matchesPlayerSearch(pickedPlayer, q) && player) set.add(player);
-      if (matchesNormalizedSearch(manager, q)) set.add(manager);
+    for (const row of allPickSearchRows) {
+      if (matchesQuery(row.playerSearchText) && row.playerLabel) {
+        set.add(row.playerLabel);
+      }
+      if (matchesQuery(row.managerSearchText) && row.managerLabel) {
+        set.add(row.managerLabel);
+      }
       if (set.size >= 10) break; // cap suggestions
     }
 
     return Array.from(set).slice(0, 10);
-  }, [picks, allPicksQuery, profilesByUid, memberLabelByUid]);
+  }, [allPickSearchRows, deferredAllPicksQuery]);
 
 
   function normalizeDraftPos(pos) {
@@ -1198,37 +1235,73 @@ useEffect(() => {
   // should only rerun when the Firestore player snapshot changes.
   const ALL_PLAYERS = useMemo(
     () =>
-      (poolPlayers?.length ? poolPlayers : MOCK_PLAYERS).map((p) => ({
-        ...p,
-        id: String(p.id),
-        name: p.fullName ?? p.name ?? "",
-        position: normalizeDraftPos(p.position),
-      })),
+      (poolPlayers?.length ? poolPlayers : MOCK_PLAYERS).map((p) => {
+        const normalizedPlayer = {
+          ...p,
+          id: String(p.id),
+          name: p.fullName ?? p.name ?? "",
+          position: normalizeDraftPos(p.position),
+        };
+
+        return {
+          ...normalizedPlayer,
+          _searchText: buildPlayerSearchText(normalizedPlayer),
+        };
+      }),
     [poolPlayers]
   );
 
   const availablePlayers = useMemo(() => {
-    const q = searchState.trim();
+    const qNorm = normalizeSearchText(searchState);
 
-      // show nothing until user types
-      if (!q) return [];
+    // show nothing until user types
+    if (!qNorm) return [];
 
-      return ALL_PLAYERS
-        .filter((p) => {
-          if (posFilterState !== "ALL" && p.position !== posFilterState) return false;
-          return matchesPlayerSearch(p, q);
-        })
-        // push drafted players to the bottom so undrafted show first
-        .sort((a, b) => {
-          const ad = pickedIds.has(a.id) ? 1 : 0;
-          const bd = pickedIds.has(b.id) ? 1 : 0;
-          return ad - bd; 
-        })
-        .slice(0, 50) 
-        .map((p) => ({
-          ...p,
-          isDrafted: pickedIds.has(p.id),
-        }));
+    const undraftedResults = [];
+    const draftedResults = [];
+    const matchesQuery = createSearchTextMatcher(qNorm);
+    const startedAt =
+      import.meta.env.DEV && typeof performance !== "undefined"
+        ? performance.now()
+        : 0;
+
+    for (const p of ALL_PLAYERS) {
+      if (posFilterState !== "ALL" && p.position !== posFilterState) continue;
+      if (!matchesQuery(p._searchText)) continue;
+
+      const isDrafted = pickedIds.has(p.id);
+      const result = {
+        ...p,
+        isDrafted,
+      };
+
+      if (isDrafted) {
+        draftedResults.push(result);
+      } else {
+        undraftedResults.push(result);
+        if (undraftedResults.length >= 50) break;
+      }
+    }
+
+    const results =
+      undraftedResults.length >= 50
+        ? undraftedResults.slice(0, 50)
+        : undraftedResults
+            .concat(draftedResults)
+            .slice(0, 50);
+
+    if (import.meta.env.DEV && startedAt) {
+      const elapsedMs = performance.now() - startedAt;
+      if (elapsedMs > 24) {
+        console.debug("[Draft] player search timing", {
+          query: qNorm,
+          resultCount: results.length,
+          elapsedMs: Math.round(elapsedMs),
+        });
+      }
+    }
+
+    return results;
   }, [ALL_PLAYERS, posFilterState, searchState, pickedIds]);
 
 
@@ -1236,6 +1309,99 @@ useEffect(() => {
   const canPickNow =
     isDraftActivelyRunning &&
     currentPickerUid === String(user?.uid || "");
+  const currentTurnSoundKey = [
+    roomId || "",
+    currentTurnIndex || 0,
+    room?.turnDeadlineAt || "",
+    currentPickerUid || "",
+  ].join(":");
+
+  async function unlockDraftTurnSound() {
+    setTurnSoundEnabled(true);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(DRAFT_TURN_SOUND_STORAGE_KEY, "true");
+    }
+
+    if (typeof Audio === "undefined") {
+      setTurnSoundHint("Turn sound is not available in this browser.");
+      return;
+    }
+
+    const audio = turnSoundAudioRef.current || new Audio(notificationSound);
+    turnSoundAudioRef.current = audio;
+
+    try {
+      audio.pause();
+      audio.currentTime = 0;
+      audio.volume = 0;
+      await audio.play();
+      audio.pause();
+      audio.currentTime = 0;
+      audio.volume = 0.5;
+      setTurnSoundUnlocked(true);
+      setTurnSoundHint("Turn sound is on. We'll alert you when it's your pick.");
+    } catch {
+      audio.volume = 0.5;
+      setTurnSoundUnlocked(false);
+      setTurnSoundHint("Tap Enable turn sound to hear an alert when it's your pick.");
+    }
+  }
+
+  async function handleTurnSoundToggle() {
+    if (turnSoundEnabled && turnSoundUnlocked) {
+      setTurnSoundEnabled(false);
+      setTurnSoundUnlocked(false);
+      setTurnSoundHint("Turn sound is off.");
+      if (typeof window !== "undefined") {
+        window.localStorage.setItem(DRAFT_TURN_SOUND_STORAGE_KEY, "false");
+      }
+      return;
+    }
+
+    await unlockDraftTurnSound();
+  }
+
+  useEffect(() => {
+    const wasCanPickNow = previousCanPickNowRef.current;
+    previousCanPickNowRef.current = canPickNow;
+
+    if (!turnSoundEnabled || !canPickNow || isDraftComplete) return;
+    if (!currentPickerUid || !currentTurnSoundKey) return;
+    if (lastPlayedTurnKeyRef.current === currentTurnSoundKey) return;
+
+    if (!turnSoundUnlocked) {
+      setTurnSoundHint("Tap Enable turn sound to hear an alert when it's your pick.");
+      return;
+    }
+
+    const shouldPlay =
+      !wasCanPickNow || lastPlayedTurnKeyRef.current !== currentTurnSoundKey;
+    if (!shouldPlay) return;
+
+    const audio = turnSoundAudioRef.current || new Audio(notificationSound);
+    audio.volume = 0.5;
+    turnSoundAudioRef.current = audio;
+    audio.currentTime = 0;
+
+    audio
+      .play()
+      .then(() => {
+        lastPlayedTurnKeyRef.current = currentTurnSoundKey;
+        setTurnSoundUnlocked(true);
+        setTurnSoundHint("");
+      })
+      .catch(() => {
+        setTurnSoundUnlocked(false);
+        setTurnSoundHint("Tap Enable turn sound to hear an alert when it's your pick.");
+      });
+  }, [
+    canPickNow,
+    currentPickerUid,
+    currentTurnSoundKey,
+    isDraftComplete,
+    turnSoundEnabled,
+    turnSoundUnlocked,
+  ]);
 
   async function pickPlayer(player) {
     if (!canPickNow) return alert(!room?.started ? "Draft not started" : "Not your turn");
@@ -1258,17 +1424,19 @@ useEffect(() => {
         e,
         "Could not make that pick. Please refresh and try again."
       );
-      await reportClientError({
-        roomId,
-        area: "Draft",
-        action: "makePick",
-        error: e,
-        userMessage,
-        extra: {
-          playerId: String(player?.id || ""),
-          position: normalizeDraftPos(player?.position),
-        },
-      });
+      if (shouldReportClientError(e, { area: "Draft", action: "makePick", userMessage })) {
+        await reportClientError({
+          roomId,
+          area: "Draft",
+          action: "makePick",
+          error: e,
+          userMessage,
+          extra: {
+            playerId: String(player?.id || ""),
+            position: normalizeDraftPos(player?.position),
+          },
+        });
+      }
       alert(userMessage);
     }
   }
@@ -1362,17 +1530,19 @@ useEffect(() => {
           e,
           "Auto-pick could not complete. The host can refresh and try again."
         );
-        await reportClientError({
-          roomId,
-          area: "Draft",
-          action: "autoPick",
-          error: e,
-          userMessage,
-          extra: {
-            candidateCount: candidates.length,
-            turnIndex: Number(room?.turnIndex || 0),
-          },
-        });
+        if (shouldReportClientError(e, { area: "Draft", action: "autoPick", userMessage })) {
+          await reportClientError({
+            roomId,
+            area: "Draft",
+            action: "autoPick",
+            error: e,
+            userMessage,
+            extra: {
+              candidateCount: candidates.length,
+              turnIndex: Number(room?.turnIndex || 0),
+            },
+          });
+        }
         devWarn("[Draft] auto-pick failed", e);
       }
     };
@@ -1755,7 +1925,7 @@ useEffect(() => {
                   total={myDraftedCount}
                 />
 
-                <div className="draftTurnBanner">
+                <div className={`draftTurnBanner ${canPickNow ? "draftTurnBannerYourTurn" : ""}`}>
                   <div className="draftTurnMain">
                     <Avatar className="draftTurnAvatar">
                       <AvatarImage src={currentPhoto || undefined} alt={currentName} />
@@ -1782,6 +1952,30 @@ useEffect(() => {
                       <span className="draftTurnNextName">{nextName}</span>
                     </div>
                   </div>
+                </div>
+                <div className="draftSoundControl">
+                  <button
+                    type="button"
+                    className={`draftSoundToggle ${
+                      turnSoundEnabled && turnSoundUnlocked
+                        ? "draftSoundToggleActive"
+                        : ""
+                    }`}
+                    onClick={handleTurnSoundToggle}
+                    aria-pressed={turnSoundEnabled && turnSoundUnlocked}
+                  >
+                    {turnSoundEnabled && turnSoundUnlocked
+                      ? "Turn sound: On"
+                      : "Enable turn sound"}
+                  </button>
+                  <span className="draftSoundHint">
+                    {turnSoundHint ||
+                      (turnSoundEnabled && turnSoundUnlocked
+                        ? "We'll alert you when it's your pick."
+                        : turnSoundEnabled
+                          ? "Tap Enable turn sound to hear an alert when it's your pick."
+                          : "Tap to hear an alert when it's your pick.")}
+                  </span>
                 </div>
                 {!isDraftComplete && (
                   <div className="mt-3">

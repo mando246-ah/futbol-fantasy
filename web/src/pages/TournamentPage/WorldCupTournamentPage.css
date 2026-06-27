@@ -1,27 +1,119 @@
+.appMain:has(.worldcup-page) {
+  width: 100%;
+  max-width: none;
+  min-width: 0;
+  padding: 0;
+}
+
 .worldcup-page {
-  background:
-    radial-gradient(circle at 10% 8%, rgba(59, 130, 246, 0.28), transparent 28%),
-    radial-gradient(circle at 85% 10%, rgba(239, 68, 68, 0.22), transparent 26%),
-    radial-gradient(circle at 24% 88%, rgba(34, 197, 94, 0.2), transparent 28%),
-    radial-gradient(circle at 78% 82%, rgba(250, 204, 21, 0.18), transparent 28%),
-    linear-gradient(180deg, #050816 0%, #07111f 48%, #04070d 100%);
+  --wc-page-max-w: 1500px;
+  --wc-page-gutter: clamp(12px, 1.5vw, 22px);
+  --wc-section-gap: clamp(14px, 1.5vw, 22px);
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  overflow-x: clip;
+  background: linear-gradient(180deg, #050816 0%, #07111f 48%, #04070d 100%);
 }
 
 .worldcup-page .tpWrap {
   position: relative;
+  isolation: isolate;
+  width: 100%;
+  max-width: var(--wc-page-max-w);
+  margin-inline: auto;
+  padding-inline: var(--wc-page-gutter);
+  box-sizing: border-box;
+}
+
+.worldcup-page .tpHeaderRow,
+.worldcup-page .tpGrid {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+
+.worldcup-page .tpGrid {
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--wc-section-gap);
+}
+
+.worldcup-page .tpGrid > .tpCard,
+.worldcup-page .tpGrid > .tpFull {
+  grid-column: 1;
+  width: 100%;
+  max-width: none;
+  min-width: 0;
+  box-sizing: border-box;
+}
+
+.worldcup-page .tpHeaderLeft {
+  flex: 1 1 900px;
+  min-width: 0;
+}
+
+.worldcup-page .tpHeaderRight {
+  flex: 0 0 auto;
+}
+
+.worldcup-page .tpMatchup,
+.worldcup-page .tpLineups,
+.worldcup-page .tpHistoryLoadCard,
+.worldcup-page .tpHistoryHeader,
+.worldcup-page .tpHistoryList,
+.worldcup-page .tpHistoryRowWrap,
+.worldcup-page .tpBreakdownWrap {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+
+.worldcup-page .tpLineups.tpLineupsSingle {
+  justify-items: stretch;
+}
+
+.worldcup-page .tpLineups.tpLineupsSingle .tpSideSolo {
+  width: 100%;
+  max-width: none;
+  min-width: 0;
 }
 
 .worldcup-page .tpWrap::before {
   content: "";
-  position: fixed;
+  position: absolute;
   inset: 0;
+  z-index: 0;
   pointer-events: none;
   background:
-    radial-gradient(circle at 50% 0%, rgba(250, 204, 21, 0.12), transparent 34%),
+    radial-gradient(circle at 10% 8%, rgba(59, 130, 246, 0.3), transparent 30%),
+    radial-gradient(circle at 85% 10%, rgba(239, 68, 68, 0.24), transparent 29%),
+    radial-gradient(circle at 24% 88%, rgba(34, 197, 94, 0.2), transparent 30%),
+    radial-gradient(circle at 78% 82%, rgba(250, 204, 21, 0.18), transparent 30%);
+  background-size: 100% 100%;
+  background-repeat: no-repeat;
+  border-radius: 32px;
+}
+
+.worldcup-page .tpWrap::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 50% 0%, rgba(250, 204, 21, 0.1), transparent 34%),
     linear-gradient(rgba(255, 255, 255, 0.025) 1px, transparent 1px),
     linear-gradient(90deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
-  background-size: 54px 54px;
+  background-size: 100% 100%, 54px 54px, 54px 54px;
+  background-repeat: no-repeat, repeat, repeat;
   mask-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.75), transparent 72%);
+}
+
+.worldcup-page .tpWrap > * {
+  position: relative;
+  z-index: 1;
 }
 
 .worldcup-flag-marquee {
@@ -63,10 +155,11 @@
 
 .worldcup-page .tpCard {
   border-color: rgba(250, 204, 21, 0.2);
-  background:
-    radial-gradient(circle at top left, rgba(59, 130, 246, 0.12), transparent 32%),
-    radial-gradient(circle at top right, rgba(239, 68, 68, 0.1), transparent 28%),
-    linear-gradient(145deg, rgba(15, 23, 42, 0.9), rgba(3, 12, 20, 0.92));
+  background: linear-gradient(
+    145deg,
+    rgba(15, 23, 42, 0.82),
+    rgba(3, 12, 20, 0.86)
+  );
   box-shadow: 0 22px 60px rgba(0, 0, 0, 0.28);
 }
 
@@ -105,6 +198,521 @@
   background: rgba(250, 204, 21, 0.08);
   color: #fde68a;
   font-weight: 800;
+}
+
+.wcRosterViewHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.worldcup-page .wcRosterViewTitle {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin-bottom: 0;
+}
+
+.wcRosterViewSwitch {
+  display: inline-grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  flex: 0 0 auto;
+  padding: 4px;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 999px;
+  background: rgba(2, 8, 16, 0.68);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+.wcRosterViewButton {
+  min-width: 108px;
+  padding: 7px 12px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: rgba(203, 213, 225, 0.72);
+  font-size: 0.76rem;
+  font-weight: 900;
+  line-height: 1;
+  white-space: nowrap;
+  transition:
+    color 160ms ease,
+    background-color 160ms ease,
+    border-color 160ms ease,
+    box-shadow 160ms ease;
+}
+
+.wcRosterViewButton:hover {
+  color: #f8fafc;
+}
+
+.wcRosterViewButton.is-active {
+  border-color: rgba(52, 211, 153, 0.46);
+  background: linear-gradient(
+    135deg,
+    rgba(6, 95, 70, 0.9),
+    rgba(5, 150, 105, 0.54)
+  );
+  color: #ecfdf5;
+  box-shadow:
+    0 0 16px rgba(16, 185, 129, 0.18),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+.wcRosterViewButton:focus-visible {
+  outline: 2px solid rgba(110, 231, 183, 0.9);
+  outline-offset: 2px;
+}
+
+.wcFieldViewShell {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
+  gap: 16px;
+  width: 100%;
+  min-width: 0;
+}
+
+.wcFieldViewMain,
+.wcFieldViewDetailsRail,
+.wcFieldViewDetailsSurface {
+  min-width: 0;
+}
+
+.wcLineupBreakout {
+  width: 100%;
+  max-width: 100%;
+  margin: 18px auto 28px;
+  box-sizing: border-box;
+}
+
+.wcLineupFieldCard {
+  --field-player-card-w: clamp(150px, 8vw, 210px);
+  --field-player-card-max-w: 210px;
+  width: 100%;
+  max-width: none;
+  min-width: 0;
+  margin: 0;
+  padding: 20px;
+  box-sizing: border-box;
+  overflow: hidden;
+  border: 1px solid rgba(250, 204, 21, 0.24);
+  border-radius: 20px;
+  background:
+    radial-gradient(circle at top right, rgba(16, 185, 129, 0.14), transparent 34%),
+    linear-gradient(145deg, rgba(4, 12, 22, 0.96), rgba(6, 20, 20, 0.92));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.05),
+    0 18px 45px rgba(0, 0, 0, 0.3);
+}
+
+.wcLineupFieldHeader {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 12px;
+}
+
+.wcLineupFieldEyebrow {
+  margin-bottom: 3px;
+  color: rgba(110, 231, 183, 0.78);
+  font-size: 0.68rem;
+  font-weight: 900;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.wcLineupFieldTitle {
+  margin: 0;
+  color: #fef3c7;
+  font-size: clamp(1rem, 2vw, 1.3rem);
+  line-height: 1.1;
+  text-shadow: 0 0 20px rgba(250, 204, 21, 0.2);
+}
+
+.wcLineupFormation {
+  flex: 0 0 auto;
+  padding: 7px 11px;
+  border: 1px solid rgba(52, 211, 153, 0.36);
+  border-radius: 999px;
+  background: rgba(6, 78, 59, 0.34);
+  color: #a7f3d0;
+  font-size: 0.76rem;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.wcLineupPitchViewport {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: hidden;
+  overflow-y: hidden;
+  border-radius: 16px;
+  scrollbar-color: rgba(250, 204, 21, 0.55) rgba(2, 8, 16, 0.8);
+  scrollbar-width: thin;
+}
+
+.wcLineupPitchViewport::-webkit-scrollbar {
+  height: 8px;
+}
+
+.wcLineupPitchViewport::-webkit-scrollbar-track {
+  background: rgba(2, 8, 16, 0.8);
+}
+
+.wcLineupPitchViewport::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: rgba(250, 204, 21, 0.55);
+}
+
+.wcLineupPitch {
+  position: relative;
+  width: 100%;
+  height: clamp(900px, 60vw, 1000px);
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 16px;
+  background-image:
+    linear-gradient(180deg, rgba(1, 8, 10, 0.04), rgba(1, 8, 10, 0.18)),
+    var(--wc-stadium-bg);
+  background-position: center;
+  background-repeat: no-repeat;
+  background-size: cover;
+  box-shadow:
+    inset 0 0 70px rgba(0, 0, 0, 0.34),
+    0 12px 30px rgba(0, 0, 0, 0.34);
+  isolation: isolate;
+}
+
+.wcLineupPitch::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at center, transparent 38%, rgba(0, 0, 0, 0.2)),
+    linear-gradient(90deg, rgba(3, 12, 10, 0.12), transparent 20%, transparent 80%, rgba(3, 12, 10, 0.12));
+}
+
+.wcLineupPlayerSlot {
+  position: absolute;
+  left: var(--wc-player-x);
+  top: var(--wc-player-y);
+  z-index: 1;
+  transform: translate(-50%, -50%);
+}
+
+.wcLineupPlayerSlot:hover {
+  z-index: 3;
+}
+
+.wcLineupPitchEmpty {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  z-index: 1;
+  padding: 10px 14px;
+  transform: translate(-50%, -50%);
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: 999px;
+  background: rgba(2, 8, 16, 0.78);
+  color: #e2e8f0;
+  font-size: 0.82rem;
+  font-weight: 850;
+  white-space: nowrap;
+}
+
+.wcFieldPlayerDetailsHint {
+  width: 100%;
+  margin: -12px 0 18px;
+  padding: 11px 14px;
+  box-sizing: border-box;
+  border: 1px dashed rgba(52, 211, 153, 0.25);
+  border-radius: 14px;
+  background: rgba(6, 78, 59, 0.1);
+  color: rgba(167, 243, 208, 0.72);
+  font-size: 0.75rem;
+  font-weight: 750;
+  text-align: center;
+}
+
+@media (min-width: 1100px) {
+  .wcFieldViewShell.has-selected-player {
+    grid-template-columns:
+      minmax(0, 1fr)
+      clamp(340px, 27vw, 420px);
+  }
+
+  .wcFieldViewDetailsRail {
+    position: sticky;
+    top: 88px;
+  }
+
+  .wcFieldViewDetailsRail .fieldPlayerDetails {
+    max-height: calc(100vh - 110px);
+    margin: 18px 0 0;
+    padding: 18px;
+    overflow-x: hidden;
+    overflow-y: auto;
+  }
+
+  .wcFieldViewDetailsRail .fieldPlayerDetailsHeader {
+    grid-template-columns: minmax(0, 1fr);
+    align-items: start;
+    gap: 12px;
+  }
+
+  .wcFieldViewDetailsRail .fieldPlayerDetailsPoints {
+    justify-items: start;
+    min-width: 0;
+  }
+
+  .wcFieldViewDetailsRail .fieldPlayerDetailsGrid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 12px;
+  }
+
+  .wcFieldViewShell.has-selected-player .wcLineupFieldCard {
+    --field-player-card-w: clamp(120px, 6.5vw, 170px);
+    --field-player-card-max-w: 170px;
+  }
+
+  .wcFieldViewShell.has-selected-player .wcLineupPitch {
+    height: clamp(760px, 54vw, 920px);
+  }
+}
+
+.wcFieldDashboard {
+  width: 100%;
+  max-width: 100%;
+  margin-top: 4px;
+  padding: clamp(14px, 1.7vw, 22px);
+  border: 1px solid rgba(250, 204, 21, 0.2);
+  border-radius: 20px;
+  background:
+    radial-gradient(circle at top right, rgba(59, 130, 246, 0.1), transparent 34%),
+    linear-gradient(145deg, rgba(4, 12, 22, 0.92), rgba(5, 18, 25, 0.9));
+  box-sizing: border-box;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.04),
+    0 16px 38px rgba(0, 0, 0, 0.24);
+}
+
+.wcFieldDashboardHeader {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.wcFieldDashboardEyebrow {
+  margin-bottom: 3px;
+  color: rgba(110, 231, 183, 0.76);
+  font-size: 0.64rem;
+  font-weight: 900;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+}
+
+.wcFieldDashboardTitle {
+  margin: 0;
+  color: #fef3c7;
+  font-size: clamp(1rem, 1.7vw, 1.28rem);
+  line-height: 1.1;
+}
+
+.wcFieldDashboardDayLabel {
+  max-width: 50%;
+  overflow: hidden;
+  padding: 6px 10px;
+  border: 1px solid rgba(52, 211, 153, 0.3);
+  border-radius: 999px;
+  background: rgba(6, 78, 59, 0.24);
+  color: #a7f3d0;
+  font-size: 0.72rem;
+  font-weight: 850;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wcFieldDashboardGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.wcFieldDashboardCard {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 16px;
+  background: rgba(7, 17, 31, 0.72);
+}
+
+.wcFieldDashboardCardHeader {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  padding: 11px 13px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.14);
+  background: rgba(15, 23, 42, 0.48);
+}
+
+.wcFieldDashboardCardHeader h5 {
+  min-width: 0;
+  margin: 0;
+  color: #f8fafc;
+  font-size: 0.82rem;
+  font-weight: 900;
+  letter-spacing: 0.02em;
+}
+
+.wcFieldDashboardIcon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 25px;
+  height: 25px;
+  border: 1px solid rgba(52, 211, 153, 0.28);
+  border-radius: 8px;
+  background: rgba(6, 78, 59, 0.26);
+  color: #6ee7b7;
+  font-size: 0.72rem;
+}
+
+.wcFieldDashboardCount {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 25px;
+  height: 22px;
+  padding-inline: 7px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.12);
+  color: rgba(226, 232, 240, 0.72);
+  font-size: 0.68rem;
+  font-weight: 900;
+}
+
+.wcFieldGameList,
+.wcFieldManagerList {
+  display: grid;
+}
+
+.wcFieldGameRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  min-height: 58px;
+  padding: 9px 13px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+}
+
+.wcFieldGameRow:last-child,
+.wcFieldManagerRow:last-child {
+  border-bottom: 0;
+}
+
+.wcFieldGameTeams {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  color: rgba(241, 245, 249, 0.92);
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+.wcFieldGameTeams span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wcFieldGameTeams span + span {
+  color: rgba(203, 213, 225, 0.7);
+}
+
+.wcFieldGameResult {
+  display: grid;
+  justify-items: end;
+  gap: 4px;
+}
+
+.wcFieldGameResult strong {
+  color: #f8fafc;
+  font-size: 0.88rem;
+  font-weight: 950;
+}
+
+.wcFieldGameStatus {
+  color: rgba(203, 213, 225, 0.66);
+  font-size: 0.66rem;
+  font-weight: 900;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.wcFieldGameStatus--live {
+  color: #6ee7b7;
+  text-shadow: 0 0 10px rgba(52, 211, 153, 0.44);
+}
+
+.wcFieldGameStatus--final {
+  color: #fde68a;
+}
+
+.wcFieldGameStatus--alert {
+  color: #fca5a5;
+}
+
+.wcFieldManagerRow {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  min-height: 58px;
+  padding: 9px 13px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+}
+
+.wcFieldManagerRank {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 25px;
+  height: 25px;
+  border-radius: 8px;
+  background: rgba(250, 204, 21, 0.1);
+  color: #fde68a;
+  font-size: 0.72rem;
+  font-weight: 950;
+}
+
+.wcFieldManagerRow .tpUserChip {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.wcFieldManagerRow > strong {
+  color: #a7f3d0;
+  font-size: 0.8rem;
+  font-weight: 950;
+  white-space: nowrap;
+}
+
+.wcFieldDashboardEmpty {
+  padding: 18px 13px;
+  color: rgba(203, 213, 225, 0.62);
+  font-size: 0.76rem;
+  text-align: center;
 }
 
 .wcDebugTools {
@@ -166,7 +774,200 @@
   }
 }
 
+@media (max-width: 760px) {
+  .worldcup-page {
+    --wc-page-gutter: 12px;
+    --wc-section-gap: 12px;
+  }
+
+  .worldcup-page .tpHeaderLeft {
+    flex-basis: 100%;
+  }
+
+  .wcRosterViewHeader {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .wcRosterViewSwitch {
+    width: 100%;
+  }
+
+  .wcRosterViewButton {
+    width: 100%;
+    min-width: 0;
+    padding: 8px 10px;
+  }
+
+  .wcFieldViewShell {
+    display: block;
+  }
+
+  .wcFieldViewDetailsRail {
+    position: fixed;
+    inset: 0;
+    z-index: 1200;
+    display: grid;
+    align-items: top;
+    width: 100%;
+    max-width: 100%;
+    padding:
+      max(56px, env(safe-area-inset-top))
+      10px
+      max(18px, env(safe-area-inset-bottom));
+    box-sizing: border-box;
+    overflow: hidden;
+    background: rgba(2, 6, 23, 0.7);
+    backdrop-filter: blur(8px);
+  }
+
+  .wcFieldViewDetailsSurface {
+    width: 100%;
+    max-width: 720px;
+    max-height: min(76vh, 700px);
+    margin-inline: auto;
+  }
+
+  .wcFieldViewDetailsRail .fieldPlayerDetails {
+    width: 100%;
+    max-height: min(76vh, 700px);
+    margin: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    border-radius: 22px;
+    animation: wcFieldDetailsSheetIn 180ms ease-out;
+  }
+
+  .wcLineupBreakout {
+    width: 100%;
+    max-width: 100%;
+    margin: 14px 0 22px;
+    overflow: hidden;
+  }
+
+  .wcLineupFieldCard {
+    --field-player-card-w: clamp(70px, 18vw, 160px);
+    --field-player-card-max-w: 160px;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    padding: 12px;
+    border-radius: 18px;
+  }
+
+  .wcLineupFieldHeader {
+    align-items: center;
+    flex-direction: row;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+
+  .wcLineupFieldHeader > div {
+    min-width: 0;
+  }
+
+  .wcLineupFieldEyebrow {
+    margin-bottom: 2px;
+    font-size: 0.58rem;
+    letter-spacing: 0.1em;
+  }
+
+  .wcLineupFieldTitle {
+    font-size: clamp(0.9rem, 4vw, 1.1rem);
+  }
+
+  .wcLineupFormation {
+    padding: 6px 8px;
+    font-size: 0.64rem;
+  }
+
+  .wcLineupPitchViewport {
+    max-width: 100%;
+    overflow: hidden;
+    border-radius: 14px;
+  }
+
+  .wcLineupPitch {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    min-height: 0;
+    height: clamp(620px, 155vw, 760px);
+    border-radius: 14px;
+    background-position: center;
+    background-size: cover;
+  }
+
+  .wcFieldDashboard {
+    padding: 12px;
+    border-radius: 17px;
+  }
+
+  .wcFieldPlayerDetailsHint {
+    margin-top: -8px;
+    padding: 10px 12px;
+    font-size: 0.7rem;
+  }
+
+  .wcFieldDashboardHeader {
+    align-items: flex-start;
+    margin-bottom: 11px;
+  }
+
+  .wcFieldDashboardDayLabel {
+    max-width: 46%;
+    padding: 5px 8px;
+    font-size: 0.64rem;
+  }
+
+  .wcFieldDashboardGrid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 10px;
+  }
+
+  .wcFieldGameRow,
+  .wcFieldManagerRow {
+    min-height: 52px;
+    padding: 8px 10px;
+  }
+
+}
+
+@keyframes wcFieldDetailsSheetIn {
+  from {
+    opacity: 0;
+    transform: translateY(18px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wcFieldViewDetailsRail .fieldPlayerDetails {
+    animation: none;
+  }
+}
+
 @media (max-width: 640px) {
+  .wcLineupFieldCard {
+    padding: 10px;
+    border-radius: 16px;
+  }
+
+  .wcLineupFieldHeader {
+    gap: 6px;
+  }
+
+  .wcLineupFormation {
+    padding: 5px 7px;
+    font-size: 0.6rem;
+  }
+
   .worldcup-flag-marquee {
     width: 100%;
     border-radius: 18px;

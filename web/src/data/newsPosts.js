@@ -1,5 +1,36 @@
 const newsPosts = [
   {
+  id: "field-view-player-details-and-update-alerts",
+  date: "2026-06-14",
+  tag: "Tournament View",
+  title: "New Field View, Player Details, and Update Alerts",
+  summary:
+  "Managers can now switch between the classic roster display and a new Field View with player cards, daily results, and clickable player details.",
+  body: [
+    "We added a new Field View option to the Tournament page so managers can view their starting XI on a soccer field with fantasy-style player cards.",
+    "Managers can now switch between Legacy View and Field View. Legacy View keeps the original roster layout, while Field View gives a more visual lineup experience. Your selected view is remembered on the same device.",
+    "Player cards now show key information like position, live status, club, country, and fantasy points. Long names are shortened on the cards to keep the field clean, while full names still appear in player details and other areas.",
+    "Clicking or tapping one of your players in Field View now opens that player’s raw stats and points breakdown. On desktop, the field shifts left and the details appear on the right. On mobile, the details open in a clean popup over the field.",
+    "Field View also includes a Daily Results section with day-specific manager points and game information when available.",
+    "We also added an update alert system. When a new version of the site is available, users with old tabs open can now see a refresh message so they know there is a new update.",
+    "These updates are part of our beta improvements to make tournaments easier to follow, more visual, and more mobile-friendly. Thank you for continuing to test and give feedback.",
+  ],
+  bullets: [
+    "Added a new Field View for your starting XI.",
+    "Managers can switch between Legacy View and Field View.",
+    "Your selected roster view is remembered on the same device.",
+    "Player cards now show position, live status, club, country, and points.",
+    "Long player names are shortened on field cards only.",
+    "Click a player card to view raw stats and points breakdown.",
+    "Desktop now shows player details beside the field.",
+    "Mobile now shows player details in a popup.",
+    "Daily Results now appear inside Field View.",
+    "Users can now see an update alert when a new site version is available.",
+  ],
+  isNew: true,
+  },
+
+  {
     id: "draft-search-and-market-player-pool-update",
     date: "2026-06-08",
     tag: "Draft & Marketplace",
@@ -23,7 +54,7 @@ const newsPosts = [
     "Missing World Cup players have been added to the marketplace.",
     "Future World Cup rooms now check for a fresher player pool before seeding.",
     ],
-    isNew: true,
+    isNew: false,
   },
 
   {
