@@ -13,6 +13,7 @@ import {
   callMaybeStartDraft,
   callStartDraftNow,
   callAutoPick,
+  callSetDraftOrderSettings,
   logAnalyticsEvent,
 } from "../firebase";
 import {
@@ -123,16 +124,79 @@ const fnScheduleDraft = httpsCallable(functions, "scheduleDraft");
 function randomKey(n = 6) {
   return Math.random().toString(36).slice(2, 2 + n).toUpperCase();
 }
-function roundOrder(order, roundIndex) {
+function getDraftRoundMode(room) {
+  return room?.draftRoundMode === "fixed" ? "fixed" : "snake";
+}
+
+function getDraftOrderMode(room) {
+  return room?.draftOrderMode === "custom" ? "custom" : "random";
+}
+
+function roundOrder(order, roundIndex, roundMode = "snake") {
   if (!order?.length) return [];
+  if (roundMode === "fixed") return order;
   return roundIndex % 2 === 0 ? order : [...order].reverse();
 }
+
+function getPickerFromOrder(order, turnIndex, roundMode = "snake") {
+  const n = order?.length || 0;
+  if (!n) return null;
+  const ti = Math.max(0, Math.floor(Number(turnIndex || 0)));
+  const roundIndex = Math.floor(ti / n);
+  const withinRound = ti % n;
+  if (roundMode === "fixed") return order[withinRound] || null;
+  const orderIndex = roundIndex % 2 === 0 ? withinRound : n - 1 - withinRound;
+  return order[orderIndex] || null;
+}
+
 function memberUidOf(member) {
   return String(
     typeof member === "string"
       ? member
       : member?.uid ?? member?.userId ?? member?.id ?? ""
   );
+}
+
+function uniqueDraftUids(values = []) {
+  return Array.from(
+    new Set((Array.isArray(values) ? values : []).map(String).map((v) => v.trim()).filter(Boolean))
+  );
+}
+
+function validateCustomDraftOrder(order = [], managerUids = []) {
+  const managers = uniqueDraftUids(managerUids);
+  const managerSet = new Set(managers);
+  const rawOrder = (Array.isArray(order) ? order : [])
+    .map(String)
+    .map((v) => v.trim())
+    .filter(Boolean);
+  const seen = new Set();
+  const duplicates = [];
+  const unknown = [];
+
+  for (const uid of rawOrder) {
+    if (seen.has(uid)) duplicates.push(uid);
+    seen.add(uid);
+    if (!managerSet.has(uid)) unknown.push(uid);
+  }
+
+  const missing = managers.filter((uid) => !seen.has(uid));
+  return {
+    ok:
+      rawOrder.length === managers.length &&
+      missing.length === 0 &&
+      duplicates.length === 0 &&
+      unknown.length === 0,
+    missing,
+    duplicates: uniqueDraftUids(duplicates),
+    unknown: uniqueDraftUids(unknown),
+  };
+}
+
+function sameUidOrder(a = [], b = []) {
+  const left = (Array.isArray(a) ? a : []).map(String);
+  const right = (Array.isArray(b) ? b : []).map(String);
+  return left.length === right.length && left.every((uid, idx) => uid === right[idx]);
 }
 
 function formatDraftDuration(totalSeconds) {
@@ -412,6 +476,10 @@ export default function DraftWithPresence() {
   const deferredSearch = useDeferredValue(search);
   const deferredAllPicksQuery = useDeferredValue(allPicksQuery);
   const [memberLabelByUid, setMemberLabelByUid] = useState({});
+  const [draftOrderModeInput, setDraftOrderModeInput] = useState("random");
+  const [draftRoundModeInput, setDraftRoundModeInput] = useState("snake");
+  const [customDraftOrderInput, setCustomDraftOrderInput] = useState([]);
+  const [savingDraftOrderSettings, setSavingDraftOrderSettings] = useState(false);
 
   // User in room 
   const [joinAttempted, setJoinAttempted] = useState(false);
@@ -421,6 +489,7 @@ export default function DraftWithPresence() {
     () => getRoomMemberCount(room, members),
     [room?.members, members]
   );
+  const isHost = Boolean(user?.uid && room?.hostUid === user.uid);
   const hasEnoughManagers = managerCount >= 2;
   const requiresEvenManagers = isRegularHeadToHeadRoom(room);
   const hasEvenManagers = managerCount % 2 === 0;
@@ -512,6 +581,151 @@ export default function DraftWithPresence() {
   }
 
   const managerLabel = (uid, fallback = "Someone") => managerName(uid, fallback || "Someone");
+
+  const currentManagerUids = useMemo(() => {
+    const ids = [];
+    const add = (uid) => {
+      const clean = String(uid || "").trim();
+      if (clean && !ids.includes(clean)) ids.push(clean);
+    };
+
+    for (const m of Array.isArray(room?.members) ? room.members : []) {
+      add(memberUidOf(m));
+    }
+    for (const uid of Array.isArray(members) ? members : []) {
+      add(uid);
+    }
+    if (room?.hostUid) add(room.hostUid);
+    return ids;
+  }, [room?.members, room?.hostUid, members]);
+
+  const savedCustomDraftOrder = useMemo(
+    () =>
+      (Array.isArray(room?.customDraftOrder) ? room.customDraftOrder : [])
+        .map(String)
+        .filter(Boolean),
+    [room?.customDraftOrder]
+  );
+
+  useEffect(() => {
+    if (!room || room.started) return;
+
+    const managerSet = new Set(currentManagerUids);
+    const saved = savedCustomDraftOrder.filter((uid, idx, arr) => {
+      return managerSet.has(uid) && arr.indexOf(uid) === idx;
+    });
+    const missing = currentManagerUids.filter((uid) => !saved.includes(uid));
+
+    setDraftOrderModeInput(getDraftOrderMode(room));
+    setDraftRoundModeInput(getDraftRoundMode(room));
+    setCustomDraftOrderInput([...saved, ...missing]);
+  }, [
+    room?.started,
+    room?.draftOrderMode,
+    room?.draftRoundMode,
+    room?.customDraftOrder,
+    currentManagerUids,
+    savedCustomDraftOrder,
+  ]);
+
+  const draftCustomOrderValidation = useMemo(
+    () => validateCustomDraftOrder(customDraftOrderInput, currentManagerUids),
+    [customDraftOrderInput, currentManagerUids]
+  );
+
+  const savedCustomOrderValidation = useMemo(
+    () => validateCustomDraftOrder(savedCustomDraftOrder, currentManagerUids),
+    [savedCustomDraftOrder, currentManagerUids]
+  );
+
+  const draftOrderSettingsChanged =
+    draftOrderModeInput !== getDraftOrderMode(room) ||
+    draftRoundModeInput !== getDraftRoundMode(room) ||
+    (draftOrderModeInput === "custom" &&
+      !sameUidOrder(customDraftOrderInput, savedCustomDraftOrder));
+
+  const draftOrderManagerChanged =
+    getDraftOrderMode(room) === "custom" && !savedCustomOrderValidation.ok;
+
+  const customDraftOrderMessage = draftCustomOrderValidation.ok
+    ? ""
+    : [
+        draftCustomOrderValidation.missing.length
+          ? `${draftCustomOrderValidation.missing.length} manager(s) missing`
+          : "",
+        draftCustomOrderValidation.duplicates.length
+          ? `${draftCustomOrderValidation.duplicates.length} duplicate manager(s)`
+          : "",
+        draftCustomOrderValidation.unknown.length
+          ? `${draftCustomOrderValidation.unknown.length} unknown manager(s)`
+          : "",
+      ]
+        .filter(Boolean)
+        .join(", ");
+
+  function moveCustomDraftManager(index, delta) {
+    setCustomDraftOrderInput((prev) => {
+      const next = [...prev];
+      const target = index + delta;
+      if (target < 0 || target >= next.length) return prev;
+      [next[index], next[target]] = [next[target], next[index]];
+      return next;
+    });
+  }
+
+  function validateDraftOrderForStart() {
+    if (draftOrderSettingsChanged) {
+      alert("Save draft order settings before starting.");
+      return false;
+    }
+
+    if (getDraftOrderMode(room) !== "custom") return true;
+
+    if (!savedCustomOrderValidation.ok || draftOrderSettingsChanged) {
+      alert("Custom draft order must include every current manager before starting.");
+      return false;
+    }
+
+    return true;
+  }
+
+  async function saveDraftOrderSettings() {
+    if (!isHost || !roomId || room?.started) return;
+    if (draftOrderModeInput === "custom" && !draftCustomOrderValidation.ok) {
+      return alert("Custom draft order must include every current manager exactly once.");
+    }
+
+    setSavingDraftOrderSettings(true);
+    try {
+      await callSetDraftOrderSettings({
+        roomId,
+        draftOrderMode: draftOrderModeInput,
+        draftRoundMode: draftRoundModeInput,
+        customDraftOrder:
+          draftOrderModeInput === "custom" ? customDraftOrderInput : [],
+      });
+    } catch (e) {
+      const userMessage = friendlyErrorMessage(
+        e,
+        "Could not save draft order settings. Please refresh and try again."
+      );
+      await reportClientError({
+        roomId,
+        area: "Draft",
+        action: "setDraftOrderSettings",
+        error: e,
+        userMessage,
+        extra: {
+          draftOrderMode: draftOrderModeInput,
+          draftRoundMode: draftRoundModeInput,
+          managerCount: currentManagerUids.length,
+        },
+      });
+      alert(userMessage);
+    } finally {
+      setSavingDraftOrderSettings(false);
+    }
+  }
 
   //Flags
   const competitionName = room?.competitionMeta?.name || "";
@@ -793,6 +1007,9 @@ useEffect(() => {
         totalRounds: DRAFT_SIZE_LEAGUE, 
         turnSeconds: TURN_SECONDS,
         draftPlan: null,
+        draftOrderMode: "random",
+        draftRoundMode: "snake",
+        customDraftOrder: [],
         started: false,
         startAt: null,
         turnDeadlineAt: null,
@@ -957,6 +1174,7 @@ useEffect(() => {
     if (!user || !room) return;
     if (room.hostUid !== user.uid) return alert("Only host can schedule");
     if (!validateManagerCountForDraftStart()) return;
+    if (!validateDraftOrderForStart()) return;
     if (!poolReady) {
       return alert("Pick + lock a competition and load players before scheduling the draft.");
     }
@@ -998,6 +1216,7 @@ useEffect(() => {
     if (room.hostUid !== user.uid) return alert("Only host can start");
 
     if (!validateManagerCountForDraftStart()) return;
+    if (!validateDraftOrderForStart()) return;
 
     if (!poolReady) {
       return alert("Pick + lock a competition and load players before starting the draft.");
@@ -1079,7 +1298,7 @@ useEffect(() => {
 
   const isPlayerDrafted = (playerId) => draftedByPlayerId.has(String(playerId));
 
-  // Who is on the clock (snake)
+  // Who is on the clock
   const currentPicker = useMemo(() => {
     if (!room) return null;
     const order = (Array.isArray(room.draftOrder) && room.draftOrder.length)
@@ -1091,10 +1310,7 @@ useEffect(() => {
     const totalRounds = room.totalRounds ?? DRAFT_SIZE_LEAGUE;
     const maxPicks = totalRounds * n;
     if (ti >= maxPicks) return null;
-    const roundIndex = Math.floor(ti / n);
-    const withinRound = ti % n;
-    const orderIndex = (roundIndex % 2 === 0) ? withinRound : (n - 1 - withinRound);
-    return order[orderIndex] || null;
+    return getPickerFromOrder(order, ti, getDraftRoundMode(room));
   }, [room]);
 
   //Next picker 
@@ -1112,10 +1328,7 @@ useEffect(() => {
     if (ti + 1 >= maxPicks) return null;
 
     const nextTi = ti + 1;
-    const roundIndex = Math.floor(nextTi / n);
-    const withinRound = nextTi % n;
-    const orderIndex = (roundIndex % 2 === 0) ? withinRound : (n - 1 - withinRound);
-    return order[orderIndex] || null;
+    return getPickerFromOrder(order, nextTi, getDraftRoundMode(room));
   }, [room]);
 
 
@@ -1576,7 +1789,6 @@ useEffect(() => {
   const nextPhoto = nextPicker ? profileOf(memberUidOf(nextPicker))?.photoURL : "";
 
   //Draft Name 
-  const isHost = user?.uid && room?.hostUid === user.uid;
   const poolReady = room?.status === "ready_to_draft" && (poolPlayers?.length || 0) > 0;
   const canStartDraft = poolReady && canStartByManagerCount;
   const hostControlsHelpText =
@@ -1803,14 +2015,204 @@ useEffect(() => {
                     )}
                   </div>
 
-                  <div className="mt-4 rounded border border-line/60 bg-pitch/70 px-3 py-3">
-                    <h3 className="font-semibold mb-1">🎲 Draft Order</h3>
-                    <p className="text-sm opacity-90">
-                      Draft order will be randomly generated when the draft starts. Managers will pick in a "snake" order: 1→10, then 10→1, then 1→10, etc.
-                    </p>
-                    <p className="text-xs opacity-75 mt-1">
-                      Once the draft begins, the official order will appear and stay locked.
-                    </p>
+                  <div className="draftOrderSettingsCard">
+                    <div className="draftOrderSettingsHeader">
+                      <div>
+                        <h3>🎲 Draft Order Settings</h3>
+                        <p>
+                          Order Type:{" "}
+                          <b>{draftOrderModeInput === "custom" ? "Custom Order" : "Random Order"}</b>
+                          {" · "}
+                          Round Style:{" "}
+                          <b>{draftRoundModeInput === "fixed" ? "Fixed" : "Snake"}</b>
+                        </p>
+                      </div>
+                      {draftOrderModeInput === "custom" ? (
+                        <span className="draftOrderModePill">Custom</span>
+                      ) : (
+                        <span className="draftOrderModePill">Random</span>
+                      )}
+                    </div>
+
+                    {isHost && !room.started ? (
+                      <>
+                        <div className="draftOrderSettingsGrid">
+                          <div>
+                            <div className="draftOrderSettingsLabel">Order type</div>
+                            <div className="draftOrderSettingTabs">
+                              <button
+                                type="button"
+                                className={`draftOrderSettingButton ${
+                                  draftOrderModeInput === "random"
+                                    ? "draftOrderSettingButtonActive"
+                                    : ""
+                                }`}
+                                onClick={() => setDraftOrderModeInput("random")}
+                              >
+                                Random Order
+                              </button>
+                              <button
+                                type="button"
+                                className={`draftOrderSettingButton ${
+                                  draftOrderModeInput === "custom"
+                                    ? "draftOrderSettingButtonActive"
+                                    : ""
+                                }`}
+                                onClick={() => {
+                                  setDraftOrderModeInput("custom");
+                                  setCustomDraftOrderInput((prev) => {
+                                    const managerSet = new Set(currentManagerUids);
+                                    const kept = prev.filter((uid) => managerSet.has(uid));
+                                    const missing = currentManagerUids.filter(
+                                      (uid) => !kept.includes(uid)
+                                    );
+                                    return [...kept, ...missing];
+                                  });
+                                }}
+                              >
+                                Custom Order
+                              </button>
+                            </div>
+                          </div>
+
+                          <div>
+                            <div className="draftOrderSettingsLabel">Round style</div>
+                            <div className="draftOrderSettingTabs">
+                              <button
+                                type="button"
+                                className={`draftOrderSettingButton ${
+                                  draftRoundModeInput === "snake"
+                                    ? "draftOrderSettingButtonActive"
+                                    : ""
+                                }`}
+                                onClick={() => setDraftRoundModeInput("snake")}
+                              >
+                                Snake
+                              </button>
+                              <button
+                                type="button"
+                                className={`draftOrderSettingButton ${
+                                  draftRoundModeInput === "fixed"
+                                    ? "draftOrderSettingButtonActive"
+                                    : ""
+                                }`}
+                                onClick={() => setDraftRoundModeInput("fixed")}
+                              >
+                                Fixed
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+
+                        {draftOrderModeInput === "custom" ? (
+                          <div className="customDraftOrderList">
+                            {customDraftOrderInput.map((uid, idx) => {
+                              const name = displayNameForMember(uid);
+                              const p = profileOf(uid);
+                              return (
+                                <div className="customDraftOrderRow" key={uid}>
+                                  <div className="customDraftOrderIdentity">
+                                    <span className="customDraftOrderRank">#{idx + 1}</span>
+                                    <Avatar className="h-9 w-9 border border-line/60">
+                                      <AvatarImage src={p.photoURL || undefined} alt={name} />
+                                      <AvatarFallback className="bg-line text-pitch font-bold">
+                                        {(name || "M").slice(0, 2).toUpperCase()}
+                                      </AvatarFallback>
+                                    </Avatar>
+                                    <span>{name}</span>
+                                    {uid === room.hostUid ? (
+                                      <Badge className="bg-goal text-ball">Host</Badge>
+                                    ) : null}
+                                  </div>
+                                  <div className="customDraftOrderActions">
+                                    <button
+                                      type="button"
+                                      onClick={() => moveCustomDraftManager(idx, -1)}
+                                      disabled={idx === 0}
+                                    >
+                                      Move Up
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => moveCustomDraftManager(idx, 1)}
+                                      disabled={idx === customDraftOrderInput.length - 1}
+                                    >
+                                      Move Down
+                                    </button>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        ) : (
+                          <p className="draftOrderPreview">
+                            Order will be randomly generated when the draft starts.
+                          </p>
+                        )}
+
+                        <div className="draftOrderPreview">
+                          {draftRoundModeInput === "fixed"
+                            ? "Every round uses the same order: 1 → 10."
+                            : "Rounds alternate: 1 → 10, then 10 → 1."}
+                        </div>
+
+                        {draftOrderManagerChanged || customDraftOrderMessage ? (
+                          <div className="draftOrderWarning">
+                            {draftOrderManagerChanged
+                              ? "Manager list changed. Save the order again before starting."
+                              : customDraftOrderMessage}
+                          </div>
+                        ) : null}
+
+                        <div className="draftOrderSaveRow">
+                          <button
+                            type="button"
+                            className="draftOrderSaveButton"
+                            onClick={saveDraftOrderSettings}
+                            disabled={
+                              savingDraftOrderSettings ||
+                              !draftOrderSettingsChanged ||
+                              (draftOrderModeInput === "custom" &&
+                                !draftCustomOrderValidation.ok)
+                            }
+                          >
+                            {savingDraftOrderSettings ? "Saving..." : "Save Draft Order"}
+                          </button>
+                          <span>
+                            {draftOrderSettingsChanged
+                              ? "Save before starting."
+                              : "Settings saved."}
+                          </span>
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        {getDraftOrderMode(room) === "custom" ? (
+                          <ol className="customDraftOrderReadOnly">
+                            {savedCustomDraftOrder.map((uid, idx) => (
+                              <li key={uid}>
+                                #{idx + 1} — {displayNameForMember(uid)}
+                                {uid === room.hostUid ? " (Host)" : ""}
+                              </li>
+                            ))}
+                          </ol>
+                        ) : (
+                          <p className="draftOrderPreview">
+                            Order will be randomly generated when the draft starts.
+                          </p>
+                        )}
+                        <p className="draftOrderPreview">
+                          {getDraftRoundMode(room) === "fixed"
+                            ? "Every round uses the same order: 1 → 10."
+                            : "Rounds alternate: 1 → 10, then 10 → 1."}
+                        </p>
+                        {!isHost && !room.started ? (
+                          <p className="draftOrderPreview">
+                            Host controls the draft order before the draft starts.
+                          </p>
+                        ) : null}
+                      </>
+                    )}
                   </div>
                 </CardContent>
               </Card>
@@ -2012,7 +2414,9 @@ useEffect(() => {
 
               {/* Draft Order + Picks */}
               <div className="rounded-2xl border border-slate-200 p-4 bg-white shadow-sm md:col-span-1">
-                <div className="font-semibold mb-2">Draft Order (Frozen)</div>
+                <div className="font-semibold mb-2">
+                  Draft Order (Frozen · {getDraftRoundMode(room) === "fixed" ? "Fixed" : "Snake"})
+                </div>
                 <ol className="text-sm space-y-1 list-decimal list-inside">
                   {(room.draftOrder || []).map((m, idx) => {
                     const memberUid = memberUidOf(m);
@@ -2037,7 +2441,11 @@ useEffect(() => {
                     This Round Order (Round {displayCurrentRound})
                   </div>
                   <ol className="text-sm space-y-1 list-decimal list-inside">
-                    {roundOrder(room.draftOrder || room.members || [], displayRoundOrderIndex)
+                    {roundOrder(
+                      room.draftOrder || room.members || [],
+                      displayRoundOrderIndex,
+                      getDraftRoundMode(room)
+                    )
                       .map((m, idx) => {
                         const memberUid = memberUidOf(m);
                         const isCurrent = currentPickerUid === memberUid;

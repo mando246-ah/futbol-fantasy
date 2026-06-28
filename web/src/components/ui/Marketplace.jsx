@@ -288,6 +288,30 @@ const AcquireSearch = React.memo(function AcquireSearch({
   );
 });
 
+//Recurring schedule day options
+const MARKET_RECURRING_TZ = "America/Los_Angeles";
+const MARKET_RECURRING_MAX_DURATION_MS =
+  (22 * 60 * 60 * 1000) + (59 * 60 * 1000);
+
+const MARKET_WEEKDAYS = [
+  { value: 1, label: "Mon" },
+  { value: 2, label: "Tue" },
+  { value: 3, label: "Wed" },
+  { value: 4, label: "Thu" },
+  { value: 5, label: "Fri" },
+  { value: 6, label: "Sat" },
+  { value: 0, label: "Sun" },
+];
+
+function toggleWeekday(list, dayValue) {
+  const day = Number(dayValue);
+  const current = Array.isArray(list) ? list.map(Number) : [];
+  if (current.includes(day)) {
+    return current.filter((d) => d !== day);
+  }
+  return [...current, day].sort((a, b) => a - b);
+}
+
 
 export default function Marketplace({
   roomId,
@@ -302,8 +326,11 @@ export default function Marketplace({
   const [fallbackPicks, setFallbackPicks] = useState([]);
   const [choiceA, setChoiceA] = useState({ wantId: "", swapOutId: "" });
   const [choiceB, setChoiceB] = useState({ wantId: "", swapOutId: "" });
-  const [dur, setDur] = useState({ days: 0, hours: 0, minutes: 10 });
+  const [scheduleMode, setScheduleMode] = useState("recurring"); // "recurring" | "oneTime"
+  const [dur, setDur] = useState({ days: 0, hours: 0, minutes: 15 });
   const [startISO, setStartISO] = useState("");
+  const [recurringDays, setRecurringDays] = useState([]);
+  const [recurringTime, setRecurringTime] = useState("");
   const [isEditing, setIsEditing] = useState(true); // default: editable
   const [saveStatus, setSaveStatus] = useState(""); 
   const [marketError, setMarketError] = useState("");
@@ -578,7 +605,17 @@ export default function Marketplace({
   }, [market?.status, market?.closesAt, now]);
 
 
-  const durationMs = (Number(dur.days||0)*86400000) + (Number(dur.hours||0)*3600000) + (Number(dur.minutes||0)*60000);
+  const oneTimeDurationMs =
+    (Number(dur.days || 0) * 86400000) +
+    (Number(dur.hours || 0) * 3600000) +
+    (Number(dur.minutes || 0) * 60000);
+
+  const recurringDurationMs =
+    (Number(dur.hours || 0) * 3600000) +
+    (Number(dur.minutes || 0) * 60000);
+
+  const durationMs =
+    scheduleMode === "recurring" ? recurringDurationMs : oneTimeDurationMs;
   const scheduledAtMs = useMemo(() => toMillis(market?.scheduledAt), [market?.scheduledAt]);
 
 
@@ -667,25 +704,56 @@ function clearChoice(label, state, setState) {
   }
 
 
-     async function onSchedule() {
-    if (!durationMs || !startISO) return alert("Start time + duration required.");
+  async function onSchedule() {
+    const isRecurring = scheduleMode === "recurring";
 
-    const whenMillis = new Date(startISO).getTime();
-    if (!Number.isFinite(whenMillis)) return alert("Invalid start time.");
+    if (!durationMs) {
+      return alert("Duration required.");
+    }
+
+    if (isRecurring) {
+      if (!Array.isArray(recurringDays) || recurringDays.length === 0) {
+        return alert("Pick at least one recurring market day.");
+      }
+
+      if (!recurringTime) {
+        return alert("Pick a recurring market time.");
+      }
+
+      if (durationMs > MARKET_RECURRING_MAX_DURATION_MS) {
+        return alert("Recurring market duration cannot be longer than 22 hours and 59 minutes.");
+      }
+    } else if (!startISO) {
+      return alert("Start time + duration required.");
+    }
+
+    const whenMillis = isRecurring ? null : new Date(startISO).getTime();
+    if (!isRecurring && !Number.isFinite(whenMillis)) {
+      return alert("Invalid start time.");
+    }
 
     try {
       setMarketError("");
-      devLog("Scheduling market debug:", {
-        startISO,
-        whenMillis,
-        whenLocal: new Date(whenMillis).toString(),
-        durationMs,
-      });
-      const res = await fnScheduleMarket({
-        roomId,
-        scheduledAtMs: whenMillis,
-        durationMs,
-      });
+
+      const payload = isRecurring
+        ? {
+            roomId,
+            scheduleMode: "recurring",
+            durationMs,
+            recurringDays,
+            recurringTime,
+            
+          }
+        : {
+            roomId,
+            scheduleMode: "oneTime",
+            scheduledAtMs: whenMillis,
+            durationMs,
+          };
+
+      devLog("Scheduling market debug:", payload);
+
+      const res = await fnScheduleMarket(payload);
 
       devLog("scheduleMarket ok:", res?.data ?? res);
     } catch (e) {
@@ -693,6 +761,7 @@ function clearChoice(label, state, setState) {
         e,
         "Could not schedule the market. Please refresh and try again."
       );
+
       await reportClientError({
         roomId,
         area: "Marketplace",
@@ -700,10 +769,14 @@ function clearChoice(label, state, setState) {
         error: e,
         userMessage,
         extra: {
+          scheduleMode,
           scheduledAtMs: whenMillis,
           durationMs,
+          recurringDays,
+          recurringTime,
         },
       });
+
       devError("[Marketplace] scheduleMarket failed", e);
       setMarketError(userMessage);
       alert(userMessage);
@@ -739,55 +812,139 @@ function clearChoice(label, state, setState) {
 
       {/* Host controls */}
       {isHost && (
-        <div className="marketHostGrid">
-          <div className="col-span-1">
-            <label className="text-xs font-semibold block mb-1">Duration</label>
-            <div className="marketDurationRow">
-              <div className="marketDurationItem">
-                <input
-                  className="marketNum"
-                  type="number"
-                  min="0"
-                  value={dur.days}
-                  onChange={(e) => setDur({ ...dur, days: e.target.value })}
-                />
-                <span className="marketUnit">days</span>
+        <div className="marketHostPanel">
+          <div className="marketScheduleModeRow">
+            <button
+              type="button"
+              className={`marketScheduleModeBtn ${
+                scheduleMode === "recurring" ? "marketScheduleModeBtnActive" : ""
+              }`}
+              onClick={() => setScheduleMode("recurring")}
+            >
+              Recurring
+            </button>
+
+            <button
+              type="button"
+              className={`marketScheduleModeBtn ${
+                scheduleMode === "oneTime" ? "marketScheduleModeBtnActive" : ""
+              }`}
+              onClick={() => setScheduleMode("oneTime")}
+            >
+              One time
+            </button>
+          </div>
+
+          <div className="marketHostGrid">
+            <div className="col-span-1">
+              <label className="text-xs font-semibold block mb-1">
+                Duration
+              </label>
+
+              <div className="marketDurationRow">
+                {scheduleMode === "oneTime" && (
+                  <div className="marketDurationItem">
+                    <input
+                      className="marketNum"
+                      type="number"
+                      min="0"
+                      value={dur.days}
+                      onChange={(e) => setDur({ ...dur, days: e.target.value })}
+                    />
+                    <span className="marketUnit">days</span>
+                  </div>
+                )}
+
+                <div className="marketDurationItem">
+                  <input
+                    className="marketNum"
+                    type="number"
+                    min="0"
+                    max={scheduleMode === "recurring" ? "22" : undefined}
+                    value={dur.hours}
+                    onChange={(e) => setDur({ ...dur, hours: e.target.value })}
+                  />
+                  <span className="marketUnit">hrs</span>
+                </div>
+
+                <div className="marketDurationItem">
+                  <input
+                    className="marketNum"
+                    type="number"
+                    min="0"
+                    max="59"
+                    value={dur.minutes}
+                    onChange={(e) => setDur({ ...dur, minutes: e.target.value })}
+                  />
+                  <span className="marketUnit">min</span>
+                </div>
               </div>
 
-              <div className="marketDurationItem">
-                <input
-                  className="marketNum"
-                  type="number"
-                  min="0"
-                  value={dur.hours}
-                  onChange={(e) => setDur({ ...dur, hours: e.target.value })}
-                />
-                <span className="marketUnit">hrs</span>
-              </div>
-
-              <div className="marketDurationItem">
-                <input
-                  className="marketNum"
-                  type="number"
-                  min="0"
-                  value={dur.minutes}
-                  onChange={(e) => setDur({ ...dur, minutes: e.target.value })}
-                />
-                <span className="marketUnit">min</span>
-              </div>
+              {scheduleMode === "recurring" && (
+                <div className="marketHint">
+                  Recurring markets can stay open up to 22h 59m.
+                </div>
+              )}
             </div>
 
-          </div>
-          <div className="col-span-1">
-            <label className="text-xs font-semibold block mb-1">Schedule start</label>
-            <input className="marketInput marketInputDate" type="datetime-local" value={startISO} onChange={e=>setStartISO(e.target.value)} />
-          </div>
-          <div className="marketHostActions">
-            <button className="marketBtn marketBtnAmber" onClick={onSchedule}>Schedule</button>
-            {/*<button className="marketBtn marketBtnGreen" onClick={onStartNow}>Open Now</button>
-            {market?.status !== "resolved" ? (
-              <button className="marketBtn marketBtnBlue" onClick={onResolve}>Resolve Now</button>
-            ) : null} */}
+            {scheduleMode === "oneTime" ? (
+              <div className="col-span-1">
+                <label className="text-xs font-semibold block mb-1">
+                  Schedule start
+                </label>
+                <input
+                  className="marketInput marketInputDate"
+                  type="datetime-local"
+                  value={startISO}
+                  onChange={(e) => setStartISO(e.target.value)}
+                />
+              </div>
+            ) : (
+              <div className="col-span-1">
+                <label className="text-xs font-semibold block mb-1">
+                  Recurring days
+                </label>
+
+                <div className="marketWeekdayGrid">
+                  {MARKET_WEEKDAYS.map((day) => (
+                    <button
+                      key={day.value}
+                      type="button"
+                      className={`marketWeekdayBtn ${
+                        recurringDays.includes(day.value)
+                          ? "marketWeekdayBtnActive"
+                          : ""
+                      }`}
+                      onClick={() =>
+                        setRecurringDays((prev) => toggleWeekday(prev, day.value))
+                      }
+                    >
+                      {day.label}
+                    </button>
+                  ))}
+                </div>
+
+                <label className="text-xs font-semibold block mt-3 mb-1">
+                  Open time
+                </label>
+                <input
+                  className="marketInput"
+                  type="time"
+                  value={recurringTime}
+                  onChange={(e) => setRecurringTime(e.target.value)}
+                />
+
+                <div className="marketHint">
+                  Uses this room&apos;s timezone. Markets will open at this time on the selected days.
+                </div>
+              </div>
+            )}
+
+            <div className="marketHostActions">
+              <button className="marketBtn marketBtnAmber" onClick={onSchedule}>
+                Schedule
+              </button>
+            </div>
           </div>
         </div>
       )}

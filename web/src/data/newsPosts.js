@@ -1,5 +1,45 @@
 const newsPosts = [
   {
+  id: "marketplace-recurring-schedules-custom-draft-order-and-knockouts",
+  date: "2026-06-14",
+  tag: "Draft & Marketplace",
+  title: "Recurring Marketplace, Custom Draft Order, Turn Sounds, and Knockout Drafts",
+  summary:
+  "Hosts can now set recurring Marketplace schedules, customize draft order, and managers can enable a sound cue for their draft turn. World Cup Knockout drafts are also available.",
+  body: [
+  "We added new Marketplace scheduling options to make room management easier for hosts.",
+  "Hosts can now choose between a one-time Marketplace schedule or a recurring schedule. With recurring schedules, hosts can pick the days and time when the Marketplace should open automatically, so they do not have to keep coming back to schedule it manually.",
+  "When a host reschedules the Marketplace, the newest schedule now replaces the previous one. Pending Marketplace reminders are also reset so old schedule reminders do not continue after a new schedule is saved.",
+  "We also added more control to the draft setup. Hosts can now choose between a random draft order or a custom draft order before the draft starts.",
+  "Hosts can also choose the draft round style. Snake Draft reverses the order every round, while Fixed Order keeps the same order every round.",
+  "Managers can now enable a sound cue for their draft turn. This can help users know when they are on the clock, especially during longer drafts or when they are checking another tab.",
+  "Player search has also been improved with more nicknames and name variations, making it easier to find players during the draft.",
+  "World Cup Knockout drafts are now available, so managers can create a new room and draft specifically for the knockout stage.",
+  ],
+  callout: {
+    title: "💚 Community Update",
+    text:
+      "Thank you to everyone who has been testing rooms, reporting issues, and sending feedback. Many of these improvements came directly from your suggestions, and we’ll keep improving Fútbol Fantasy throughout the World Cup.",
+  },
+  bullets: [
+  "Hosts can now schedule the Marketplace as one-time or recurring.",
+  "Recurring Marketplace schedules can be set by selected days and time.",
+  "Recurring Marketplace mode starts with no days selected until the host chooses them.",
+  "Default Marketplace duration is now 15 minutes.",
+  "Recurring Marketplace duration is limited to 22 hours and 59 minutes.",
+  "Rescheduling the Marketplace now replaces the previous schedule.",
+  "Pending Marketplace reminder emails are reset when a new schedule is saved.",
+  "Hosts can now choose Random Draft Order or Custom Draft Order.",
+  "Hosts can now choose Snake Draft or Fixed Draft order.",
+  "Managers can enable a sound cue when it becomes their turn to draft.",
+  "More player nicknames and name variations were added to draft search.",
+  "World Cup Knockout drafts are now available.",
+  ],
+  isNew: true,
+  },
+
+
+  {
   id: "field-view-player-details-and-update-alerts",
   date: "2026-06-14",
   tag: "Tournament View",
@@ -27,7 +67,7 @@ const newsPosts = [
     "Daily Results now appear inside Field View.",
     "Users can now see an update alert when a new site version is available.",
   ],
-  isNew: true,
+  isNew: false,
   },
 
   {

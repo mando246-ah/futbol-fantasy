@@ -608,68 +608,25 @@ function getDraftTurnMs(room = {}) {
 }
 
 
-export async function callMaybeStartDraft({ roomId }) {
-  const roomRef = doc(db, "rooms", roomId);
-  await runTransaction(db, async (tx) => {
-    const snap = await tx.get(roomRef);
-    if (!snap.exists()) throw new Error("Room not found");
-    const room = snap.data();
-    if (room.started) return;
-
-    const now = Date.now();
-    const startAtMillis =
-      typeof room.startAt === "number"
-        ? room.startAt
-        : room.startAt?.toDate
-        ? room.startAt.toDate().getTime()
-        : null;
-
-    if (startAtMillis && now >= startAtMillis) {
-      const members = Array.isArray(room.members) ? room.members : [];
-      assertDraftManagerCount(room);
-      const draftOrder = room.draftOrder?.length ? room.draftOrder : shuffleArray(members);
-      const ti = Number.isFinite(room.turnIndex) ? room.turnIndex : 0;
-      tx.update(roomRef, {
-        started: true,
-        startedAt: serverTimestamp(),
-        draftOrder,
-        turnIndex: ti,
-        turnSeconds: DRAFT_TURN_SECONDS,
-        turnDeadlineAt: now + DRAFT_TURN_MS,
-        updatedAt: serverTimestamp(),
-      });
-    }
-  });
-  return { ok: true };
+export async function callSetDraftOrderSettings(payload) {
+  requireUser();
+  const callable = httpsCallable(functions, "setDraftOrderSettings");
+  const result = await callable(payload || {});
+  return result?.data || { ok: true };
 }
 
-export async function callStartDraftNow({ roomId }) {
-  const user = requireUser();
-  const roomRef = doc(db, "rooms", roomId);
-  await runTransaction(db, async (tx) => {
-    const snap = await tx.get(roomRef);
-    if (!snap.exists()) throw new Error("Room not found");
-    const room = snap.data();
-    if (room.started) return;
-    if (room.hostUid !== user.uid) throw new Error("Only host can start");
+export async function callMaybeStartDraft({ roomId, turnSeconds } = {}) {
+  requireUser();
+  const callable = httpsCallable(functions, "maybeStartDraft");
+  const result = await callable({ roomId, turnSeconds });
+  return result?.data || { ok: true };
+}
 
-    const members = Array.isArray(room.members) ? room.members : [];
-    assertDraftManagerCount(room);
-
-    const draftOrder = room.draftOrder?.length ? room.draftOrder : shuffleArray(members);
-    const ti = Number.isFinite(room.turnIndex) ? room.turnIndex : 0;
-    const now = Date.now();
-    tx.update(roomRef, {
-      started: true,
-      startedAt: serverTimestamp(),
-      draftOrder,
-      turnIndex: ti,
-      turnSeconds: DRAFT_TURN_SECONDS,
-      turnDeadlineAt: now + DRAFT_TURN_MS,
-      updatedAt: serverTimestamp(),
-    });
-  });
-  return { ok: true };
+export async function callStartDraftNow({ roomId, turnSeconds } = {}) {
+  requireUser();
+  const callable = httpsCallable(functions, "startDraftNow");
+  const result = await callable({ roomId, turnSeconds });
+  return result?.data || { ok: true };
 }
 
 function normalizePos(pos) {
@@ -688,168 +645,26 @@ export async function callMakePick({
   teamName,
   nationality,
 }) {
-  const user = requireUser();
-
-  const allowedPositions = new Set(["ATT", "MID", "DEF", "GK"]);
-  const pos = normalizePos(position);
-  if (!allowedPositions.has(pos)) throw new Error("Position must be one of ATT, MID, DEF, GK");
-
-  const pid = String(playerId);
-  const roomRef = doc(db, "rooms", roomId);
-  const pickRef = doc(db, "rooms", roomId, "picks", pid);
-
-  await runTransaction(db, async (tx) => {
-    const roomSnap = await tx.get(roomRef);
-    if (!roomSnap.exists()) throw new Error("Room not found");
-    const room = roomSnap.data();
-    if (!room.started) throw new Error("Draft has not started");
-
-    const order =
-      (Array.isArray(room.draftOrder) && room.draftOrder.length)
-        ? room.draftOrder
-        : (Array.isArray(room.members) ? room.members : []);
-
-    const n = order.length;
-    if (n === 0) throw new Error("Room has no members");
-
-    const totalRounds = room.totalRounds ?? 9;
-    const maxPicks = totalRounds * n;
-    const turnIndex = Number.isFinite(room.turnIndex) ? room.turnIndex : 0;
-    if (turnIndex >= maxPicks) throw new Error("All rounds completed");
-
-    const roundIndex = Math.floor(turnIndex / n);
-    const withinRound = turnIndex % n;
-    const orderIndex = (roundIndex % 2 === 0) ? withinRound : (n - 1 - withinRound);
-    const picker = order[orderIndex];
-    if (!picker?.uid) throw new Error("Invalid draft order");
-    if (picker.uid !== user.uid) throw new Error("Not your turn");
-
-    const existingPick = await tx.get(pickRef);
-    if (existingPick.exists()) throw new Error("Player already picked");
-
-    const pickerName =
-      (await getDisplayNameFallback(tx, user.uid)) ||
-      user.displayName ||
-      user.email ||
-      "Manager";
-
-    const now = Date.now();
-    const nextTurnIndex = turnIndex + 1;
-    const nextDeadline = (nextTurnIndex < maxPicks) ? now + getDraftTurnMs(room) : null;
-
-    tx.set(pickRef, {
-      playerId: pid,
-      playerName: String(playerName || playerId),
-      position: pos,
-
-      uid: picker.uid,
-      displayName: pickerName,
-
-      turn: turnIndex + 1,
-      round: roundIndex + 1,
-      createdAt: serverTimestamp(),
-
-      ...(apiPlayerId != null ? { apiPlayerId: Number(apiPlayerId) } : {}),
-      ...(apiTeamId != null ? { apiTeamId: Number(apiTeamId) } : {}),
-      ...(teamName ? { teamName: String(teamName) } : {}),
-      ...(nationality ? { nationality: String(nationality) } : {}),
-    });
-
-    tx.update(roomRef, {
-      turnIndex: nextTurnIndex,
-      turnDeadlineAt: nextDeadline,
-      updatedAt: serverTimestamp(),
-    });
+  requireUser();
+  const callable = httpsCallable(functions, "makePick");
+  const result = await callable({
+    roomId,
+    playerId,
+    position,
+    playerName,
+    apiPlayerId,
+    apiTeamId,
+    teamName,
+    nationality,
   });
-
-  return { ok: true };
+  return result?.data || { ok: true };
 }
 
 export async function callAutoPick({ roomId, candidates }) {
-  const user = requireUser();
-  const roomRef = doc(db, "rooms", roomId);
-
-  await runTransaction(db, async (tx) => {
-    const roomSnap = await tx.get(roomRef);
-    if (!roomSnap.exists()) throw new Error("Room not found");
-    const room = roomSnap.data();
-
-    if (!room.started) throw new Error("Draft not started");
-    if (room.hostUid !== user.uid) throw new Error("Only host can auto-pick");
-
-    const order = (Array.isArray(room.draftOrder) && room.draftOrder.length)
-      ? room.draftOrder
-      : (Array.isArray(room.members) ? room.members : []);
-    const n = order.length;
-    if (n === 0) throw new Error("Room has no members");
-
-    const totalRounds = room.totalRounds ?? 9;
-    const maxPicks = totalRounds * n;
-    const turnIndex = Number.isFinite(room.turnIndex) ? room.turnIndex : 0;
-    if (turnIndex >= maxPicks) throw new Error("Draft complete");
-
-    const deadline = typeof room.turnDeadlineAt === "number" ? room.turnDeadlineAt : null;
-    if (!deadline || Date.now() < deadline) throw new Error("Deadline not reached");
-
-    const roundIndex = Math.floor(turnIndex / n);
-    const withinRound = turnIndex % n;
-    const orderIndex = (roundIndex % 2 === 0) ? withinRound : (n - 1 - withinRound);
-    const picker = order[orderIndex];
-    if (!picker?.uid) throw new Error("Invalid draft order");
-
-    const pool = Array.isArray(candidates) ? candidates : [];
-    if (!pool.length) throw new Error("No candidates available for auto-pick");
-
-    let choice = null;
-    for (let safety = 0; safety < 50 && !choice; safety++) {
-      const tryOne = pool[Math.floor(Math.random() * pool.length)];
-      if (!tryOne) continue;
-      const pid = String(tryOne.id);
-      const pRef = doc(db, "rooms", roomId, "picks", pid);
-      const exists = await tx.get(pRef);
-      if (!exists.exists()) choice = tryOne;
-    }
-    if (!choice) throw new Error("Could not find a free player to auto-pick");
-
-    const pid = String(choice.id);
-    const allowed = new Set(["ATT","MID","DEF","GK"]);
-    const pos = normalizePos(choice.position);
-
-    const pickRef = doc(db, "rooms", roomId, "picks", pid);
-
-    const pickerName =
-      (await getDisplayNameFallback(tx, picker.uid)) ||
-      picker.displayName ||
-      "Manager";
-
-    const now = Date.now();
-    const nextTurnIndex = turnIndex + 1;
-    const nextDeadline = (nextTurnIndex < maxPicks) ? now + getDraftTurnMs(room) : null;
-
-    tx.set(pickRef, {
-      playerId: pid,
-      playerName: choice.name || pid,
-      position: pos,
-      uid: picker.uid,
-      displayName: pickerName,
-      turn: turnIndex + 1,
-      round: roundIndex + 1,
-      createdAt: serverTimestamp(),
-
-      ...(choice.apiPlayerId != null ? { apiPlayerId: String(choice.apiPlayerId) } : {}),
-      ...(choice.apiTeamId != null ? { apiTeamId: String(choice.apiTeamId) } : {}),
-      ...(choice.teamName ? { teamName: String(choice.teamName) } : {}),
-      ...(choice.nationality ? { nationality: String(choice.nationality) } : {}),
-    });
-
-    tx.update(roomRef, {
-      turnIndex: nextTurnIndex,
-      turnDeadlineAt: nextDeadline,
-      updatedAt: serverTimestamp(),
-    });
-  });
-
-  return { ok: true };
+  requireUser();
+  const callable = httpsCallable(functions, "autoPick");
+  const result = await callable({ roomId, candidates });
+  return result?.data || { ok: true };
 }
 
 // Save interest (up to two choices), each with a swapOut from your roster

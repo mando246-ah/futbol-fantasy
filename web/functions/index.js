@@ -814,6 +814,560 @@ function isHost(room, uid) {
   return !!room?.hostUid && room.hostUid === uid;
 }
 
+const DEFAULT_DRAFT_TURN_SECONDS = 60;
+
+function draftMemberUidOf(member) {
+  return String(
+    typeof member === "string"
+      ? member
+      : member?.uid ?? member?.userId ?? member?.id ?? ""
+  ).trim();
+}
+
+function getDraftRoundMode(room = {}) {
+  return room?.draftRoundMode === "fixed" ? "fixed" : "snake";
+}
+
+function getDraftOrderMode(room = {}) {
+  return room?.draftOrderMode === "custom" ? "custom" : "random";
+}
+
+function getDraftTurnSecondsValue(value, fallback = DEFAULT_DRAFT_TURN_SECONDS) {
+  const n = Number(value);
+  const fallbackNumber = Number(fallback);
+  const safeFallback =
+    Number.isFinite(fallbackNumber) && fallbackNumber > 0
+      ? fallbackNumber
+      : DEFAULT_DRAFT_TURN_SECONDS;
+  const safe = Number.isFinite(n) && n > 0 ? n : safeFallback;
+  return Math.max(10, Math.min(300, safe));
+}
+
+function getDraftTotalRounds(room = {}) {
+  const n = Number(room?.totalRounds);
+  return Number.isFinite(n) && n > 0 ? n : 16;
+}
+
+function getPickerUidForTurn(baseOrder, turnIndex, roundMode = "snake") {
+  const order = (Array.isArray(baseOrder) ? baseOrder : [])
+    .map(draftMemberUidOf)
+    .filter(Boolean);
+  const n = order.length;
+  if (!n) return null;
+
+  const ti = Math.max(0, Math.floor(Number(turnIndex || 0)));
+  const roundIndex = Math.floor(ti / n);
+  const withinRound = ti % n;
+  if (roundMode === "fixed") return order[withinRound] || null;
+
+  const orderIndex = roundIndex % 2 === 0 ? withinRound : n - 1 - withinRound;
+  return order[orderIndex] || null;
+}
+
+function shuffleDraftOrder(memberUids = []) {
+  const arr = Array.from(new Set((memberUids || []).map(String).filter(Boolean)));
+  for (let i = arr.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+function isDraftCompleteRoom(room = {}, memberUids = []) {
+  const status = String(room?.status || "").toLowerCase();
+  const draftStatus = String(room?.draftStatus || "").toLowerCase();
+  if (
+    room?.draftComplete === true ||
+    room?.draftCompleted === true ||
+    status === "draft_complete" ||
+    draftStatus === "complete"
+  ) {
+    return true;
+  }
+
+  const orderCount =
+    (Array.isArray(room?.draftOrder) && room.draftOrder.length) ||
+    (Array.isArray(memberUids) && memberUids.length) ||
+    0;
+  const maxPicks = orderCount * getDraftTotalRounds(room);
+  const turnIndex = Number(room?.turnIndex || 0);
+  return maxPicks > 0 && Number.isFinite(turnIndex) && turnIndex >= maxPicks;
+}
+
+function validateCustomDraftOrderForMembers(customDraftOrder, memberUids = []) {
+  const current = Array.from(new Set((memberUids || []).map(String).filter(Boolean)));
+  const currentSet = new Set(current);
+  const raw = Array.isArray(customDraftOrder) ? customDraftOrder : [];
+  const order = raw.map(String).map((uid) => uid.trim()).filter(Boolean);
+  const seen = new Set();
+  const duplicates = [];
+  const unknown = [];
+
+  for (const uid of order) {
+    if (seen.has(uid)) duplicates.push(uid);
+    seen.add(uid);
+    if (!currentSet.has(uid)) unknown.push(uid);
+  }
+
+  const missing = current.filter((uid) => !seen.has(uid));
+
+  if (
+    order.length !== current.length ||
+    duplicates.length ||
+    unknown.length ||
+    missing.length
+  ) {
+    throw new HttpsError(
+      "failed-precondition",
+      "Custom draft order must include every current manager before the draft can start.",
+      {
+        missing,
+        duplicates: Array.from(new Set(duplicates)),
+        unknown: Array.from(new Set(unknown)),
+        managerCount: current.length,
+        customOrderCount: order.length,
+      }
+    );
+  }
+
+  return order;
+}
+
+function getDraftStartAtMs(room = {}) {
+  const raw = room?.startAt ?? room?.scheduledStartAtMs ?? null;
+  if (typeof raw === "number") return raw;
+  if (raw?.toMillis) return raw.toMillis();
+  if (raw?.toDate) return raw.toDate().getTime();
+  return null;
+}
+
+function normalizeDraftPosition(pos) {
+  const p = String(pos || "").toUpperCase().trim();
+  if (["FWD", "FW", "ST", "CF", "LW", "RW"].includes(p)) return "ATT";
+  if (["ATT", "MID", "DEF", "GK"].includes(p)) return p;
+  if (["GKP"].includes(p)) return "GK";
+  if (["MF", "CM", "CDM", "CAM", "LM", "RM"].includes(p)) return "MID";
+  if (["DF", "CB", "LB", "RB", "LWB", "RWB"].includes(p)) return "DEF";
+  return p;
+}
+
+function draftMemberLabelFromRoom(room = {}, uid = "") {
+  const cleanUid = String(uid || "");
+  const members = Array.isArray(room?.members) ? room.members : [];
+  const member = members.find((m) => draftMemberUidOf(m) === cleanUid);
+  if (member && typeof member === "object") {
+    return (
+      member.displayName ||
+      member.name ||
+      member.fullName ||
+      member.email ||
+      cleanUid ||
+      "Manager"
+    );
+  }
+  return cleanUid || "Manager";
+}
+
+async function draftUserDisplayName(uid, fallback = "Manager") {
+  const cleanUid = String(uid || "");
+  if (!cleanUid) return fallback;
+  try {
+    const snap = await db.doc(`users/${cleanUid}`).get();
+    const data = snap.exists ? snap.data() || {} : {};
+    return (
+      data.displayName ||
+      data.name ||
+      data.fullName ||
+      fallback ||
+      "Manager"
+    );
+  } catch (_) {
+    return fallback || "Manager";
+  }
+}
+
+async function startDraftForRoom({
+  roomRef,
+  room,
+  turnSeconds,
+  nowMs = Date.now(),
+  requiredHostUid = null,
+}) {
+  const memberUids = await getRoomMemberUids(roomRef, room);
+  requireDraftManagerCount(memberUids, room);
+
+  const safeTurnSeconds = getDraftTurnSecondsValue(turnSeconds, room?.turnSeconds);
+  const turnDeadlineAt = nowMs + safeTurnSeconds * 1000;
+
+  return db.runTransaction(async (tx) => {
+    const freshSnap = await tx.get(roomRef);
+    if (!freshSnap.exists) {
+      throw new HttpsError("not-found", "Room not found.");
+    }
+
+    const freshRoom = freshSnap.data() || {};
+    if (requiredHostUid && !isHost(freshRoom, requiredHostUid)) {
+      throw new HttpsError("permission-denied", "Only host can start.");
+    }
+    if (freshRoom.started) {
+      return {
+        ok: true,
+        started: false,
+        alreadyStarted: true,
+        draftOrder: freshRoom.draftOrder || [],
+        draftOrderMode: getDraftOrderMode(freshRoom),
+        draftRoundMode: getDraftRoundMode(freshRoom),
+      };
+    }
+    if (isDraftCompleteRoom(freshRoom, memberUids)) {
+      throw new HttpsError("failed-precondition", "Draft is complete.");
+    }
+
+    const draftOrderMode = getDraftOrderMode(freshRoom);
+    const draftRoundMode = getDraftRoundMode(freshRoom);
+    const finalDraftOrder =
+      draftOrderMode === "custom"
+        ? validateCustomDraftOrderForMembers(freshRoom.customDraftOrder, memberUids)
+        : shuffleDraftOrder(memberUids);
+
+    tx.set(
+      roomRef,
+      {
+        started: true,
+        startedAt: admin.firestore.FieldValue.serverTimestamp(),
+        draftOrder: finalDraftOrder,
+        draftOrderMode,
+        draftRoundMode,
+        turnIndex: 0,
+        turnSeconds: safeTurnSeconds,
+        turnDeadlineAt,
+        draftOrderLockedAtMs: nowMs,
+        draftOrderLockedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    return {
+      ok: true,
+      started: true,
+      draftOrder: finalDraftOrder,
+      draftOrderMode,
+      draftRoundMode,
+      turnDeadlineAt,
+    };
+  });
+}
+
+exports.setDraftOrderSettings = onCall({ region: "us-west2" }, async (request) => {
+  const uid = request.auth?.uid;
+  if (!uid) throw new HttpsError("unauthenticated", "Sign in required.");
+
+  const roomId = String(request.data?.roomId || "").trim();
+  if (!roomId) throw new HttpsError("invalid-argument", "roomId is required.");
+
+  const draftOrderMode = String(request.data?.draftOrderMode || "random").trim();
+  const draftRoundMode = String(request.data?.draftRoundMode || "snake").trim();
+
+  if (!["random", "custom"].includes(draftOrderMode)) {
+    throw new HttpsError("invalid-argument", "draftOrderMode must be random or custom.");
+  }
+  if (!["snake", "fixed"].includes(draftRoundMode)) {
+    throw new HttpsError("invalid-argument", "draftRoundMode must be snake or fixed.");
+  }
+
+  const roomRef = db.doc(`rooms/${roomId}`);
+  const roomSnap = await roomRef.get();
+  if (!roomSnap.exists) throw new HttpsError("not-found", "Room not found.");
+
+  const room = roomSnap.data() || {};
+  if (!isHost(room, uid)) throw new HttpsError("permission-denied", "Host only.");
+  if (room.started) {
+    throw new HttpsError("failed-precondition", "Draft order is locked after the draft starts.");
+  }
+
+  const memberUids = await getRoomMemberUids(roomRef, room);
+  if (isDraftCompleteRoom(room, memberUids)) {
+    throw new HttpsError("failed-precondition", "Draft is complete.");
+  }
+
+  const customDraftOrder =
+    draftOrderMode === "custom"
+      ? validateCustomDraftOrderForMembers(request.data?.customDraftOrder, memberUids)
+      : [];
+  const nowMs = Date.now();
+
+  await roomRef.set(
+    {
+      draftOrderMode,
+      draftRoundMode,
+      customDraftOrder,
+      draftOrderSettingsUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      draftOrderSettingsUpdatedAtMs: nowMs,
+      draftOrderSettingsUpdatedBy: uid,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+
+  return {
+    ok: true,
+    draftOrderMode,
+    draftRoundMode,
+    customDraftOrder,
+  };
+});
+
+exports.startDraftNow = onCall({ region: "us-west2" }, async (request) => {
+  const uid = request.auth?.uid;
+  if (!uid) throw new HttpsError("unauthenticated", "Sign in required.");
+
+  const roomId = String(request.data?.roomId || "").trim();
+  if (!roomId) throw new HttpsError("invalid-argument", "roomId is required.");
+
+  const roomRef = db.doc(`rooms/${roomId}`);
+  const roomSnap = await roomRef.get();
+  if (!roomSnap.exists) throw new HttpsError("not-found", "Room not found.");
+
+  const room = roomSnap.data() || {};
+  if (!isHost(room, uid)) throw new HttpsError("permission-denied", "Only host can start.");
+
+  return startDraftForRoom({
+    roomRef,
+    room,
+    turnSeconds: request.data?.turnSeconds,
+    nowMs: Date.now(),
+    requiredHostUid: uid,
+  });
+});
+
+exports.maybeStartDraft = onCall({ region: "us-west2" }, async (request) => {
+  const uid = request.auth?.uid;
+  if (!uid) throw new HttpsError("unauthenticated", "Sign in required.");
+
+  const roomId = String(request.data?.roomId || "").trim();
+  if (!roomId) throw new HttpsError("invalid-argument", "roomId is required.");
+
+  const roomRef = db.doc(`rooms/${roomId}`);
+  const roomSnap = await roomRef.get();
+  if (!roomSnap.exists) throw new HttpsError("not-found", "Room not found.");
+
+  const room = roomSnap.data() || {};
+  if (room.started) {
+    return { ok: true, started: false, alreadyStarted: true };
+  }
+
+  const nowMs = Date.now();
+  const startAtMs = getDraftStartAtMs(room);
+  if (!Number.isFinite(startAtMs) || nowMs < startAtMs) {
+    return { ok: true, started: false, due: false, startAtMs };
+  }
+
+  return startDraftForRoom({
+    roomRef,
+    room,
+    turnSeconds: request.data?.turnSeconds,
+    nowMs,
+  });
+});
+
+exports.makePick = onCall({ region: "us-west2" }, async (request) => {
+  const uid = request.auth?.uid;
+  if (!uid) throw new HttpsError("unauthenticated", "Sign in required.");
+
+  const roomId = String(request.data?.roomId || "").trim();
+  const playerId = String(request.data?.playerId || "").trim();
+  if (!roomId || !playerId) {
+    throw new HttpsError("invalid-argument", "roomId and playerId are required.");
+  }
+
+  const pos = normalizeDraftPosition(request.data?.position);
+  if (!["ATT", "MID", "DEF", "GK"].includes(pos)) {
+    throw new HttpsError("invalid-argument", "Position must be one of ATT, MID, DEF, GK.");
+  }
+
+  const displayName = await draftUserDisplayName(
+    uid,
+    request.auth?.token?.name || request.auth?.token?.email || "Manager"
+  );
+  const nowMs = Date.now();
+  const roomRef = db.doc(`rooms/${roomId}`);
+  const pickRef = roomRef.collection("picks").doc(playerId);
+
+  return db.runTransaction(async (tx) => {
+    const roomSnap = await tx.get(roomRef);
+    if (!roomSnap.exists) throw new HttpsError("not-found", "Room not found.");
+
+    const room = roomSnap.data() || {};
+    if (!room.started) throw new HttpsError("failed-precondition", "Draft has not started.");
+
+    const order = (Array.isArray(room.draftOrder) ? room.draftOrder : [])
+      .map(draftMemberUidOf)
+      .filter(Boolean);
+    if (!order.length) throw new HttpsError("failed-precondition", "Room has no draft order.");
+
+    const turnIndex = Math.max(0, Math.floor(Number(room.turnIndex || 0)));
+    const totalRounds = getDraftTotalRounds(room);
+    const maxPicks = order.length * totalRounds;
+    if (turnIndex >= maxPicks) {
+      throw new HttpsError("failed-precondition", "Draft is complete.");
+    }
+
+    const draftRoundMode = getDraftRoundMode(room);
+    const pickerUid = getPickerUidForTurn(order, turnIndex, draftRoundMode);
+    if (!pickerUid) throw new HttpsError("failed-precondition", "Invalid draft order.");
+    if (pickerUid !== uid) throw new HttpsError("failed-precondition", "Not your turn.");
+
+    const existingPick = await tx.get(pickRef);
+    if (existingPick.exists) {
+      throw new HttpsError("failed-precondition", "Player already picked.");
+    }
+
+    const nextTurnIndex = turnIndex + 1;
+    const nextDeadline =
+      nextTurnIndex < maxPicks
+        ? nowMs + getDraftTurnSecondsValue(room.turnSeconds) * 1000
+        : null;
+    const round = Math.floor(turnIndex / order.length) + 1;
+
+    tx.set(pickRef, {
+      playerId,
+      playerName: String(request.data?.playerName || playerId),
+      position: pos,
+      uid,
+      displayName,
+      turn: turnIndex + 1,
+      round,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      ...(request.data?.apiPlayerId != null
+        ? { apiPlayerId: Number(request.data.apiPlayerId) }
+        : {}),
+      ...(request.data?.apiTeamId != null
+        ? { apiTeamId: Number(request.data.apiTeamId) }
+        : {}),
+      ...(request.data?.teamName ? { teamName: String(request.data.teamName) } : {}),
+      ...(request.data?.nationality ? { nationality: String(request.data.nationality) } : {}),
+    });
+
+    tx.set(
+      roomRef,
+      {
+        turnIndex: nextTurnIndex,
+        turnDeadlineAt: nextDeadline,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    return { ok: true, turnIndex: nextTurnIndex };
+  });
+});
+
+exports.autoPick = onCall({ region: "us-west2" }, async (request) => {
+  const uid = request.auth?.uid;
+  if (!uid) throw new HttpsError("unauthenticated", "Sign in required.");
+
+  const roomId = String(request.data?.roomId || "").trim();
+  if (!roomId) throw new HttpsError("invalid-argument", "roomId is required.");
+
+  const candidates = Array.isArray(request.data?.candidates)
+    ? request.data.candidates
+    : [];
+  if (!candidates.length) {
+    throw new HttpsError("failed-precondition", "No candidates available for auto-pick.");
+  }
+
+  const nowMs = Date.now();
+  const roomRef = db.doc(`rooms/${roomId}`);
+
+  return db.runTransaction(async (tx) => {
+    const roomSnap = await tx.get(roomRef);
+    if (!roomSnap.exists) throw new HttpsError("not-found", "Room not found.");
+
+    const room = roomSnap.data() || {};
+    if (!room.started) throw new HttpsError("failed-precondition", "Draft not started.");
+    if (!isHost(room, uid)) {
+      throw new HttpsError("permission-denied", "Only host can auto-pick.");
+    }
+
+    const order = (Array.isArray(room.draftOrder) ? room.draftOrder : [])
+      .map(draftMemberUidOf)
+      .filter(Boolean);
+    if (!order.length) throw new HttpsError("failed-precondition", "Room has no draft order.");
+
+    const totalRounds = getDraftTotalRounds(room);
+    const maxPicks = order.length * totalRounds;
+    const turnIndex = Math.max(0, Math.floor(Number(room.turnIndex || 0)));
+    if (turnIndex >= maxPicks) {
+      throw new HttpsError("failed-precondition", "Draft complete.");
+    }
+
+    const deadline = Number(room.turnDeadlineAt || 0);
+    if (!Number.isFinite(deadline) || !deadline || nowMs < deadline) {
+      throw new HttpsError("failed-precondition", "Deadline not reached.");
+    }
+
+    const draftRoundMode = getDraftRoundMode(room);
+    const pickerUid = getPickerUidForTurn(order, turnIndex, draftRoundMode);
+    if (!pickerUid) throw new HttpsError("failed-precondition", "Invalid draft order.");
+
+    let choice = null;
+    for (let safety = 0; safety < 50 && !choice; safety += 1) {
+      const candidate = candidates[Math.floor(Math.random() * candidates.length)];
+      if (!candidate) continue;
+      const candidateId = String(candidate.id || candidate.playerId || "").trim();
+      const candidatePos = normalizeDraftPosition(candidate.position);
+      if (!candidateId || !["ATT", "MID", "DEF", "GK"].includes(candidatePos)) continue;
+
+      const candidateRef = roomRef.collection("picks").doc(candidateId);
+      const candidateSnap = await tx.get(candidateRef);
+      if (!candidateSnap.exists) {
+        choice = { ...candidate, id: candidateId, position: candidatePos, ref: candidateRef };
+      }
+    }
+
+    if (!choice) {
+      throw new HttpsError("failed-precondition", "Could not find a free player to auto-pick.");
+    }
+
+    const pickerName = draftMemberLabelFromRoom(room, pickerUid);
+    const nextTurnIndex = turnIndex + 1;
+    const nextDeadline =
+      nextTurnIndex < maxPicks
+        ? nowMs + getDraftTurnSecondsValue(room.turnSeconds) * 1000
+        : null;
+    const round = Math.floor(turnIndex / order.length) + 1;
+
+    tx.set(choice.ref, {
+      playerId: choice.id,
+      playerName: String(choice.name || choice.playerName || choice.id),
+      position: choice.position,
+      uid: pickerUid,
+      displayName: pickerName,
+      turn: turnIndex + 1,
+      round,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      autoPicked: true,
+      ...(choice.apiPlayerId != null ? { apiPlayerId: Number(choice.apiPlayerId) } : {}),
+      ...(choice.apiTeamId != null ? { apiTeamId: Number(choice.apiTeamId) } : {}),
+      ...(choice.teamName ? { teamName: String(choice.teamName) } : {}),
+      ...(choice.nationality ? { nationality: String(choice.nationality) } : {}),
+    });
+
+    tx.set(
+      roomRef,
+      {
+        turnIndex: nextTurnIndex,
+        turnDeadlineAt: nextDeadline,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    return { ok: true, playerId: choice.id, pickerUid, turnIndex: nextTurnIndex };
+  });
+});
+
 //Tournament 
 function toPos(pos) {
   const p = String(pos || "").toUpperCase().trim();
@@ -16188,6 +16742,9 @@ exports.scheduleDraft = onCall({ region: "us-west2" }, async (request) => {
   const memberUids = await getRoomMemberUids(roomRef, room);
   if (!room.started) {
     requireDraftManagerCount(memberUids, room);
+    if (getDraftOrderMode(room) === "custom") {
+      validateCustomDraftOrderForMembers(room.customDraftOrder, memberUids);
+    }
   }
 
   const reminderSendAtMs = Number(startAtMs) - 10 * 60 * 1000;
@@ -16239,6 +16796,175 @@ exports.scheduleDraft = onCall({ region: "us-west2" }, async (request) => {
   return { ok: true, emailsQueued };
 });
 
+const MARKET_ONE_TIME_MODE = "oneTime";
+const MARKET_RECURRING_MODE = "recurring";
+const MARKET_RECURRING_TZ = "America/Los_Angeles";
+const MARKET_RECURRING_MAX_DURATION_MS =
+  (22 * 60 * 60 * 1000) + (59 * 60 * 1000);
+
+const MARKET_WEEKDAY_NAMES = {
+  Sunday: 0,
+  Monday: 1,
+  Tuesday: 2,
+  Wednesday: 3,
+  Thursday: 4,
+  Friday: 5,
+  Saturday: 6,
+};
+
+function normalizeMarketScheduleMode(value) {
+  return value === MARKET_RECURRING_MODE
+    ? MARKET_RECURRING_MODE
+    : MARKET_ONE_TIME_MODE;
+}
+
+function normalizeRecurringDays(value) {
+  return Array.from(
+    new Set(
+      (Array.isArray(value) ? value : [])
+        .map((day) => Number(day))
+        .filter((day) => Number.isInteger(day) && day >= 0 && day <= 6)
+    )
+  ).sort((a, b) => a - b);
+}
+
+function parseRecurringTime(value) {
+  const raw = String(value || "").trim();
+  const match = raw.match(/^([01]?\d|2[0-3]):([0-5]\d)$/);
+  if (!match) return null;
+
+  return {
+    hour: Number(match[1]),
+    minute: Number(match[2]),
+    label: `${String(Number(match[1])).padStart(2, "0")}:${match[2]}`,
+  };
+}
+
+function getZonedParts(ms, timeZone = MARKET_RECURRING_TZ) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    weekday: "long",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(new Date(ms));
+
+  const byType = {};
+  for (const part of parts) {
+    byType[part.type] = part.value;
+  }
+
+  return {
+    weekday: MARKET_WEEKDAY_NAMES[byType.weekday],
+    year: Number(byType.year),
+    month: Number(byType.month),
+    day: Number(byType.day),
+    hour: Number(byType.hour),
+    minute: Number(byType.minute),
+  };
+}
+
+function zonedLocalTimeToUtcMs({
+  timeZone = MARKET_RECURRING_TZ,
+  year,
+  month,
+  day,
+  hour,
+  minute,
+}) {
+  let utcMs = Date.UTC(year, month - 1, day, hour, minute, 0, 0);
+
+  for (let i = 0; i < 3; i += 1) {
+    const parts = getZonedParts(utcMs, timeZone);
+    const renderedAsUtc = Date.UTC(
+      parts.year,
+      parts.month - 1,
+      parts.day,
+      parts.hour,
+      parts.minute,
+      0,
+      0
+    );
+    const targetAsUtc = Date.UTC(year, month - 1, day, hour, minute, 0, 0);
+    utcMs += targetAsUtc - renderedAsUtc;
+  }
+
+  return utcMs;
+}
+
+function getNextRecurringMarketAtMs({
+  days,
+  recurringTime,
+  afterMs = Date.now(),
+  timeZone = MARKET_RECURRING_TZ,
+}) {
+  const cleanDays = normalizeRecurringDays(days);
+  const parsedTime = parseRecurringTime(recurringTime);
+
+  if (!cleanDays.length || !parsedTime) return null;
+
+  const localNow = getZonedParts(afterMs, timeZone);
+
+  for (let offset = 0; offset <= 14; offset += 1) {
+    const localNoonUtc = Date.UTC(
+      localNow.year,
+      localNow.month - 1,
+      localNow.day + offset,
+      12,
+      0,
+      0,
+      0
+    );
+    const localDate = getZonedParts(localNoonUtc, timeZone);
+
+    if (!cleanDays.includes(localDate.weekday)) continue;
+
+    const candidateMs = zonedLocalTimeToUtcMs({
+      timeZone,
+      year: localDate.year,
+      month: localDate.month,
+      day: localDate.day,
+      hour: parsedTime.hour,
+      minute: parsedTime.minute,
+    });
+
+    if (candidateMs > afterMs + 30 * 1000) {
+      return candidateMs;
+    }
+  }
+
+  return null;
+}
+
+function getSafeMarketTimeZone(room = {}, fallback = MARKET_RECURRING_TZ) {
+  const candidate = String(getRoomTimeZone(room) || fallback || MARKET_RECURRING_TZ).trim();
+
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: candidate }).format(new Date());
+    return candidate;
+  } catch (_) {
+    return MARKET_RECURRING_TZ;
+  }
+}
+
+async function deletePendingMarketRemindersForRoom(roomId, batch) {
+  const snap = await db
+    .collection("reminders")
+    .where("roomId", "==", String(roomId))
+    .where("type", "==", "market_10min")
+    .where("sentAt", "==", null)
+    .get();
+
+  snap.forEach((docSnap) => {
+    batch.delete(docSnap.ref);
+  });
+
+  return snap.size;
+}
+
 /**
  * Market scheduling: writes schedule to rooms/{roomId}/market/current
  * + NEW: creates a "market_10min" reminder doc
@@ -16246,9 +16972,13 @@ exports.scheduleDraft = onCall({ region: "us-west2" }, async (request) => {
 exports.scheduleMarket = onCall({ region: "us-west2" }, async (request) => {
   if (!request.auth) throw new HttpsError("unauthenticated", "Login required.");
 
-  const { roomId, scheduledAtMs, durationMs } = request.data || {};
-  if (!roomId || scheduledAtMs == null || durationMs == null) {
-    throw new HttpsError("invalid-argument", "Missing roomId/scheduledAtMs/durationMs.");
+  const data = request.data || {};
+  const roomId = String(data.roomId || "").trim();
+  const scheduleMode = normalizeMarketScheduleMode(data.scheduleMode);
+  const durationMs = Number(data.durationMs || 0);
+
+  if (!roomId || !Number.isFinite(durationMs) || durationMs <= 0) {
+    throw new HttpsError("invalid-argument", "Missing roomId/durationMs.");
   }
 
   const roomRef = db.doc(`rooms/${roomId}`);
@@ -16260,8 +16990,49 @@ exports.scheduleMarket = onCall({ region: "us-west2" }, async (request) => {
     throw new HttpsError("permission-denied", "Only host can schedule.");
   }
 
+  const timezone = getSafeMarketTimeZone(room);
+
+  let scheduledAtMs = Number(data.scheduledAtMs || 0);
+  let recurringDays = [];
+  let recurringTime = "";
+
+  if (scheduleMode === MARKET_RECURRING_MODE) {
+    recurringDays = normalizeRecurringDays(data.recurringDays);
+    const parsedTime = parseRecurringTime(data.recurringTime);
+
+    if (!recurringDays.length) {
+      throw new HttpsError("invalid-argument", "Pick at least one recurring market day.");
+    }
+
+    if (!parsedTime) {
+      throw new HttpsError("invalid-argument", "Recurring market time must use HH:mm format.");
+    }
+
+    if (durationMs > MARKET_RECURRING_MAX_DURATION_MS) {
+      throw new HttpsError(
+        "invalid-argument",
+        "Recurring market duration cannot be longer than 22 hours and 59 minutes."
+      );
+    }
+
+    recurringTime = parsedTime.label;
+    scheduledAtMs = getNextRecurringMarketAtMs({
+      days: recurringDays,
+      recurringTime,
+      afterMs: Date.now(),
+      timeZone: timezone,
+    });
+  } else if (!Number.isFinite(scheduledAtMs) || scheduledAtMs <= 0) {
+    throw new HttpsError("invalid-argument", "Missing scheduledAtMs.");
+  }
+
+  if (!Number.isFinite(scheduledAtMs) || scheduledAtMs <= 0) {
+    throw new HttpsError("failed-precondition", "Could not calculate the next market opening time.");
+  }
+
+
   // ✅ NOW it's safe to use room + the input vars
-  const tz = getRoomTimeZone(room);
+  const tz = timezone;
   const openStr = formatWhen(Number(scheduledAtMs), tz);
   const durStr = formatDuration(Number(durationMs));
 
@@ -16277,7 +17048,14 @@ exports.scheduleMarket = onCall({ region: "us-west2" }, async (request) => {
   const newMarketReminderRef = db.collection("reminders").doc();
 
   const batch = db.batch();
-  if (oldMarketReminderId) batch.delete(db.doc(`reminders/${oldMarketReminderId}`));
+
+  if (oldMarketReminderId) {
+    batch.delete(db.doc(`reminders/${oldMarketReminderId}`));
+  }
+
+  // Strong cleanup: delete all old pending market reminders for this room.
+  // This prevents old reminder emails from firing after rescheduling.
+  await deletePendingMarketRemindersForRoom(roomId, batch);
 
   batch.set(newMarketReminderRef, {
     type: "market_10min",
@@ -16285,6 +17063,10 @@ exports.scheduleMarket = onCall({ region: "us-west2" }, async (request) => {
     sendAtMs: reminderSendAtMs,
     scheduledAtMs: Number(scheduledAtMs),
     durationMs: Number(durationMs),
+    scheduleMode,
+    recurringDays,
+    recurringTime,
+    timezone,
     recipientUids: memberUids,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
     sentAt: null,
@@ -16305,6 +17087,10 @@ exports.scheduleMarket = onCall({ region: "us-west2" }, async (request) => {
       priorityMode: admin.firestore.FieldValue.delete(),
       marketReminderId: newMarketReminderRef.id,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      scheduleMode,
+      recurringDays,
+      recurringTime,
+      timezone,
     },
     { merge: true }
   );
@@ -16326,6 +17112,10 @@ exports.scheduleMarket = onCall({ region: "us-west2" }, async (request) => {
       lastErrorAtMs: null,
       updatedAtMs: Date.now(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      scheduleMode,
+      recurringDays,
+      recurringTime,
+      timezone,
     },
     { merge: true }
   );
@@ -16412,7 +17202,33 @@ exports.processReminders = onSchedule(
 
       // --- NEW: Market reminder ---
       if (r.type === "market_10min") {
-        const openStr = formatWhen(r.scheduledAtMs);
+        const marketSnap = await db
+          .doc(`rooms/${r.roomId}/market/current`)
+          .get();
+
+        const currentMarket = marketSnap.exists ? marketSnap.data() || {} : {};
+        const currentReminderId = String(currentMarket.marketReminderId || "");
+        const currentScheduledAt = Number(currentMarket.scheduledAt || 0);
+        const reminderScheduledAt = Number(r.scheduledAtMs || 0);
+
+        const reminderStillCurrent =
+          currentReminderId === docSnap.id &&
+          currentMarket.status === "scheduled" &&
+          Number.isFinite(currentScheduledAt) &&
+          currentScheduledAt === reminderScheduledAt;
+
+        if (!reminderStillCurrent) {
+          await docSnap.ref.update({
+            sentAt: admin.firestore.FieldValue.serverTimestamp(),
+            skippedAtMs: now,
+            skippedReason: "stale-market-reminder",
+          });
+          continue;
+        }
+        const openStr = formatWhen(
+          r.scheduledAtMs,
+          currentMarket.timezone || r.timezone || DEFAULT_TZ
+        );
         const durStr = formatDuration(Number(r.durationMs || 0));
 
         const subject = "Fútbol Fantasy — Market opens in 10 minutes";
@@ -16531,6 +17347,143 @@ async function recordMarketQueueFailure({
     nextAttemptAtMs,
     lastError,
   });
+}
+async function scheduleNextRecurringMarketAfterResolve({
+  roomId,
+  marketRef,
+  taskDoc,
+  market,
+  task,
+  now,
+}) {
+  const scheduleMode = normalizeMarketScheduleMode(
+    market?.scheduleMode || task?.scheduleMode
+  );
+
+  if (scheduleMode !== MARKET_RECURRING_MODE) {
+    await markMarketQueueCompleted(taskDoc, now, "market-resolved");
+    return;
+  }
+
+  const recurringDays = normalizeRecurringDays(
+    market?.recurringDays || task?.recurringDays
+  );
+  const recurringTime = String(
+    market?.recurringTime || task?.recurringTime || ""
+  ).trim();
+  const durationMs = Number(market?.durationMs || task?.durationMs || 0);
+
+  const roomRef = db.doc(`rooms/${roomId}`);
+  const roomSnap = await roomRef.get();
+  const room = roomSnap.exists ? roomSnap.data() || {} : {};
+
+  let timezone = String(market?.timezone || task?.timezone || "").trim();
+  if (timezone) {
+    try {
+      new Intl.DateTimeFormat("en-US", { timeZone: timezone }).format(new Date());
+    } catch (_) {
+      timezone = "";
+    }
+  }
+  if (!timezone) {
+    timezone = getSafeMarketTimeZone(room);
+  }
+
+  if (
+    !recurringDays.length ||
+    !parseRecurringTime(recurringTime) ||
+    !Number.isFinite(durationMs) ||
+    durationMs <= 0 ||
+    durationMs > MARKET_RECURRING_MAX_DURATION_MS
+  ) {
+    await markMarketQueueCompleted(taskDoc, now, "recurring-config-invalid");
+    return;
+  }
+
+  const nextScheduledAtMs = getNextRecurringMarketAtMs({
+    days: recurringDays,
+    recurringTime,
+    afterMs: now,
+    timeZone: timezone,
+  });
+
+  if (!Number.isFinite(nextScheduledAtMs) || nextScheduledAtMs <= now) {
+    await markMarketQueueCompleted(taskDoc, now, "recurring-next-not-found");
+    return;
+  }
+
+  const memberUids = await getRoomMemberUids(roomRef, room);
+
+  const reminderSendAtMs = nextScheduledAtMs - 10 * 60 * 1000;
+  const newMarketReminderRef = db.collection("reminders").doc();
+
+  const batch = db.batch();
+  await deletePendingMarketRemindersForRoom(roomId, batch);
+
+  batch.set(newMarketReminderRef, {
+    type: "market_10min",
+    roomId,
+    sendAtMs: reminderSendAtMs,
+    scheduledAtMs: nextScheduledAtMs,
+    durationMs,
+    scheduleMode: MARKET_RECURRING_MODE,
+    recurringDays,
+    recurringTime,
+    timezone,
+    recipientUids: memberUids,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    sentAt: null,
+  });
+
+  batch.set(
+    marketRef,
+    {
+      roomId,
+      status: "scheduled",
+      scheduledAt: nextScheduledAtMs,
+      durationMs,
+      scheduleMode: MARKET_RECURRING_MODE,
+      recurringDays,
+      recurringTime,
+      timezone,
+      openedAt: null,
+      closesAt: null,
+      resolvedAt: null,
+      marketReminderId: newMarketReminderRef.id,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+
+  batch.set(
+    taskDoc.ref,
+    {
+      roomId,
+      status: "scheduled",
+      scheduledAt: nextScheduledAtMs,
+      durationMs,
+      scheduleMode: MARKET_RECURRING_MODE,
+      recurringDays,
+      recurringTime,
+      timezone,
+      openedAt: null,
+      closesAt: null,
+      resolvedAt: null,
+      nextAttemptAtMs: nextScheduledAtMs,
+      lastAttemptAtMs: null,
+      attemptCount: 0,
+      lastError: null,
+      lastErrorAtMs: null,
+      completedAtMs: admin.firestore.FieldValue.delete(),
+      completedAt: admin.firestore.FieldValue.delete(),
+      completionReason: admin.firestore.FieldValue.delete(),
+      updatedAtMs: now,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+
+  await batch.commit();
 }
 
 /**
@@ -16779,8 +17732,15 @@ exports.processMarketSchedule = onSchedule(
           continue;
         }
 
-        await markMarketQueueCompleted(taskDoc, now, "market-resolved").catch((error) => {
-          console.error("[processMarketSchedule] failed to mark resolved task completed", {
+        await scheduleNextRecurringMarketAfterResolve({
+          roomId,
+          marketRef,
+          taskDoc,
+          market: m,
+          task,
+          now,
+        }).catch((error) => {
+          console.error("[processMarketSchedule] failed to schedule next recurring market", {
             roomId,
             message: error?.message,
           });
@@ -16828,12 +17788,20 @@ exports.processMarketSchedule = onSchedule(
             continue;
           }
 
-          await markMarketQueueCompleted(taskDoc, now, "market-retry-resolved").catch((error) => {
-            console.error("[processMarketSchedule] failed to mark retried task completed", {
+          await scheduleNextRecurringMarketAfterResolve({
+            roomId,
+            marketRef,
+            taskDoc,
+            market: m,
+            task,
+            now,
+          }).catch((error) => {
+            console.error("[processMarketSchedule] failed to schedule next recurring market", {
               roomId,
               message: error?.message,
             });
           });
+          continue;
         }
       }
     }

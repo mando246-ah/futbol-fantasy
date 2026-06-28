@@ -68,6 +68,12 @@ export default function NewsPage() {
                 {(post.body || []).map((paragraph, index) => (
                   <p key={`${post.id}-paragraph-${index}`}>{paragraph}</p>
                 ))}
+              {post.callout && (
+                <div className="newsPostCallout">
+                  <div className="newsPostCalloutTitle">{post.callout.title}</div>
+                  <div className="newsPostCalloutText">{post.callout.text}</div>
+                </div>
+              )}
               </div>
 
               {post.bullets?.length ? (

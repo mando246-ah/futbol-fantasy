@@ -482,6 +482,68 @@
   }
 }
 
+.marketHostPanel {
+  display: grid;
+  gap: 12px;
+  margin-top: 10px;
+}
+
+.marketScheduleModeRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.marketScheduleModeBtn {
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.32);
+  background: rgba(15, 23, 42, 0.68);
+  color: rgba(248, 250, 252, 0.88);
+  padding: 8px 12px;
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.marketScheduleModeBtnActive {
+  border-color: rgba(34, 197, 94, 0.72);
+  background: linear-gradient(
+    135deg,
+    rgba(34, 197, 94, 0.28),
+    rgba(34, 211, 238, 0.16)
+  );
+  color: #ecfdf5;
+}
+
+.marketWeekdayGrid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.marketWeekdayBtn {
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.32);
+  background: rgba(15, 23, 42, 0.68);
+  color: rgba(248, 250, 252, 0.88);
+  padding: 7px 10px;
+  font-size: 0.78rem;
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.marketWeekdayBtnActive {
+  border-color: rgba(34, 211, 238, 0.72);
+  background: rgba(34, 211, 238, 0.18);
+  color: rgba(224, 242, 254, 0.98);
+}
+
+@media (max-width: 640px) {
+  .marketScheduleModeBtn,
+  .marketWeekdayBtn {
+    flex: 1 1 auto;
+  }
+}
+
 /* ---------------------------------------------------- */
 /* MOBILE OVERFLOW FIX FOR INPUTS                       */
 /* ---------------------------------------------------- */
@@ -739,3 +801,4 @@
     font-size: 0.95rem;
   }
 }
+
