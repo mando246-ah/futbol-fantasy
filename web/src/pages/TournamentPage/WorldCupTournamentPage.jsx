@@ -206,18 +206,112 @@ function fieldDashboardKickoffMs(fixture = {}) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function fieldDashboardGameStatus(statusValue) {
-  const status = String(statusValue || "").trim().toUpperCase();
+function fieldDashboardFirstValue(...values) {
+  for (const value of values) {
+    if (value == null) continue;
+    const text = String(value).trim();
+    if (text) return text;
+  }
+  return "";
+}
+
+function fieldDashboardStatusCandidate(value) {
+  if (value == null) return "";
+  if (typeof value === "string" || typeof value === "number") {
+    return String(value).trim();
+  }
+  if (typeof value !== "object") return "";
+  return fieldDashboardFirstValue(
+    value.statusShort,
+    value.short,
+    value.status?.short,
+    value.status?.long,
+    value.status,
+    value.fixtureStatus,
+    value.matchStatus,
+    value.statusLong,
+    value.long,
+    value.fixture?.status?.short,
+    value.fixture?.status?.long
+  );
+}
+
+function fieldDashboardGameStatus(statusValue, kickoffMs, nowMs = Date.now()) {
+  const rawStatus = String(statusValue || "").trim();
+  const status = rawStatus.toUpperCase();
+  const longStatus = rawStatus.toLowerCase();
+  const kickoffNumber = Number(kickoffMs || 0);
+  const kickoffHasPassed =
+    Number.isFinite(kickoffNumber) &&
+    kickoffNumber > 0 &&
+    Number(nowMs || Date.now()) >= kickoffNumber;
+
   if (["FT", "AET", "PEN"].includes(status)) {
     return { label: status, tone: "final" };
   }
-  if (["1H", "HT", "2H", "ET", "BT", "P", "INT", "LIVE"].includes(status)) {
+  if (["1H", "HT", "2H", "ET", "INT", "LIVE"].includes(status)) {
     return { label: status === "LIVE" ? "LIVE" : status, tone: "live" };
   }
-  if (["PST", "SUSP", "ABD", "CANC", "AWD", "WO"].includes(status)) {
-    return { label: status, tone: "alert" };
+  if (status === "BT") {
+    return { label: "Break", tone: "live" };
   }
-  return { label: "", tone: "scheduled" };
+  if (status === "P") {
+    return { label: "Penalties", tone: "live" };
+  }
+  if (["PST", "SUSP", "ABD", "CANC", "AWD", "WO"].includes(status)) {
+    const labels = {
+      PST: "Postponed",
+      SUSP: "Suspended",
+      ABD: "Abandoned",
+      CANC: "Cancelled",
+      AWD: "Awarded",
+      WO: "Walkover",
+    };
+    return { label: labels[status] || status, tone: "alert" };
+  }
+  if (longStatus.includes("finished")) {
+    return { label: "FT", tone: "final" };
+  }
+  if (kickoffHasPassed) {
+    return { label: "LIVE", tone: "live" };
+  }
+  if (["NS", "TBD"].includes(status) || longStatus === "not started") {
+    return { label: status === "TBD" ? "TBD" : "Scheduled", tone: "scheduled" };
+  }
+  return { label: "Scheduled", tone: "scheduled" };
+}
+
+function fieldDashboardStatusDisplay(status = {}, elapsed = null, extra = null) {
+  const label = String(status?.label || "").trim();
+  if (!label) return "Scheduled";
+
+  const elapsedValue = Number(elapsed);
+  const extraValue = Number(extra);
+  const canShowMinute =
+    status?.tone === "live" &&
+    Number.isFinite(elapsedValue) &&
+    elapsedValue > 0 &&
+    !["HT", "Break", "Penalties"].includes(label);
+
+  if (!canShowMinute) return label;
+
+  const minute = Number.isFinite(extraValue) && extraValue > 0
+    ? `${elapsedValue}+${extraValue}'`
+    : `${elapsedValue}'`;
+
+  return `${label} ${minute}`;
+}
+
+function fieldDashboardDateLabel(kickoffMs) {
+  if (!Number.isFinite(Number(kickoffMs)) || Number(kickoffMs) <= 0) {
+    return "Date TBD";
+  }
+
+  return new Date(Number(kickoffMs)).toLocaleDateString("en-US", {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+  });
 }
 
 function fieldDashboardTimeLabel(kickoffMs) {
@@ -232,12 +326,86 @@ function fieldDashboardTimeLabel(kickoffMs) {
   });
 }
 
-function buildFieldDashboardGames(day = {}, result = {}) {
+function fieldDashboardNumberValue(...values) {
+  for (const value of values) {
+    if (value == null || value === "") continue;
+    const n = Number(value);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+function fieldDashboardScorePair(...sources) {
+  for (const source of sources) {
+    if (!source || typeof source !== "object") continue;
+    const home = fieldDashboardNumberValue(
+      source.goalsHome,
+      source.homeGoals,
+      source.homeScore,
+      source.goals?.home,
+      source.score?.fulltime?.home,
+      source.score?.halftime?.home
+    );
+    const away = fieldDashboardNumberValue(
+      source.goalsAway,
+      source.awayGoals,
+      source.awayScore,
+      source.goals?.away,
+      source.score?.fulltime?.away,
+      source.score?.halftime?.away
+    );
+    if (home != null && away != null) {
+      return { home, away };
+    }
+  }
+  return { home: null, away: null };
+}
+
+function fieldDashboardCurrentWindowStatus(cup = {}, nowMs = Date.now()) {
+  const games = buildFieldDashboardGames(
+    {
+      fixtures: [
+        ...(Array.isArray(cup?.fixtureCoverage) ? cup.fixtureCoverage : []),
+        ...(Array.isArray(cup?.currentWindowFixtures) ? cup.currentWindowFixtures : []),
+      ],
+    },
+    cup,
+    nowMs
+  );
+  if (!games.length) return "";
+  if (games.some((game) => game.status?.tone === "live")) return "live";
+  if (games.length > 0 && games.every((game) => game.status?.tone === "final")) return "final";
+  return "";
+}
+
+function buildFieldDashboardGames(day = {}, result = {}, nowMs = Date.now()) {
   const dayFixtures = Array.isArray(day?.fixtures) ? day.fixtures : [];
   const resultFixtures = Array.isArray(result?.fixtures) ? result.fixtures : [];
-  const sourceFixtures = dayFixtures.length ? dayFixtures : resultFixtures;
+  const coverageRows = Array.isArray(result?.fixtureCoverage)
+    ? result.fixtureCoverage
+    : [];
+  const idOnlyFixtures = Array.isArray(result?.currentWindowFixtureIds)
+    ? result.currentWindowFixtureIds
+        .map((fixtureId) => ({ fixtureId }))
+        .filter((fixture) => fieldDashboardFixtureId(fixture))
+    : [];
+  const sourceFixturesById = new Map();
+
+  for (const source of [coverageRows, dayFixtures, resultFixtures, idOnlyFixtures]) {
+    for (const fixture of source) {
+      const fixtureId = fieldDashboardFixtureId(fixture);
+      if (!fixtureId) continue;
+      sourceFixturesById.set(fixtureId, {
+        ...(sourceFixturesById.get(fixtureId) || {}),
+        ...(fixture || {}),
+        fixtureId,
+      });
+    }
+  }
+
+  const sourceFixtures = Array.from(sourceFixturesById.values());
   const coverageByFixtureId = new Map(
-    (Array.isArray(result?.fixtureCoverage) ? result.fixtureCoverage : [])
+    coverageRows
       .map((row) => [fieldDashboardFixtureId(row), row])
       .filter(([fixtureId]) => fixtureId)
   );
@@ -260,50 +428,46 @@ function buildFieldDashboardGames(day = {}, result = {}) {
       const fixtureId = fieldDashboardFixtureId(fixture);
       const coverage = coverageByFixtureId.get(fixtureId) || {};
       const stats = playerStatsByFixtureId.get(fixtureId) || {};
-      const statusShort =
-        result?.fixtureStatusById?.[fixtureId] ||
-        coverage?.statusShort ||
-        stats?.statusShort ||
-        stats?.fixtureStatus ||
-        fixture?.statusShort ||
-        "";
+      const statusShort = fieldDashboardFirstValue(
+        fieldDashboardStatusCandidate(coverage),
+        fieldDashboardStatusCandidate(fixture),
+        fieldDashboardStatusCandidate(result?.fixtureStatusById?.[fixtureId]),
+        fieldDashboardStatusCandidate(stats)
+      );
       const kickoffMs =
+        fieldDashboardKickoffMs(coverage) ||
         fieldDashboardKickoffMs(fixture) ||
         fieldDashboardKickoffMs(stats);
-      const homeScore = Number(
-        stats?.goalsHome ??
-          stats?.homeGoals ??
-          stats?.homeScore ??
-          fixture?.goalsHome
-      );
-      const awayScore = Number(
-        stats?.goalsAway ??
-          stats?.awayGoals ??
-          stats?.awayScore ??
-          fixture?.goalsAway
-      );
-      const hasScore =
-        Number.isFinite(homeScore) &&
-        Number.isFinite(awayScore);
+      const score = fieldDashboardScorePair(coverage, fixture, stats);
 
       return {
         fixtureId: fixtureId || `field-dashboard-game-${index}`,
         kickoffMs,
+        dateLabel: fieldDashboardDateLabel(kickoffMs),
+        timeLabel: fieldDashboardTimeLabel(kickoffMs),
+        elapsed: fieldDashboardNumberValue(coverage?.elapsed, fixture?.elapsed, stats?.elapsed),
+        extra: fieldDashboardNumberValue(coverage?.extra, fixture?.extra, stats?.extra),
         homeTeam:
+          coverage?.homeTeam ||
+          coverage?.homeTeamName ||
           fixture?.homeTeam ||
           fixture?.homeTeamName ||
+          fixture?.home?.name ||
           fixture?.teams?.home?.name ||
           stats?.homeTeamName ||
           "Home",
         awayTeam:
+          coverage?.awayTeam ||
+          coverage?.awayTeamName ||
           fixture?.awayTeam ||
           fixture?.awayTeamName ||
+          fixture?.away?.name ||
           fixture?.teams?.away?.name ||
           stats?.awayTeamName ||
           "Away",
-        homeScore: hasScore ? homeScore : null,
-        awayScore: hasScore ? awayScore : null,
-        status: fieldDashboardGameStatus(statusShort),
+        homeScore: score.home,
+        awayScore: score.away,
+        status: fieldDashboardGameStatus(statusShort, kickoffMs, nowMs),
       };
     })
     .sort(
@@ -612,6 +776,33 @@ function sumNumberMaps(base = {}, add = {}) {
     out[uid] = Number(out[uid] || 0) + Number(value || 0);
   }
   return out;
+}
+
+function hasNumberMapValues(map = {}) {
+  return Object.values(map || {}).some((value) => Number(value || 0) !== 0);
+}
+
+function buildLeaderboardRowsFromTotalsMap(totalsByUid = {}, userById = {}) {
+  return Object.entries(totalsByUid || {})
+    .map(([uid, total]) => {
+      const key = String(uid || "");
+      if (!key) return null;
+      const user = userById?.[key] || {};
+      const points = Number(total || 0);
+
+      return {
+        userId: key,
+        uid: key,
+        name: user.name || user.displayName || key,
+        displayName: user.displayName || user.name || key,
+        teamName: user.teamName || "",
+        tablePoints: points,
+        totalFantasyPoints: points,
+        totalPoints: points,
+        projectedFantasyPoints: points,
+      };
+    })
+    .filter(Boolean);
 }
 
 function buildFixtureTotalsByUid(fixtures = [], fixtureIds = null) {
@@ -1217,16 +1408,33 @@ function getWorldCupGroupDisplayStatus(dayResult = null, room = {}) {
   ).trim().toLowerCase();
 }
 
-function isPlayerLiveFromStats(stats = {}) {
+function isPlayerLiveFromStats(stats = {}, options = {}) {
   const status =
     stats?.statusShort ||
     stats?.fixtureStatus ||
     stats?.matchStatus ||
     "";
 
-  if (isFinalStatusCode(status)) return false;
+  const fixtureId = String(
+    stats?.fixtureId ||
+      stats?.fixtureID ||
+      stats?.fixture_id ||
+      ""
+  ).trim();
 
-  return Boolean(stats?.isLive) || isLiveStatusCode(status);
+  if (isFinalStatusCode(status)) return false;
+  if (isLiveStatusCode(status)) return true;
+
+  if (
+    fixtureId &&
+    options?.activeLiveFixtureIds instanceof Set &&
+    options.activeLiveFixtureIds.has(fixtureId)
+  ) {
+    return true;
+  }
+
+  // Do not trust stale stats.isLive by itself unless the room/window is actively live.
+  return options?.allowBareIsLive === true && Boolean(stats?.isLive);
 }
 
 function statsFromEntry(entry = {}) {
@@ -1293,7 +1501,7 @@ function getDisplayOpponentName(player = {}, entry = null, stats = null) {
 }
 
 const FIELD_PLAYER_STAT_ORDER = [
-  "position",
+  "rawApiPosition",
   "rating",
   "minutes",
   "goals",
@@ -1328,6 +1536,11 @@ const FIELD_PLAYER_HIDDEN_STAT_KEYS = new Set([
   "extra",
   "statusUpdatedAtMs",
   "timerUpdatedAtMs",
+  "position",
+  "pos",
+  "role",
+  "rawApiPosition",
+  "rawApiPositionOriginal",
   "teamScore",
   "opponentScore",
   "teamGoals",
@@ -1367,7 +1580,26 @@ function formatFieldPlayerStatValue(key, value) {
   return String(value);
 }
 
-function buildFieldPlayerRawStatRows(stats = {}) {
+function resolveFieldPlayerDisplayPosition(stats = {}, fantasyPosition = "") {
+  const rawApiPositionOriginal = String(stats?.rawApiPositionOriginal || "").trim();
+  if (rawApiPositionOriginal) {
+    return { label: "Raw/API Position", value: rawApiPositionOriginal };
+  }
+
+  const rawApiPosition = normalizeDisplayPos(stats?.rawApiPosition || "");
+  if (rawApiPosition) {
+    return { label: "Raw/API Position", value: rawApiPosition };
+  }
+
+  const savedFantasyPosition = normalizeDisplayPos(fantasyPosition || "");
+  if (savedFantasyPosition) {
+    return { label: "Fantasy Position", value: savedFantasyPosition };
+  }
+
+  return { label: "Position", value: "Unknown" };
+}
+
+function buildFieldPlayerRawStatRows(stats = {}, options = {}) {
   const isLive = isPlayerLiveFromStats(stats);
   const minutes = Number(stats?.minutes ?? stats?.minutesPlayed ?? 0);
   const keys = sortFieldPlayerStatKeys(stats);
@@ -1376,21 +1608,34 @@ function buildFieldPlayerRawStatRows(stats = {}) {
       ? ["minutes", ...keys]
       : keys;
 
-  return displayKeys.flatMap((key) => {
-    if (FIELD_PLAYER_HIDDEN_STAT_KEYS.has(key)) return [];
+  const positionRow = resolveFieldPlayerDisplayPosition(
+    stats,
+    options?.fantasyPosition
+  );
 
-    const value = key === "minutes" ? minutes : stats?.[key];
-    const isEmpty =
-      value == null || value === false || value === 0 || value === "0";
-    if (isEmpty && !(key === "minutes" && isLive && minutes === 0)) return [];
+  return [
+    {
+      key: "displayPosition",
+      label: positionRow.label,
+      value: positionRow.value,
+      formattedValue: positionRow.value,
+    },
+    ...displayKeys.flatMap((key) => {
+      if (FIELD_PLAYER_HIDDEN_STAT_KEYS.has(key)) return [];
 
-    return [{
-      key,
-      label: prettyStatLabel(key),
-      value,
-      formattedValue: formatFieldPlayerStatValue(key, value),
-    }];
-  });
+      const value = key === "minutes" ? minutes : stats?.[key];
+      const isEmpty =
+        value == null || value === false || value === 0 || value === "0";
+      if (isEmpty && !(key === "minutes" && isLive && minutes === 0)) return [];
+
+      return [{
+        key,
+        label: prettyStatLabel(key),
+        value,
+        formattedValue: formatFieldPlayerStatValue(key, value),
+      }];
+    }),
+  ];
 }
 
 function buildFieldPlayerBreakdownRows(breakdown = {}) {
@@ -1626,7 +1871,7 @@ function getLiveTimerDisplay(stats, nowMs, localElapsedBaseMs = null) {
   };
 }
 
-function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
+function PlayerStatsCard({ stats, breakdown, teamName, opponentName, fantasyPosition = "" }) {
   const hasStats = stats && Object.keys(stats).length > 0;
   const hasBD = breakdown && Object.keys(breakdown).length > 0;
 
@@ -1754,7 +1999,7 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
   }
 
   const STAT_ORDER = [
-    "position",
+    "rawApiPosition",
     "rating",
     "minutes",
     "goals",
@@ -1788,6 +2033,7 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
   const displayRawKeys = showLiveNoAppearanceNote && !sortedRawKeys.includes("minutes")
     ? ["minutes", ...sortedRawKeys]
     : sortedRawKeys;
+  const positionRow = resolveFieldPlayerDisplayPosition(stats, fantasyPosition);
 
   const sortedBreakdownKeys = Object.keys(breakdown || {}).sort((a, b) => {
     const indexA = STAT_ORDER.indexOf(a);
@@ -1854,6 +2100,10 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
       <div className="tpStatsGrid">
         <div className="tpStatsCol">
           <span className="tpStatsHead">Raw Stats</span>
+          <div className="tpStatRow">
+            <span>{positionRow.label}</span>
+            <span>{positionRow.value}</span>
+          </div>
           {displayRawKeys.map((k) => {
             const v = k === "minutes" ? minutes : stats[k];
             if (k !== "minutes" && (v == null || v === false || v === 0 || v === "0")) return null;
@@ -1862,6 +2112,11 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
             // 4. Hide the score keys from the list below so they don't randomly show up twice!
             if (
               k === "isLive" ||
+              k === "position" ||
+              k === "pos" ||
+              k === "role" ||
+              k === "rawApiPosition" ||
+              k === "rawApiPositionOriginal" ||
               k === "teamId" ||
               k === "fixtureId" ||
               k === "fixtureStatus" ||
@@ -1994,12 +2249,26 @@ export default function WorldCupTournamentPage() {
       engineType === "cupEngine" ||
       room?.competitionState?.phaseLabel === "Cup"
     );
+  const globalPipelineMode = String(
+    room?.globalPipeline?.mode ||
+      room?.globalPipelineMode ||
+      ""
+  ).trim().toLowerCase();
+  const isGlobalCupRoom =
+    !isWorldCupGroupRoom &&
+    (
+      globalPipelineMode === "global" ||
+      isWorldCupKnockoutRoom ||
+      room?.globalPipeline?.cupGlobalAutoApply === true ||
+      room?.globalPipeline?.cupAggregator === true ||
+      room?.globalPipeline?.cupGlobalCurrentWindowApply === true
+    );
   const worldCupPageTitle = isWorldCupGroupRoom
     ? "World Cup Group Stage"
     : isWorldCupKnockoutRoom
       ? "World Cup Knockouts"
       : "World Cup Tournament";
-  const worldCupWindowLabel = isWorldCupGroupRoom ? "Group Stage Games" : "Next Games";
+  const worldCupWindowLabel = isWorldCupGroupRoom ? "Group Stage Games" : "Current Round Fixtures";
   const worldCupCurrentLabel = isWorldCupGroupRoom ? "Current Day" : "Current Round";
   const worldCupHistoryTitle = isWorldCupGroupRoom ? "Daily Results" : "Knockout Results";
   const worldCupLeaderboardTitle = isWorldCupGroupRoom
@@ -2011,6 +2280,7 @@ export default function WorldCupTournamentPage() {
   const [rosterViewMode, setRosterViewMode] = useState(
     loadWorldCupRosterViewMode
   );
+
   const [selectedFieldPlayerId, setSelectedFieldPlayerId] = useState(null);
 
   const selectRosterViewMode = (nextMode) => {
@@ -2055,6 +2325,41 @@ export default function WorldCupTournamentPage() {
   const [cupFixtureDocs, setCupFixtureDocs] = useState([]);
   const [standingsDoc, setStandingsDoc] = useState(null);
   const [finalResultsDoc, setFinalResultsDoc] = useState(null);
+
+  const activeLiveFixtureIdsForRoster = useMemo(() => {
+      const rows = Array.isArray(cupDoc?.fixtureCoverage)
+        ? cupDoc.fixtureCoverage
+        : [];
+
+      return new Set(
+        rows
+          .filter((row) => {
+            const status =
+              row?.statusShort ||
+              row?.fixtureStatus ||
+              row?.matchStatus ||
+              "";
+
+            if (isFinalStatusCode(status)) return false;
+            return Boolean(row?.isLive) || isLiveStatusCode(status);
+          })
+          .map((row) => String(row?.fixtureId || row?.id || "").trim())
+          .filter(Boolean)
+      );
+    }, [cupDoc?.fixtureCoverage]);
+
+    const cupWindowStatusForRoster = String(
+      cupDoc?.status ||
+        cupDoc?.globalApplyStatus ||
+        room?.competitionState?.weekStatus ||
+        room?.["competitionState.weekStatus"] ||
+        ""
+    ).toLowerCase();
+
+    const allowBarePlayerLiveStats =
+      cupWindowStatusForRoster === "live" ||
+      cupWindowStatusForRoster === "resolving";
+
   //History 
   const [historyEnabled, setHistoryEnabled] = useState(false);
   const [historyRounds, setHistoryRounds] = useState([]);
@@ -2209,14 +2514,18 @@ export default function WorldCupTournamentPage() {
         (snap) => setCupDoc(snap.exists() ? snap.data() : null)
       );
 
-      unsubCupFixtures = onSnapshot(
-        collection(db, "rooms", roomId, "cup", "current", "fixtures"),
-        (snap) => {
-          const rows = snap.docs.map((d) => ({ id: d.id, ...(d.data() || {}) }));
-          setCupFixtureDocs(rows);
-        },
-        () => setCupFixtureDocs([])
-      );
+      if (isGlobalCupRoom) {
+        setCupFixtureDocs([]);
+      } else {
+        unsubCupFixtures = onSnapshot(
+          collection(db, "rooms", roomId, "cup", "current", "fixtures"),
+          (snap) => {
+            const rows = snap.docs.map((d) => ({ id: d.id, ...(d.data() || {}) }));
+            setCupFixtureDocs(rows);
+          },
+          () => setCupFixtureDocs([])
+        );
+      }
 
       if (historyEnabled) {
         const historyQ = query(
@@ -2251,7 +2560,7 @@ export default function WorldCupTournamentPage() {
       unsubStandings();
       unsubHistory();
     };
-  }, [roomId, isWorldCupGroupRoom, historyEnabled]);
+  }, [roomId, isWorldCupGroupRoom, isGlobalCupRoom, historyEnabled]);
 
   useEffect(() => {
     if (!roomId || !isWorldCupGroupRoom || !historyEnabled) {
@@ -2646,6 +2955,10 @@ export default function WorldCupTournamentPage() {
             })) || null
       : null;
 
+    const cupFixtureDisplayStatus = !isWorldCupGroupRoom
+      ? fieldDashboardCurrentWindowStatus(cupDoc || {}, nowMs)
+      : "";
+
     const statusRaw =
       isWorldCupGroupRoom
           ? getWorldCupGroupDisplayStatus(
@@ -2657,6 +2970,7 @@ export default function WorldCupTournamentPage() {
             room
           )
         : (
+            cupFixtureDisplayStatus ||
             cupDoc?.status ||
             room?.competitionState?.weekStatus ||
             room?.["competitionState.weekStatus"] ||
@@ -2774,19 +3088,36 @@ export default function WorldCupTournamentPage() {
     const isFinal = status === "FINAL" || cupDoc?.completed || (isWorldCupGroupRoom && room?.competitionState?.isDone);
     
     const livePoints = cupDoc?.livePointsByUid || {};
-    const fixtureLedgerTotalsByUid = buildFixtureTotalsByUid(cupFixtureDocs);
+    const hasCupProjectedTotals = hasNumberMapValues(cupDoc?.projectedTotalsByUid);
+    const globalCupBaseTotalsByUid =
+      cupDoc?.globalBaseTotalsByUid ||
+      cupDoc?.creditedTotalsByUid ||
+      cupDoc?.cupTotalsByUid ||
+      {};
+    const fixtureLedgerTotalsByUid = isGlobalCupRoom
+      ? {}
+      : buildFixtureTotalsByUid(cupFixtureDocs);
     const creditedTotalsByUid =
-      Object.keys(fixtureLedgerTotalsByUid).length > 0
-        ? fixtureLedgerTotalsByUid
-        : Object.keys(latestCompletedHistoryTotalsByUid).length > 0
-        ? latestCompletedHistoryTotalsByUid
-        : (cupDoc?.creditedTotalsByUid || cupDoc?.cupTotalsByUid || {});
-    const projectedTotalsByUid = sumNumberMaps(creditedTotalsByUid, livePoints);
+      isGlobalCupRoom
+        ? globalCupBaseTotalsByUid
+        : Object.keys(fixtureLedgerTotalsByUid).length > 0
+          ? fixtureLedgerTotalsByUid
+          : Object.keys(latestCompletedHistoryTotalsByUid).length > 0
+            ? latestCompletedHistoryTotalsByUid
+            : (cupDoc?.creditedTotalsByUid || cupDoc?.cupTotalsByUid || {});
+    const projectedTotalsByUid =
+      isGlobalCupRoom && hasCupProjectedTotals
+        ? cupDoc.projectedTotalsByUid
+        : sumNumberMaps(creditedTotalsByUid, livePoints);
     const standingsIncludeLive =
+      isGlobalCupRoom ||
       Boolean(standingsDoc?.includesLivePoints) ||
       Boolean(cupDoc?.projectedIncludesLivePoints);
     const standingsSourceIsCup =
-      String(standingsDoc?.source || "").toLowerCase() === "cup";
+      isGlobalCupRoom ||
+      ["cup", "global-live-fixtures"].includes(
+        String(standingsDoc?.source || "").toLowerCase()
+      );
     const shouldProjectLive =
       !isFinal &&
       !standingsIncludeLive &&
@@ -2798,7 +3129,18 @@ export default function WorldCupTournamentPage() {
           : Array.isArray(standingsDoc?.standings)
           ? standingsDoc.standings
           : [])
-      : (Array.isArray(standingsDoc?.standings) ? standingsDoc.standings : []);
+      : isGlobalCupRoom
+        ? firstNonEmptyArray(
+            cupDoc?.projectedStandingsRows,
+            cupDoc?.standingsRows,
+            cupDoc?.leaderboard,
+            buildLeaderboardRowsFromTotalsMap(cupDoc?.projectedTotalsByUid, userById),
+            standingsDoc?.projectedStandingsRows,
+            standingsDoc?.standings,
+            standingsDoc?.leaderboard,
+            standingsDoc?.rows
+          )
+        : (Array.isArray(standingsDoc?.standings) ? standingsDoc.standings : []);
     const standingsByUid = Object.fromEntries(
       standingsRows
         .map((row) => {
@@ -3231,6 +3573,16 @@ export default function WorldCupTournamentPage() {
     return out;
   }
 
+  function firstNonEmptyBreakdownMap(...maps) {
+    for (const map of maps) {
+      if (map && typeof map === "object" && Object.keys(map).length) {
+        return map;
+      }
+    }
+
+    return {};
+  }
+
   function aggregateFixtureBreakdowns(fixtures = []) {
     let agg = {};
     for (const fx of fixtures || []) {
@@ -3267,12 +3619,39 @@ export default function WorldCupTournamentPage() {
         parsedWindow?.endAtMs) ??
     null;
 
-  const currentBreakdownByUserId = mergeBreakdownMaps(
-    isWorldCupGroupRoom
-      ? (activeWorldCupResult?.breakdownByUserId || {})
-      : (cupDoc?.breakdownByUserId || {}),
-    isWorldCupGroupRoom ? {} : (cupDoc?.liveBreakdownByUserId || {})
+  const isCupGlobalCurrentWindow =
+    !isWorldCupGroupRoom &&
+    (
+      cupDoc?.source === "global-live-fixtures" ||
+      cupDoc?.globalCurrentWindowBreakdownByUserId ||
+      cupDoc?.globalApplyMode ||
+      cupDoc?.globalApplyStatus
+    );
+  const cupGlobalLiveBreakdownByUserId = firstNonEmptyBreakdownMap(
+    cupDoc?.globalCurrentWindowBreakdownByUserId,
+    cupDoc?.liveBreakdownByUserId
   );
+  const cupGlobalFinalBreakdownByUserId = firstNonEmptyBreakdownMap(
+    cupDoc?.windowBreakdownByUserId,
+    cupDoc?.breakdownByUserId,
+    cupGlobalLiveBreakdownByUserId
+  );
+  const cupStatusLower = String(cupDoc?.status || cupDoc?.globalApplyStatus || "")
+    .trim()
+    .toLowerCase();
+  const currentBreakdownByUserId = isWorldCupGroupRoom
+    ? (activeWorldCupResult?.breakdownByUserId || {})
+    : isCupGlobalCurrentWindow
+      ? (cupStatusLower === "final" || cupStatusLower === "complete"
+          ? cupGlobalFinalBreakdownByUserId
+          : firstNonEmptyBreakdownMap(
+              cupGlobalLiveBreakdownByUserId,
+              cupGlobalFinalBreakdownByUserId
+            ))
+      : mergeBreakdownMaps(
+          cupDoc?.breakdownByUserId || {},
+          cupDoc?.liveBreakdownByUserId || {}
+        );
 
   const latestHistory = displayHistoryRounds[0] || null;
   const autoHidePreviousRoundAtMs = Number(winStartMs || 0) ? Number(winStartMs) - (60 * 60 * 1000) : null;
@@ -3395,7 +3774,13 @@ export default function WorldCupTournamentPage() {
 
     const scored = scorePlayerFromCore(
       stats,
-      toCorePos(player?.position || stats?.position || stats?.pos || stats?.role)
+      toCorePos(
+        player?.position ||
+          stats?.rawApiPosition ||
+          stats?.position ||
+          stats?.pos ||
+          stats?.role
+      )
     );
     const derivedPoints = Number(scored?.points || 0);
     const derivedBreakdown = hasBreakdownMap(scored?.breakdown) ? scored.breakdown : null;
@@ -3406,7 +3791,13 @@ export default function WorldCupTournamentPage() {
 
     return {
       ...player,
-      position: player?.position || stats?.position || stats?.pos || stats?.role || "MID",
+      position:
+        player?.position ||
+        stats?.rawApiPosition ||
+        stats?.position ||
+        stats?.pos ||
+        stats?.role ||
+        "MID",
       points: shouldKeepExistingPoints ? existingPoints : derivedPoints,
       breakdown: breakdown || derivedBreakdown,
     };
@@ -3849,7 +4240,10 @@ export default function WorldCupTournamentPage() {
     selectedFieldPlayer?.scoringBreakdown ||
     {};
   const selectedFieldPlayerIsLive =
-    isPlayerLiveFromStats(selectedFieldPlayerStats);
+    isPlayerLiveFromStats(selectedFieldPlayerStats, {
+      activeLiveFixtureIds: activeLiveFixtureIdsForRoster,
+      allowBareIsLive: allowBarePlayerLiveStats,
+    });
   const selectedFieldPlayerPoints = Number.isFinite(
     Number(
       selectedFieldPlayer?.points ??
@@ -3864,7 +4258,9 @@ export default function WorldCupTournamentPage() {
       )
     : 0;
   const selectedFieldPlayerRawRows =
-    buildFieldPlayerRawStatRows(selectedFieldPlayerStats);
+    buildFieldPlayerRawStatRows(selectedFieldPlayerStats, {
+      fantasyPosition: selectedFieldPlayer?.position,
+    });
   const selectedFieldPlayerBreakdownRows =
     buildFieldPlayerBreakdownRows(selectedFieldPlayerBreakdown);
   const otherUsers = users.filter(u => u.userId !== myUid);
@@ -3872,8 +4268,21 @@ export default function WorldCupTournamentPage() {
     isWorldCupGroupRoom
       ? (worldCupDisplayDay || currentDayDoc || activeWorldCupResult || {})
       : { fixtures: cupDoc?.currentWindowFixtures || [] },
-    isWorldCupGroupRoom ? (activeWorldCupResult || {}) : (cupDoc || {})
+    isWorldCupGroupRoom ? (activeWorldCupResult || {}) : (cupDoc || {}),
+    nowMs
   );
+  const fieldDashboardEyebrow = isWorldCupGroupRoom
+    ? "Current matchday"
+    : "Current knockout round";
+  const fieldDashboardTitle = isWorldCupGroupRoom
+    ? "Daily Results"
+    : "Round Fixtures";
+  const fieldDashboardGamesTitle = isWorldCupGroupRoom
+    ? "Today's Games"
+    : "Current Round Fixtures";
+  const fieldDashboardEmptyText = isWorldCupGroupRoom
+    ? "No games are available for this day yet."
+    : "No fixtures are available for this round yet.";
   const fieldDashboardManagers = otherUsers
     .map((manager) => {
       const uid = String(manager?.userId || "");
@@ -4115,7 +4524,10 @@ export default function WorldCupTournamentPage() {
                               player.stats
                             );
                             const displayCountry = getPlayerCountry(player, player);
-                            const isLiveNow = isPlayerLiveFromStats(player.stats);
+                            const isLiveNow = isPlayerLiveFromStats(player.stats, {
+                              activeLiveFixtureIds: activeLiveFixtureIdsForRoster,
+                              allowBareIsLive: allowBarePlayerLiveStats,
+                            });
                             const points = Number.isFinite(Number(player.points))
                               ? Number(player.points)
                               : 0;
@@ -4211,112 +4623,6 @@ export default function WorldCupTournamentPage() {
                     </aside>
                   ) : null}
                 </div>
-
-                  <section
-                    className="wcFieldDashboard"
-                    aria-labelledby="wc-field-dashboard-title"
-                  >
-                    <div className="wcFieldDashboardHeader">
-                      <div>
-                        <div className="wcFieldDashboardEyebrow">
-                          Current matchday
-                        </div>
-                        <h4
-                          id="wc-field-dashboard-title"
-                          className="wcFieldDashboardTitle"
-                        >
-                          Daily Results
-                        </h4>
-                      </div>
-                      <span className="wcFieldDashboardDayLabel">
-                        {currentWindowLabel}
-                      </span>
-                    </div>
-
-                    <div className="wcFieldDashboardGrid">
-                      <article className="wcFieldDashboardCard">
-                        <div className="wcFieldDashboardCardHeader">
-                          <span className="wcFieldDashboardIcon" aria-hidden="true">
-                            ⚽
-                          </span>
-                          <h5>Today&apos;s Games</h5>
-                          <span className="wcFieldDashboardCount">
-                            {fieldDashboardGames.length}
-                          </span>
-                        </div>
-
-                        <div className="wcFieldGameList">
-                          {fieldDashboardGames.map((game) => {
-                            const hasScore =
-                              game.homeScore != null && game.awayScore != null;
-                            const statusLabel =
-                              game.status.label ||
-                              fieldDashboardTimeLabel(game.kickoffMs);
-
-                            return (
-                              <div className="wcFieldGameRow" key={game.fixtureId}>
-                                <div className="wcFieldGameTeams">
-                                  <span>{game.homeTeam}</span>
-                                  <span>{game.awayTeam}</span>
-                                </div>
-                                <div className="wcFieldGameResult">
-                                  {hasScore && (
-                                    <strong>
-                                      {game.homeScore} - {game.awayScore}
-                                    </strong>
-                                  )}
-                                  <span
-                                    className={`wcFieldGameStatus wcFieldGameStatus--${game.status.tone}`}
-                                  >
-                                    {statusLabel}
-                                  </span>
-                                </div>
-                              </div>
-                            );
-                          })}
-
-                          {!fieldDashboardGames.length && (
-                            <div className="wcFieldDashboardEmpty">
-                              No games are available for this day yet.
-                            </div>
-                          )}
-                        </div>
-                      </article>
-
-                      <article className="wcFieldDashboardCard">
-                        <div className="wcFieldDashboardCardHeader">
-                          <span className="wcFieldDashboardIcon" aria-hidden="true">
-                            ◉
-                          </span>
-                          <h5>Other Managers</h5>
-                          <span className="wcFieldDashboardCount">
-                            {fieldDashboardManagers.length}
-                          </span>
-                        </div>
-
-                        <div className="wcFieldManagerList">
-                          {fieldDashboardManagers.map((manager, index) => (
-                            <div
-                              className="wcFieldManagerRow"
-                              key={manager.userId}
-                            >
-                              <span className="wcFieldManagerRank">
-                                {index + 1}
-                              </span>
-                              <UserChip user={manager} />
-                              <strong>{Number(manager.points || 0)} pts</strong>
-                            </div>
-                          ))}
-
-                          {!fieldDashboardManagers.length && (
-                            <div className="wcFieldDashboardEmpty">
-                              No other managers are in this room.
-                            </div>
-                          )}
-                        </div>
-                      </article>
-                    </div>
-                  </section>
                 </>
               )}
 
@@ -4358,6 +4664,7 @@ export default function WorldCupTournamentPage() {
                                 breakdown={p.breakdown}
                                 teamName={displayTeamName}
                                 opponentName={displayOpponentName}
+                                fantasyPosition={p.position}
                             />
                             )}
                         </li>
@@ -4408,6 +4715,7 @@ export default function WorldCupTournamentPage() {
                                         breakdown={p.breakdown}
                                         teamName={displayTeamName}
                                         opponentName={displayOpponentName}
+                                        fantasyPosition={p.position}
                                     />
                                     )}
                             </li>
@@ -4424,6 +4732,132 @@ export default function WorldCupTournamentPage() {
               )}
             </div>
           )}
+          <section
+            className="wcFieldDashboard"
+            aria-labelledby="wc-field-dashboard-title"
+          >
+            <div className="wcFieldDashboardHeader">
+                <div>
+                    <div className="wcFieldDashboardEyebrow">
+                        {fieldDashboardEyebrow}
+                    </div>
+                    <h4
+                      id="wc-field-dashboard-title"
+                      className="wcFieldDashboardTitle"
+                    >
+                      {fieldDashboardTitle}
+                    </h4>
+                </div>
+                      <span className="wcFieldDashboardDayLabel">
+                        {currentWindowLabel}
+                      </span>
+                    </div>
+
+                    <div className="wcFieldDashboardGrid">
+                      <article className="wcFieldDashboardCard">
+                        <div className="wcFieldDashboardCardHeader">
+                          <span className="wcFieldDashboardIcon" aria-hidden="true">
+                            ⚽
+                          </span>
+                          <h5>{fieldDashboardGamesTitle}</h5>
+                          <span className="wcFieldDashboardCount">
+                            {fieldDashboardGames.length}
+                          </span>
+                        </div>
+
+                        <div className="wcFieldGameList">
+                          {fieldDashboardGames.map((game) => {
+                            const hasScore =
+                              game.homeScore != null && game.awayScore != null;
+                            const shouldShowScore =
+                              hasScore &&
+                              ["live", "final"].includes(game.status?.tone);
+                            const statusLabel = fieldDashboardStatusDisplay(
+                              game.status,
+                              game.elapsed,
+                              game.extra
+                            );
+
+                            return (
+                              <div className="wcFieldGameRow" key={game.fixtureId}>
+                                <div className="wcFieldGameInfo">
+                                  <div className="wcFieldGameMatch">
+                                    <span className="wcFieldGameTeam wcFieldGameTeam--home">
+                                      {game.homeTeam}
+                                    </span>
+
+                                    <strong
+                                      className={`wcFieldGameScore ${
+                                        shouldShowScore ? "" : "wcFieldGameScore--vs"
+                                      }`}
+                                    >
+                                      {shouldShowScore ? `${game.homeScore} - ${game.awayScore}` : "vs"}
+                                    </strong>
+
+                                    <span className="wcFieldGameTeam wcFieldGameTeam--away">
+                                      {game.awayTeam}
+                                    </span>
+                                  </div>
+
+                                  <div className="wcFieldGameMeta">
+                                    <span>{game.dateLabel}</span>
+                                    <span>{game.timeLabel}</span>
+                                  </div>
+                                </div>
+
+                                <div className="wcFieldGameResult">
+                                  <span
+                                    className={`wcFieldGameStatus wcFieldGameStatus--${game.status.tone}`}
+                                  >
+                                    {statusLabel}
+                                  </span>
+                                </div>
+                              </div>
+                            );
+                          })}
+
+                          {!fieldDashboardGames.length && (
+                            <div className="wcFieldDashboardEmpty">
+                              {fieldDashboardEmptyText}
+                            </div>
+                          )}
+                        </div>
+                      </article>
+
+                      <article className="wcFieldDashboardCard">
+                        <div className="wcFieldDashboardCardHeader">
+                          <span className="wcFieldDashboardIcon" aria-hidden="true">
+                            ◉
+                          </span>
+                          <h5>Other Managers</h5>
+                          <span className="wcFieldDashboardCount">
+                            {fieldDashboardManagers.length}
+                          </span>
+                        </div>
+
+                        <div className="wcFieldManagerList">
+                          {fieldDashboardManagers.map((manager, index) => (
+                            <div
+                              className="wcFieldManagerRow"
+                              key={manager.userId}
+                            >
+                              <span className="wcFieldManagerRank">
+                                {index + 1}
+                              </span>
+                              <UserChip user={manager} />
+                              <strong>{Number(manager.points || 0)} pts</strong>
+                            </div>
+                          ))}
+
+                          {!fieldDashboardManagers.length && (
+                            <div className="wcFieldDashboardEmpty">
+                              No other managers are in this room.
+                            </div>
+                          )}
+                        </div>
+                      </article>
+                    </div>
+                  </section>
 
           {/* OTHER MANAGERS */}
           {!showFinalPodium && (
@@ -4488,10 +4922,11 @@ export default function WorldCupTournamentPage() {
                                             <div className={`tpPts ${mainPointsClass(p.points)}`}>{p.points} pts</div>
                                         </div>
                                         {isPlayerOpen && <PlayerStatsCard
-                                             stats={p.stats}
+                                            stats={p.stats}
                                             breakdown={p.breakdown}
                                             teamName={displayTeamName}
                                             opponentName={displayOpponentName}
+                                            fantasyPosition={p.position}
                                         />}
                                       </li>
                                     );
@@ -4542,6 +4977,7 @@ export default function WorldCupTournamentPage() {
                                                 breakdown={p.breakdown}
                                                 teamName={displayTeamName}
                                                 opponentName={displayOpponentName}
+                                                fantasyPosition={p.position}
                                               />
                                             )}
                                           </li>

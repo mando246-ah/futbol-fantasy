@@ -100,6 +100,14 @@ const API_FOOTBALL_COOLDOWN_MESSAGE =
   "API-Football Safe Mode is enabled or quota cooldown is active. Try again after reset.";
 const FIXTURE_PLAYERS_REFRESH_LOCK_MS = 90 * 1000;
 const FIXTURE_PLAYERS_LOCK_WAIT_MS = 1200;
+const FIXTURE_STATUS_REFRESH_LOCK_MS = 90 * 1000;
+const FIXTURE_STATUS_LOCK_WAIT_MS = 1000;
+const FIXTURE_STATUS_LIVE_MIN_TTL_MS = 60 * 1000;
+const FIXTURE_STATUS_STALE_NS_MIN_TTL_MS = 75 * 1000;
+const FIXTURE_STATUS_SCHEDULED_MIN_TTL_MS = 5 * 60 * 1000;
+const FIXTURE_STATUS_FINAL_MIN_TTL_MS = 5 * 60 * 1000;
+const GLOBAL_SEASON_REFRESH_DEDUPE_MS = 55 * 1000;
+const GLOBAL_SEASON_REFRESH_LOCK_MS = 90 * 1000;
 const cupGlobalRefreshResultByKey = new Map();
 
 exports.trimRoomChatMessages = onDocumentCreated(
@@ -753,13 +761,46 @@ async function writeApiFootballCooldown({
   return { cooldownUntilMs, cooldownReason };
 }
 
-async function apiFootballGet(path, params, apiKey) {
+function apiFootballLogPayload(path, params = {}, meta = {}, extra = {}) {
+  return {
+    path: String(path || ""),
+    params: params || {},
+    source: String(meta?.source || meta?.caller || ""),
+    roomId: meta?.roomId ? String(meta.roomId) : "",
+    fixtureId: meta?.fixtureId ? String(meta.fixtureId) : "",
+    fixtureIds: Array.isArray(meta?.fixtureIds)
+      ? meta.fixtureIds.map((id) => String(id || "")).filter(Boolean)
+      : undefined,
+    forceRefresh: Boolean(meta?.forceRefresh),
+    cacheHit: Boolean(meta?.cacheHit),
+    cacheMiss: Boolean(meta?.cacheMiss),
+    lockAcquired: Boolean(meta?.lockAcquired),
+    lockSkipped: Boolean(meta?.lockSkipped),
+    safeModeBlocked: Boolean(extra?.safeModeBlocked),
+    status: extra?.status ?? null,
+  };
+}
+
+async function apiFootballGet(path, params, apiKey, meta = {}) {
   const url = new URL(`https://v3.football.api-sports.io/${path}`);
   Object.entries(params || {}).forEach(([k, v]) => {
     if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
   });
 
-  await assertApiFootballRuntimeAllowsCall(path);
+  try {
+    await assertApiFootballRuntimeAllowsCall(path);
+  } catch (error) {
+    console.warn(
+      "[apiFootballGet] blocked by runtime guard",
+      apiFootballLogPayload(path, params, meta, { safeModeBlocked: true })
+    );
+    throw error;
+  }
+
+  console.log(
+    "[apiFootballGet] request",
+    apiFootballLogPayload(path, params, meta, { safeModeBlocked: false })
+  );
 
   const res = await fetch(url.toString(), {
     headers: { "x-apisports-key": apiKey },
@@ -6003,7 +6044,6 @@ function buildPlayerStatsMapFromFixturePlayersResponse(responseArr, fixtureMeta)
       const red = toNum(st?.cards?.red);
       const pensSaved = toNum(st?.penalty?.saved);
       const pensMissed = toNum(st?.penalty?.missed);
-      const pos = toPos(st?.games?.position);
       const rating = toNum(st?.games?.rating);
 
       const tackles = toNum(st?.tackles?.total);
@@ -6014,6 +6054,12 @@ function buildPlayerStatsMapFromFixturePlayersResponse(responseArr, fixtureMeta)
       const offsides = toNum(st?.offsides);
       const shotsOnTarget = toNum(st?.shots?.on);
       const pensCommitted = toNum(st?.penalty?.commited ?? st?.penalty?.committed);
+      const rawApiPositionOriginal =
+        st?.games?.position === undefined || st?.games?.position === null || String(st.games.position).trim() === ""
+          ? null
+          : String(st.games.position).trim();
+      // Preserve API truth: missing API position should stay empty, not become a fake MID.
+      const rawApiPosition = rawApiPositionOriginal ? toPos(rawApiPositionOriginal) : null;
 
       // raw from API (mostly only useful for GK)
       const rawConceded = toNum(st?.goals?.conceded);
@@ -6091,7 +6137,9 @@ function buildPlayerStatsMapFromFixturePlayersResponse(responseArr, fixtureMeta)
         pensMissed,
         cleanSheet,
         ownGoals,
-        position: pos,
+        rawApiPositionOriginal,
+        rawApiPosition,
+        position: rawApiPosition,
         rating,
         tackles,
         duelsWon,
@@ -6406,7 +6454,18 @@ async function getFixturePlayersStatsMapCached({
     });
 
     // If fixture hasn't started yet, this can return 204 No Content (handled in apiFootballGet)
-    const json = await apiFootballGet("fixtures/players", { fixture: safeFixtureId }, apiKey);
+    const json = await apiFootballGet(
+      "fixtures/players",
+      { fixture: safeFixtureId },
+      apiKey,
+      {
+        source: source || "getFixturePlayersStatsMapCached",
+        fixtureId: safeFixtureId,
+        forceRefresh,
+        cacheMiss: true,
+        lockAcquired: true,
+      }
+    );
     const fresh = buildPlayerStatsMapFromFixturePlayersResponse(json?.response || [], fixtureMeta);
 
     // Sometimes the API returns 204/empty even when a fixture should have stats.
@@ -6483,29 +6542,179 @@ async function getFixturePlayersStatsMapCached({
   }
 }
 
-async function getFixtureStatusMap({ fixtureIds, timezone, apiKey, forceRefresh = false }) {
+function fixtureStatusSoftTtlMs(short) {
+  const s = String(short || "").trim().toUpperCase();
+  if (!s) return 5 * 60 * 1000;
+  if (isInPlay(s)) return 60 * 1000;
+  if (s === "NS") return 10 * 60 * 1000;
+  if (isFinished(s)) return 60 * 60 * 1000;
+  return 5 * 60 * 1000;
+}
+
+function fixtureStatusHardMinTtlMs({ short, kickoffMs, nowMs }) {
+  const s = String(short || "").trim().toUpperCase();
+  const safeKickoffMs = Number(kickoffMs || 0);
+  const kickoffPassed =
+    Number.isFinite(safeKickoffMs) &&
+    safeKickoffMs > 0 &&
+    Number(nowMs || 0) >= safeKickoffMs;
+
+  if (isFinished(s)) return FIXTURE_STATUS_FINAL_MIN_TTL_MS;
+  if (s === "NS" && kickoffPassed) return FIXTURE_STATUS_STALE_NS_MIN_TTL_MS;
+  if (isInPlay(s) || (kickoffPassed && !isCancelledOrAbandonedStatus(s))) {
+    return FIXTURE_STATUS_LIVE_MIN_TTL_MS;
+  }
+  return FIXTURE_STATUS_SCHEDULED_MIN_TTL_MS;
+}
+
+function getFixtureStatusCacheDecision(cacheDoc = {}, nowMs = Date.now(), { forceRefresh = false } = {}) {
+  const short = String(cacheDoc?.short || cacheDoc?.statusShort || "").trim().toUpperCase();
+  const updatedAtMs = Number(cacheDoc?.updatedAtMs || 0);
+  const lastStatusFetchAtMs = Number(
+    cacheDoc?.lastStatusFetchAtMs ||
+      cacheDoc?.refreshCompletedAtMs ||
+      cacheDoc?.lastStatusFetchStartedAtMs ||
+      0
+  );
+  const kickoffMs = Number(cacheDoc?.kickoffMs || 0);
+  const hasFixtureDetails =
+    cacheDoc?.fixtureId &&
+    cacheDoc?.homeTeamName &&
+    cacheDoc?.awayTeamName &&
+    cacheDoc?.kickoffMs !== undefined;
+  const staleNsAfterKickoff =
+    short === "NS" &&
+    Number.isFinite(kickoffMs) &&
+    kickoffMs > 0 &&
+    nowMs >= kickoffMs;
+
+  if (forceRefresh) {
+    return {
+      useCache: false,
+      reason: "force-refresh",
+      short,
+      updatedAtMs,
+      lastStatusFetchAtMs,
+      kickoffMs,
+      staleNsAfterKickoff,
+    };
+  }
+
+  const hardReferenceAtMs = Math.max(updatedAtMs || 0, lastStatusFetchAtMs || 0);
+  const hardMinTtlMs = fixtureStatusHardMinTtlMs({ short, kickoffMs, nowMs });
+  if (short && hardReferenceAtMs > 0 && nowMs - hardReferenceAtMs < hardMinTtlMs) {
+    return {
+      useCache: true,
+      reason: "hard-min-ttl",
+      short,
+      updatedAtMs,
+      lastStatusFetchAtMs,
+      kickoffMs,
+      staleNsAfterKickoff,
+    };
+  }
+
+  const softTtlMs = fixtureStatusSoftTtlMs(short);
+  if (
+    short &&
+    updatedAtMs > 0 &&
+    nowMs - updatedAtMs < softTtlMs &&
+    hasFixtureDetails &&
+    !staleNsAfterKickoff
+  ) {
+    return {
+      useCache: true,
+      reason: "soft-ttl",
+      short,
+      updatedAtMs,
+      lastStatusFetchAtMs,
+      kickoffMs,
+      staleNsAfterKickoff,
+    };
+  }
+
+  return {
+    useCache: false,
+    reason: !short ? "missing-status" : staleNsAfterKickoff ? "stale-ns-after-kickoff" : "expired",
+    short,
+    updatedAtMs,
+    lastStatusFetchAtMs,
+    kickoffMs,
+    staleNsAfterKickoff,
+  };
+}
+
+function logFixtureStatusCacheDecision({
+  fixtureId,
+  source = "getFixtureStatusMap",
+  reason = "",
+  cacheHit = false,
+  cacheMiss = false,
+  lockAcquired = false,
+  lockSkipped = false,
+  forceRefresh = false,
+} = {}) {
+  console.log("[fixtureStatusCache]", {
+    fixtureId: String(fixtureId || ""),
+    source,
+    reason,
+    cacheHit,
+    cacheMiss,
+    lockAcquired,
+    lockSkipped,
+    forceRefresh,
+  });
+}
+
+async function releaseFixtureStatusLocks({
+  fixtureIds = [],
+  nowMs = Date.now(),
+  error = null,
+} = {}) {
+  const writes = [];
+  for (const fixtureId of fixtureIds) {
+    const safeFixtureId = String(fixtureId || "").trim();
+    if (!safeFixtureId) continue;
+    writes.push(
+      db.doc(`apiCache/fixtureStatus_${safeFixtureId}`).set(
+        {
+          refreshInProgress: false,
+          refreshOwner: FieldValue.delete(),
+          refreshSource: FieldValue.delete(),
+          refreshForceRefresh: FieldValue.delete(),
+          refreshCompletedAtMs: nowMs,
+          lastStatusFetchAtMs: nowMs,
+          ...(error
+            ? {
+                lastStatusFetchErrorAtMs: nowMs,
+                lastStatusFetchError: String(error?.message || error).slice(0, 500),
+              }
+            : {
+                lastStatusFetchEmptyAtMs: nowMs,
+                lastStatusFetchError: FieldValue.delete(),
+              }),
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      )
+    );
+  }
+
+  await Promise.all(writes).catch(() => {});
+}
+
+async function getFixtureStatusMap({
+  fixtureIds,
+  timezone,
+  apiKey,
+  forceRefresh = false,
+  source = "getFixtureStatusMap",
+}) {
   const ids = [...new Set((fixtureIds || []).map((x) => String(x)).filter(Boolean))];
   const out = {};
   if (!ids.length) return out;
 
   const now = Date.now();
-
-  // TTL policy (tweak anytime)
-  const LIVE_TTL_MS = 60 * 1000;        // 1 min while in-play
-  const NS_TTL_MS = 10 * 60 * 1000;     // 10 min if not started
-  const FIN_TTL_MS = 60 * 60 * 1000;    // 60 min if finished
-  const DEFAULT_TTL_MS = 5 * 60 * 1000; // 5 min fallback
-
-  const ttlForShort = (short) => {
-    if (!short) return DEFAULT_TTL_MS;
-    if (isInPlay(short)) return LIVE_TTL_MS;
-    if (short === "NS") return NS_TTL_MS;
-    if (isFinished(short)) return FIN_TTL_MS;
-    return DEFAULT_TTL_MS;
-  };
-
-  // 1) Read cache for each fixtureId (global cache by fixture)
-  // We only fetch from API for ids that are missing/expired.
   const missing = [];
 
   await Promise.all(
@@ -6520,59 +6729,179 @@ async function getFixtureStatusMap({ fixtureIds, timezone, apiKey, forceRefresh 
         const snap = await ref.get();
         if (!snap.exists) {
           missing.push(id);
+          logFixtureStatusCacheDecision({
+            fixtureId: id,
+            source,
+            reason: "missing-doc",
+            cacheMiss: true,
+            forceRefresh,
+          });
           return;
         }
 
         const d = snap.data() || {};
-        const short = d.short || d.statusShort || null;
-        const updatedAtMs = Number(d.updatedAtMs || 0);
-        const ttlMs = ttlForShort(short);
-        const hasFixtureDetails =
-          d.fixtureId &&
-          d.homeTeamName &&
-          d.awayTeamName &&
-          d.kickoffMs !== undefined;
-
-        if (short && updatedAtMs && now - updatedAtMs < ttlMs && hasFixtureDetails) {
-          out[id] = short;
+        const decision = getFixtureStatusCacheDecision(d, now, { forceRefresh });
+        if (decision.useCache) {
+          out[id] = decision.short;
+          logFixtureStatusCacheDecision({
+            fixtureId: id,
+            source,
+            reason: decision.reason,
+            cacheHit: true,
+            forceRefresh,
+          });
         } else {
-          // expired or incomplete, refetch
           missing.push(id);
+          logFixtureStatusCacheDecision({
+            fixtureId: id,
+            source,
+            reason: decision.reason,
+            cacheMiss: true,
+            forceRefresh,
+          });
         }
       } catch (_) {
-        // If cache read fails, refetch from API
         missing.push(id);
       }
     })
   );
 
-  // 2) Fetch missing statuses from API (try multi-id first)
+  const refreshIds = [];
+  await Promise.all(
+    missing.map(async (id) => {
+      const ref = db.doc(`apiCache/fixtureStatus_${id}`);
+      const lockOwner = [
+        "fixtureStatus",
+        id,
+        now,
+        Math.random().toString(16).slice(2),
+      ].join(":");
+      let txDecision = { type: "unknown", cacheDoc: null, reason: "" };
+
+      await db.runTransaction(async (tx) => {
+        const snap = await tx.get(ref);
+        const cacheDoc = snap.exists ? (snap.data() || {}) : {};
+        const cacheDecision = getFixtureStatusCacheDecision(cacheDoc, now, { forceRefresh });
+        const refreshStartedAtMs = Number(cacheDoc?.refreshStartedAtMs || 0);
+        const lockFresh =
+          cacheDoc?.refreshInProgress === true &&
+          Number.isFinite(refreshStartedAtMs) &&
+          now - refreshStartedAtMs < FIXTURE_STATUS_REFRESH_LOCK_MS;
+
+        if (cacheDecision.useCache) {
+          txDecision = { type: "fresh-cache", cacheDoc, reason: cacheDecision.reason };
+          return;
+        }
+
+        if (lockFresh) {
+          txDecision = { type: "fresh-lock", cacheDoc, reason: "fresh-lock" };
+          return;
+        }
+
+        tx.set(
+          ref,
+          {
+            refreshInProgress: true,
+            refreshStartedAtMs: now,
+            refreshOwner: lockOwner,
+            refreshSource: source || "",
+            refreshForceRefresh: Boolean(forceRefresh),
+            lastStatusFetchStartedAtMs: now,
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+        txDecision = { type: "lock-acquired", cacheDoc, reason: "lock-acquired" };
+      });
+
+      if (txDecision.type === "fresh-cache") {
+        const decision = getFixtureStatusCacheDecision(txDecision.cacheDoc, now, { forceRefresh: false });
+        if (decision.short) out[id] = decision.short;
+        logFixtureStatusCacheDecision({
+          fixtureId: id,
+          source,
+          reason: txDecision.reason,
+          cacheHit: true,
+          lockSkipped: true,
+          forceRefresh,
+        });
+        return;
+      }
+
+      if (txDecision.type === "fresh-lock") {
+        await waitMs(FIXTURE_STATUS_LOCK_WAIT_MS);
+        const rereadSnap = await ref.get().catch(() => null);
+        const rereadDoc = rereadSnap?.exists ? (rereadSnap.data() || {}) : null;
+        const rereadDecision = getFixtureStatusCacheDecision(rereadDoc || {}, Date.now(), {
+          forceRefresh: false,
+        });
+        if (rereadDecision.short) out[id] = rereadDecision.short;
+        logFixtureStatusCacheDecision({
+          fixtureId: id,
+          source,
+          reason: rereadDecision.useCache ? rereadDecision.reason : "fresh-lock-stale-cache",
+          cacheHit: Boolean(rereadDecision.short),
+          lockSkipped: true,
+          forceRefresh,
+        });
+        return;
+      }
+
+      refreshIds.push(id);
+      logFixtureStatusCacheDecision({
+        fixtureId: id,
+        source,
+        reason: "lock-acquired",
+        cacheMiss: true,
+        lockAcquired: true,
+        forceRefresh,
+      });
+    })
+  );
+
   const fetchList = async (params) => {
-    const r = await apiFootballGet("fixtures", { ...params, timezone }, apiKey);
+    const r = await apiFootballGet(
+      "fixtures",
+      { ...params, timezone },
+      apiKey,
+      {
+        source,
+        fixtureId: params?.id,
+        fixtureIds: params?.ids ? String(params.ids).split(/[-,]/).filter(Boolean) : refreshIds,
+        forceRefresh,
+        cacheMiss: true,
+        lockAcquired: true,
+      }
+    );
     return Array.isArray(r?.response) ? r.response : [];
   };
 
   let list = [];
 
-  if (missing.length) {
-    if (missing.length > 1) {
-      list = await fetchList({ ids: missing.join("-") });
-      if (!list.length) list = await fetchList({ ids: missing.join(",") });
-    } else {
-      list = await fetchList({ id: missing[0] });
-    }
-
-    // Fallback per-id if still empty
-    if (!list.length) {
-      for (const id of missing) {
-        const one = await fetchList({ id });
-        if (one?.[0]) list.push(one[0]);
+  if (refreshIds.length) {
+    try {
+      if (refreshIds.length > 1) {
+        list = await fetchList({ ids: refreshIds.join("-") });
+        if (!list.length) list = await fetchList({ ids: refreshIds.join(",") });
+      } else {
+        list = await fetchList({ id: refreshIds[0] });
       }
+
+      // Fallback per-id if still empty. This is now protected by the per-fixture
+      // Firestore lock above, so parallel function instances do not all retry.
+      if (!list.length) {
+        for (const id of refreshIds) {
+          const one = await fetchList({ id });
+          if (one?.[0]) list.push(one[0]);
+        }
+      }
+    } catch (error) {
+      await releaseFixtureStatusLocks({ fixtureIds: refreshIds, nowMs: now, error });
+      throw error;
     }
   }
 
-  // 3) Write fresh statuses back to global cache and to output map
-  // Note: we only cache statuses we actually received.
+  const receivedIds = new Set();
   if (list.length) {
     const writes = [];
 
@@ -6580,6 +6909,7 @@ async function getFixtureStatusMap({ fixtureIds, timezone, apiKey, forceRefresh 
       const fixtureId = String(f?.fixture?.id ?? "");
       const short = f?.fixture?.status?.short ?? null;
       if (!fixtureId || !short) continue;
+      receivedIds.add(fixtureId);
 
       const kickoffMs = f?.fixture?.timestamp
         ? Number(f.fixture.timestamp) * 1000
@@ -6615,6 +6945,13 @@ async function getFixtureStatusMap({ fixtureIds, timezone, apiKey, forceRefresh 
             extra,
             kickoffMs: Number.isFinite(kickoffMs) ? kickoffMs : null,
             updatedAtMs: now,
+            lastStatusFetchAtMs: now,
+            refreshInProgress: false,
+            refreshOwner: FieldValue.delete(),
+            refreshSource: FieldValue.delete(),
+            refreshForceRefresh: FieldValue.delete(),
+            refreshCompletedAtMs: now,
+            lastStatusFetchError: FieldValue.delete(),
             homeTeamId,
             homeTeamName,
             homeTeamLogo,
@@ -6636,6 +6973,11 @@ async function getFixtureStatusMap({ fixtureIds, timezone, apiKey, forceRefresh 
     try {
       await Promise.all(writes);
     } catch (_) {}
+  }
+
+  const notReceivedIds = refreshIds.filter((id) => !receivedIds.has(String(id)));
+  if (notReceivedIds.length) {
+    await releaseFixtureStatusLocks({ fixtureIds: notReceivedIds, nowMs: now });
   }
 
   return out;
@@ -6841,7 +7183,19 @@ function patchGlobalLiveFixturesWithSummaries(liveFixturesById = {}, fixtureSumm
       elapsed: fixtureMeta.elapsed ?? live?.elapsed ?? null,
       extra: fixtureMeta.extra ?? live?.extra ?? null,
       kickoffMs: fixtureMeta.kickoffMs ?? live?.kickoffMs ?? null,
+      statusUpdatedAtMs: fixtureMeta.statusUpdatedAtMs ?? live?.statusUpdatedAtMs ?? null,
+      goalsHome: fixtureMeta.goalsHome ?? live?.goalsHome ?? null,
+      goalsAway: fixtureMeta.goalsAway ?? live?.goalsAway ?? null,
+      homeScore: fixtureMeta.goalsHome ?? live?.homeScore ?? live?.goalsHome ?? null,
+      awayScore: fixtureMeta.goalsAway ?? live?.awayScore ?? live?.goalsAway ?? null,
+      homeTeamId: fixtureMeta.homeTeamId ?? live?.homeTeamId ?? null,
+      awayTeamId: fixtureMeta.awayTeamId ?? live?.awayTeamId ?? null,
+      homeTeamName: fixtureMeta.homeTeamName || live?.homeTeamName || "",
+      awayTeamName: fixtureMeta.awayTeamName || live?.awayTeamName || "",
+      homeTeamLogo: fixtureMeta.homeTeamLogo || live?.homeTeamLogo || "",
+      awayTeamLogo: fixtureMeta.awayTeamLogo || live?.awayTeamLogo || "",
       isLive: isLiveNow,
+      isFinished: isFinalStatusCode(fixtureMeta.statusShort || live?.statusShort || ""),
       rawStatsByPlayerId: patchedRawStats,
       fantasyByPlayerId: patchedFantasy,
     };
@@ -6940,8 +7294,22 @@ async function loadRoomUsersLineupsForGlobalAggregation({ db, roomId }) {
   }
 
   async function fetchNeededPlayerDocs(playersById, neededIds) {
-    const ids = [...new Set((neededIds || []).map(String).filter(Boolean))]
+    const neededIdList =
+      neededIds == null
+        ? []
+        : Array.isArray(neededIds)
+          ? neededIds
+          : neededIds instanceof Set
+            ? Array.from(neededIds)
+            : typeof neededIds === "string" || typeof neededIds === "number"
+              ? [neededIds]
+              : typeof neededIds?.[Symbol.iterator] === "function"
+                ? Array.from(neededIds)
+                : [];
+
+    const ids = [...new Set(neededIdList.map(String).filter(Boolean))]
       .filter((id) => !hasUsefulPlayerMeta(playersById.get(id)));
+
     let docsRead = 0;
     const chunkSize = 300;
 
@@ -7260,7 +7628,9 @@ function mergeGlobalRawPlayerStats(prev = {}, next = {}, fixtureId = "") {
 
   // Keep API position for debugging only.
   // Room/fantasy position will be used later when scoring.
-  out.position = out.position || next?.position || "";
+  out.rawApiPositionOriginal = out.rawApiPositionOriginal || next?.rawApiPositionOriginal || null;
+  out.rawApiPosition = out.rawApiPosition || next?.rawApiPosition || null;
+  out.position = out.position || next?.rawApiPosition || next?.position || "";
 
   const ids = new Set(Array.isArray(out.fixtureIds) ? out.fixtureIds.map(String) : []);
   const fid = String(fixtureId || next?.fixtureId || "").trim();
@@ -7305,7 +7675,7 @@ function buildAggregatedGlobalRawStatsByPlayerId(liveFixturesById = {}) {
         stats: mergedStats,
         teamName: mergedStats.teamName || current.teamName || "",
         opponentName: mergedStats.opponentName || current.opponentName || "",
-        position: mergedStats.position || current.position || "",
+        position: mergedStats.rawApiPosition || mergedStats.position || current.position || "",
       };
     }
   }
@@ -7666,6 +8036,7 @@ async function computeRegularWeekFromGlobalCache({
       player?.position ||
       playersById.get(pid)?.position ||
       aggregated?.position ||
+      rawStats?.rawApiPosition ||
       rawStats?.position ||
       "MID"
     );
@@ -8061,7 +8432,7 @@ async function collectActiveSeasonFixtureTargets(nowMs = Date.now(), roomDocs = 
       const roomId = roomDoc.id;
       const room = roomDoc.data() || {};
       const competitionState = getCompetitionState(room);
-      if (String(room?.seasonPhase || "").toUpperCase() === "COMPLETE" || competitionState?.isDone === true) {
+      if (roomLooksCompleteForPolling(room, competitionState)) {
         stats.skippedDoneCount += 1;
         return null;
       }
@@ -8154,9 +8525,27 @@ async function collectActiveSeasonFixtureTargets(nowMs = Date.now(), roomDocs = 
       if (phaseLabel === "Cup") {
         const cupSnap = await db.doc(`rooms/${roomId}/cup/current`).get();
         const cup = cupSnap.exists ? (cupSnap.data() || {}) : {};
-        fixtureIds = Array.isArray(cup?.currentWindowFixtureIds)
-          ? cup.currentWindowFixtureIds.map(String).filter(Boolean)
-          : [];
+        const cupStatus = String(cup?.status || cup?.globalApplyStatus || "").trim().toLowerCase();
+        const cupNextPollAtMs = Number(
+          cup?.nextPollAtMs ||
+            competitionState?.nextCupPollAtMs ||
+            competitionState?.nextPollAtMs ||
+            0
+        );
+
+        if (
+          ["final", "complete", "completed"].includes(cupStatus) &&
+          !(Number.isFinite(cupNextPollAtMs) && cupNextPollAtMs <= nowMs)
+        ) {
+          stats.skippedDoneCount += 1;
+          return null;
+        }
+
+        fixtureIds = buildCupGlobalRefreshFixtureIds(cup, nowMs);
+        if (!fixtureIds.length) {
+          stats.sleepingRoomCount += 1;
+          return null;
+        }
       } else {
         const weekIndex = Number(room?.currentWeekIndex);
         if (!Number.isFinite(weekIndex)) {
@@ -8336,9 +8725,14 @@ function buildGlobalFantasyByPlayerId(rawStatsByPlayerId = {}) {
   const fantasyByPlayerId = {};
 
   for (const [playerId, stats] of Object.entries(rawStatsByPlayerId || {})) {
-    const position = toPos(stats?.position || stats?.pos || stats?.role);
+    const rawPosition =
+      stats?.rawApiPosition || stats?.position || stats?.pos || stats?.role || "";
+    const position = rawPosition ? toPos(rawPosition) : "";
+    // This shared cache value is a fixture-level preview/debug aid. Room scoring
+    // paths recompute points with saved room/fantasy positions before using raw API position.
+    const scorePosition = position || "MID";
 
-    const scored = scorePlayer(stats || {}, position);
+    const scored = scorePlayer(stats || {}, scorePosition);
 
     fantasyByPlayerId[String(playerId)] = {
       points: Number(scored?.points ?? scored?.total ?? 0),
@@ -8450,7 +8844,12 @@ async function pollGlobalSeasonLiveFixturesOnce({ seasonTarget, apiKey, nowMs })
   }
 
   const timezone = String(seasonTarget?.timezone || "America/Los_Angeles");
-  const statusByFixtureId = await getFixtureStatusMap({ fixtureIds, timezone, apiKey });
+  const statusByFixtureId = await getFixtureStatusMap({
+    fixtureIds,
+    timezone,
+    apiKey,
+    source: "pollGlobalSeasonLiveFixturesOnce",
+  });
   const detailsByFixtureId = await loadFixtureStatusDetailsMap(fixtureIds);
 
   let payloadCount = 0;
@@ -8465,7 +8864,18 @@ async function pollGlobalSeasonLiveFixturesOnce({ seasonTarget, apiKey, nowMs })
   for (const fixtureId of fixtureIds) {
     const detail = detailsByFixtureId[fixtureId] || {};
     const short = statusByFixtureId[fixtureId] || detail?.short || null;
-    const shouldFetchPlayers = hasFixtureStarted(short);
+    const kickoffMs = Number(detail?.kickoffMs || 0);
+    const kickoffHasPassed =
+      Number.isFinite(kickoffMs) && kickoffMs > 0 && nowMs >= kickoffMs;
+    const statusUpper = String(short || "").trim().toUpperCase();
+    const isNonPlayableStatus = ["CANC", "PST", "TBD", "ABD", "AWD", "WO"].includes(statusUpper);
+    const shouldFetchPlayers =
+      hasFixtureStarted(short) ||
+      (
+        kickoffHasPassed &&
+        !isFinished(short) &&
+        !isNonPlayableStatus
+      );
 
     let rawStatsByPlayerId = {};
     let fantasyByPlayerId = {};
@@ -8473,7 +8883,7 @@ async function pollGlobalSeasonLiveFixturesOnce({ seasonTarget, apiKey, nowMs })
 
     if (shouldFetchPlayers) {
       fixtureStatsDebug.uniqueFixtureStatsChecked += 1;
-      const ttlMs = isInPlay(short) ? 60 * 1000 : 60 * 60 * 1000;
+      const ttlMs = isInPlay(short) || kickoffHasPassed ? 60 * 1000 : 60 * 60 * 1000;
       rawStatsByPlayerId = await getFixturePlayersStatsMapCached({
         fixtureId,
         apiKey,
@@ -8489,6 +8899,29 @@ async function pollGlobalSeasonLiveFixturesOnce({ seasonTarget, apiKey, nowMs })
         seasonKey,
         updatedAtMs: nowMs,
         computedAt: admin.firestore.FieldValue.serverTimestamp(),
+        statusShort: short,
+        statusLong: detail?.statusLong || null,
+        elapsed: Number.isFinite(Number(detail?.elapsed)) ? Number(detail.elapsed) : null,
+        extra: Number.isFinite(Number(detail?.extra)) ? Number(detail.extra) : null,
+        kickoffMs: Number.isFinite(kickoffMs) && kickoffMs > 0 ? kickoffMs : null,
+        isLive:
+          isInPlay(short) ||
+          (
+            kickoffHasPassed &&
+            !isFinished(short) &&
+            !isNonPlayableStatus
+          ),
+        isFinished: isFinished(short),
+        homeTeamId: detail?.homeTeamId ?? null,
+        homeTeamName: detail?.homeTeamName || "",
+        homeTeamLogo: detail?.homeTeamLogo || "",
+        awayTeamId: detail?.awayTeamId ?? null,
+        awayTeamName: detail?.awayTeamName || "",
+        awayTeamLogo: detail?.awayTeamLogo || "",
+        goalsHome: toNum(detail?.goalsHome),
+        goalsAway: toNum(detail?.goalsAway),
+        homeScore: toNum(detail?.goalsHome),
+        awayScore: toNum(detail?.goalsAway),
         rawStatsByPlayerId,
         fantasyByPlayerId,
       };
@@ -8526,13 +8959,20 @@ async function pollGlobalSeasonLiveFixturesOnce({ seasonTarget, apiKey, nowMs })
         timezone,
         updatedAtMs: nowMs,
         computedAt: admin.firestore.FieldValue.serverTimestamp(),
-        kickoffMs: Number.isFinite(Number(detail?.kickoffMs)) ? Number(detail.kickoffMs) : null,
+        kickoffMs: Number.isFinite(kickoffMs) && kickoffMs > 0 ? kickoffMs : null,
         statusShort: short,
         statusLong: detail?.statusLong || null,
         elapsed: Number.isFinite(Number(detail?.elapsed)) ? Number(detail.elapsed) : null,
-        isLive: isInPlay(short),
+        extra: Number.isFinite(Number(detail?.extra)) ? Number(detail.extra) : null,
+        isLive:
+          isInPlay(short) ||
+          (
+            kickoffHasPassed &&
+            !isFinished(short) &&
+            !isNonPlayableStatus
+          ),
         isFinished: isFinished(short),
-        hasStarted: hasFixtureStarted(short),
+        hasStarted: hasFixtureStarted(short) || kickoffHasPassed,
         homeTeamId: detail?.homeTeamId ?? null,
         homeTeamName: detail?.homeTeamName || "",
         homeTeamLogo: detail?.homeTeamLogo || "",
@@ -8624,6 +9064,193 @@ function buildCupGlobalSeasonTargetForRoom({ roomId, room = {}, cup = {} }) {
   };
 }
 
+function fixtureIdFromCupFixture(fixture = {}) {
+  return String(
+    fixture?.fixtureId ||
+      fixture?.id ||
+      fixture?.fixture?.id ||
+      ""
+  ).trim();
+}
+
+function buildCupGlobalRefreshFixtureIds(cup = {}, nowMs = Date.now()) {
+  const ids = [...new Set(
+    (Array.isArray(cup?.currentWindowFixtureIds) ? cup.currentWindowFixtureIds : [])
+      .map((fixtureId) => String(fixtureId || "").trim())
+      .filter(Boolean)
+  )];
+  if (!ids.length) return [];
+
+  const fixturesById = new Map();
+  for (const fixture of Array.isArray(cup?.currentWindowFixtures) ? cup.currentWindowFixtures : []) {
+    const fixtureId = fixtureIdFromCupFixture(fixture);
+    if (fixtureId) fixturesById.set(fixtureId, { ...(fixture || {}) });
+  }
+  for (const coverage of Array.isArray(cup?.fixtureCoverage) ? cup.fixtureCoverage : []) {
+    const fixtureId = fixtureIdFromCupFixture(coverage);
+    if (!fixtureId) continue;
+    fixturesById.set(fixtureId, {
+      ...(fixturesById.get(fixtureId) || {}),
+      ...(coverage || {}),
+    });
+  }
+
+  const fixtureStatusById =
+    cup?.fixtureStatusById && typeof cup.fixtureStatusById === "object"
+      ? cup.fixtureStatusById
+      : {};
+
+  return ids.filter((fixtureId) => {
+    const fixture = fixturesById.get(fixtureId) || { fixtureId };
+    const statusShort = String(
+      statusShortFromFixture(fixture) ||
+        fixtureStatusById[fixtureId] ||
+        ""
+    ).trim().toUpperCase();
+    const kickoffMs = kickoffMsFromFixture(fixture);
+    const hasKickoff = Number.isFinite(kickoffMs) && kickoffMs > 0;
+    const isLiveStatus = isInPlay(statusShort);
+    const isFinalOrDead = isFinished(statusShort) || isCancelledOrAbandonedStatus(statusShort);
+    const inPregameWindow =
+      hasKickoff &&
+      nowMs >= kickoffMs - TOURNAMENT_PRE_MS &&
+      nowMs < kickoffMs;
+    const kickoffPassedUnfinished =
+      hasKickoff &&
+      nowMs >= kickoffMs &&
+      nowMs <= kickoffMs + TOURNAMENT_POST_MS &&
+      !isFinalOrDead;
+    const recentlyFinished =
+      hasKickoff &&
+      nowMs >= kickoffMs &&
+      nowMs <= kickoffMs + TOURNAMENT_POST_MS &&
+      isFinalOrDead;
+
+    return (
+      isLiveStatus ||
+      inPregameWindow ||
+      kickoffPassedUnfinished ||
+      recentlyFinished
+    );
+  });
+}
+
+function globalSeasonRefreshDocId(seasonTarget = {}) {
+  const seasonKey = String(seasonTarget?.seasonKey || "unknown").trim() || "unknown";
+  const fixtureIds = [...new Set(
+    (Array.isArray(seasonTarget?.fixtureIds) ? seasonTarget.fixtureIds : [])
+      .map((id) => String(id || "").trim())
+      .filter(Boolean)
+  )].sort();
+  const key = `${seasonKey}:${fixtureIds.join("-")}`;
+  return `globalSeasonRefresh_${hashToUint32(key).toString(16)}`;
+}
+
+async function acquireGlobalSeasonRefreshLock({
+  seasonTarget,
+  nowMs = Date.now(),
+  source = "",
+  roomId = "",
+}) {
+  const fixtureIds = [...new Set(
+    (Array.isArray(seasonTarget?.fixtureIds) ? seasonTarget.fixtureIds : [])
+      .map((id) => String(id || "").trim())
+      .filter(Boolean)
+  )].sort();
+  if (!seasonTarget?.seasonKey || !fixtureIds.length) {
+    return { acquired: false, skippedReason: "global-refresh-target-empty" };
+  }
+
+  const ref = db.doc(`apiCache/${globalSeasonRefreshDocId({ ...seasonTarget, fixtureIds })}`);
+  const lockOwner = [
+    "globalSeasonRefresh",
+    seasonTarget.seasonKey,
+    nowMs,
+    Math.random().toString(16).slice(2),
+  ].join(":");
+  let decision = { acquired: false, skippedReason: "unknown" };
+
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    const doc = snap.exists ? (snap.data() || {}) : {};
+    const refreshStartedAtMs = Number(doc?.refreshStartedAtMs || 0);
+    const lastRefreshAtMs = Number(doc?.lastRefreshAtMs || 0);
+    const lockFresh =
+      doc?.refreshInProgress === true &&
+      Number.isFinite(refreshStartedAtMs) &&
+      nowMs - refreshStartedAtMs < GLOBAL_SEASON_REFRESH_LOCK_MS;
+    const recentlyRefreshed =
+      Number.isFinite(lastRefreshAtMs) &&
+      lastRefreshAtMs > 0 &&
+      nowMs - lastRefreshAtMs < GLOBAL_SEASON_REFRESH_DEDUPE_MS;
+
+    if (lockFresh || recentlyRefreshed) {
+      decision = {
+        acquired: false,
+        skippedReason: lockFresh ? "global-refresh-lock-fresh" : "global-refresh-recent",
+        lastRefreshAtMs: lastRefreshAtMs || null,
+        refreshStartedAtMs: refreshStartedAtMs || null,
+      };
+      return;
+    }
+
+    tx.set(
+      ref,
+      {
+        seasonKey: seasonTarget.seasonKey,
+        fixtureIds,
+        fixtureCount: fixtureIds.length,
+        roomIds: Array.isArray(seasonTarget?.roomIds)
+          ? seasonTarget.roomIds.map((id) => String(id || "")).filter(Boolean)
+          : [],
+        refreshInProgress: true,
+        refreshStartedAtMs: nowMs,
+        refreshOwner: lockOwner,
+        refreshSource: source || "",
+        refreshRoomId: roomId || "",
+        updatedAtMs: nowMs,
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+    decision = { acquired: true, refPath: ref.path, fixtureIds };
+  });
+
+  return {
+    ...decision,
+    ref,
+  };
+}
+
+async function finishGlobalSeasonRefreshLock(lock, {
+  nowMs = Date.now(),
+  result = null,
+  error = null,
+} = {}) {
+  if (!lock?.acquired || !lock?.ref) return;
+  await lock.ref.set(
+    {
+      refreshInProgress: false,
+      refreshOwner: FieldValue.delete(),
+      refreshCompletedAtMs: nowMs,
+      lastRefreshAtMs: nowMs,
+      lastFixtureCount: Number(result?.fixtureCount || 0),
+      lastPayloadCount: Number(result?.payloadCount || 0),
+      ...(error
+        ? {
+            lastRefreshErrorAtMs: nowMs,
+            lastRefreshError: String(error?.message || error).slice(0, 500),
+          }
+        : {
+            lastRefreshError: FieldValue.delete(),
+          }),
+      updatedAtMs: nowMs,
+      updatedAt: FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  ).catch(() => {});
+}
+
 async function refreshCupGlobalCacheForRoom({
   roomId,
   room = {},
@@ -8641,6 +9268,29 @@ async function refreshCupGlobalCacheForRoom({
     };
   }
 
+  const competitionState = getCompetitionState(room) || {};
+  const cupStatus = String(cup?.status || cup?.globalApplyStatus || "").trim().toLowerCase();
+  const cupNextPollAtMs = Number(
+    cup?.nextPollAtMs ||
+      competitionState?.nextCupPollAtMs ||
+      competitionState?.nextPollAtMs ||
+      0
+  );
+  if (
+    roomLooksCompleteForPolling(room, competitionState) ||
+    (
+      ["final", "complete", "completed"].includes(cupStatus) &&
+      !(Number.isFinite(cupNextPollAtMs) && cupNextPollAtMs <= nowMs)
+    )
+  ) {
+    return {
+      fixtureCount: 0,
+      payloadCount: 0,
+      skipped: true,
+      skippedReason: "cup-global-room-complete",
+    };
+  }
+
   const seasonTarget = buildCupGlobalSeasonTargetForRoom({ roomId, room, cup });
   if (!seasonTarget) {
     return {
@@ -8650,6 +9300,22 @@ async function refreshCupGlobalCacheForRoom({
       skippedReason: "cup-global-cache-target-missing",
     };
   }
+
+  const refreshFixtureIds = buildCupGlobalRefreshFixtureIds(cup, nowMs);
+  if (!refreshFixtureIds.length) {
+    return {
+      fixtureCount: seasonTarget.fixtureIds.length,
+      refreshFixtureCount: 0,
+      payloadCount: 0,
+      skipped: true,
+      skippedReason: "cup-global-cache-no-active-fixtures",
+    };
+  }
+
+  const activeSeasonTarget = {
+    ...seasonTarget,
+    fixtureIds: refreshFixtureIds,
+  };
 
   const { firstKickoffMs, lastKickoffMs } = getCupGlobalWindowTiming(cup);
   const activeFromMs = firstKickoffMs
@@ -8678,8 +9344,8 @@ async function refreshCupGlobalCacheForRoom({
   // This refresh writes the shared season cache used by every room. The key
   // prevents rooms on the same fixture window from fetching player stats again.
   const refreshKey = [
-    seasonTarget.seasonKey,
-    ...seasonTarget.fixtureIds.map(String).sort(),
+    activeSeasonTarget.seasonKey,
+    ...activeSeasonTarget.fixtureIds.map(String).sort(),
   ].join(":");
   const previousRefresh = cupGlobalRefreshResultByKey.get(refreshKey);
   if (
@@ -8689,8 +9355,8 @@ async function refreshCupGlobalCacheForRoom({
   ) {
     console.log("[pollLiveTournamentWeeks] reused shared Cup global cache refresh", {
       roomId,
-      seasonKey: seasonTarget.seasonKey,
-      fixtureCount: seasonTarget.fixtureIds.length,
+      seasonKey: activeSeasonTarget.seasonKey,
+      fixtureCount: activeSeasonTarget.fixtureIds.length,
       reason,
     });
     return {
@@ -8699,11 +9365,42 @@ async function refreshCupGlobalCacheForRoom({
     };
   }
 
-  const result = await pollGlobalSeasonLiveFixturesOnce({
-    seasonTarget,
-    apiKey,
+  const refreshLock = await acquireGlobalSeasonRefreshLock({
+    seasonTarget: activeSeasonTarget,
     nowMs,
+    source: "refreshCupGlobalCacheForRoom",
+    roomId,
   });
+  if (!refreshLock.acquired) {
+    console.log("[pollLiveTournamentWeeks] skipped Cup global cache refresh due to shared lock", {
+      roomId,
+      seasonKey: activeSeasonTarget.seasonKey,
+      fixtureCount: activeSeasonTarget.fixtureIds.length,
+      skippedReason: refreshLock.skippedReason,
+      reason,
+    });
+    return {
+      fixtureCount: activeSeasonTarget.fixtureIds.length,
+      payloadCount: 0,
+      skipped: true,
+      deduped: true,
+      skippedReason: refreshLock.skippedReason,
+    };
+  }
+
+  let result = null;
+  try {
+    result = await pollGlobalSeasonLiveFixturesOnce({
+      seasonTarget: activeSeasonTarget,
+      apiKey,
+      nowMs,
+    });
+    await finishGlobalSeasonRefreshLock(refreshLock, { nowMs, result });
+  } catch (error) {
+    await finishGlobalSeasonRefreshLock(refreshLock, { nowMs, error });
+    throw error;
+  }
+
   cupGlobalRefreshResultByKey.set(refreshKey, {
     refreshedAtMs: nowMs,
     result,
@@ -8719,8 +9416,10 @@ async function refreshCupGlobalCacheForRoom({
 
   console.log("[pollLiveTournamentWeeks] refreshed Cup global cache before aggregation", {
     roomId,
-    seasonKey: seasonTarget.seasonKey,
+    seasonKey: activeSeasonTarget.seasonKey,
     fixtureCount: result.fixtureCount,
+    fullWindowFixtureCount: seasonTarget.fixtureIds.length,
+    refreshFixtureCount: activeSeasonTarget.fixtureIds.length,
     payloadCount: result.payloadCount,
     reason,
   });
@@ -10921,6 +11620,136 @@ function isOwnerWorldCupRoom(room = {}) {
   );
 }
 
+function isOwnerWorldCupKnockoutRoom(room = {}) {
+  const worldCupPhase = String(
+    room?.worldCupPhase || room?.worldCup?.phase || ""
+  ).trim().toLowerCase();
+  const engineType = String(
+    room?.engineType || room?.worldCup?.engineType || ""
+  ).trim();
+
+  return (
+    worldCupPhase === WORLD_CUP_KNOCKOUT_PHASE ||
+    (
+      engineType === WORLD_CUP_KNOCKOUT_ENGINE &&
+      isWorldCupCompetition({
+        competitionKey: room?.competitionKey,
+        competitionName:
+          room?.competitionMeta?.name ||
+          room?.competition?.name ||
+          "",
+      })
+    )
+  );
+}
+
+function isOwnerCupGlobalPipelineRoom(room = {}) {
+  const pipeline = room?.globalPipeline || {};
+
+  return (
+    getGlobalPipelineMode(room) === "global" ||
+    isOwnerWorldCupKnockoutRoom(room) ||
+    pipeline?.roomAggregator === true ||
+    pipeline?.liveFixtureCache === true ||
+    pipeline?.globalLiveFixtureCache === true ||
+    pipeline?.cupGlobalAutoApply === true ||
+    pipeline?.cupAggregator === true ||
+    pipeline?.cupGlobalCurrentWindowApply === true
+  );
+}
+
+function assertOwnerLegacyCupRoom(room = {}) {
+  assertOwnerCupRoom(room);
+
+  if (isOwnerCupGlobalPipelineRoom(room)) {
+    throw new HttpsError(
+      "failed-precondition",
+      "This room uses the Cup global pipeline. Use Force Global Cup Engine Now instead."
+    );
+  }
+}
+
+function assertOwnerCupGlobalPipelineRoom(room = {}) {
+  assertOwnerCupRoom(room);
+
+  if (!isOwnerCupGlobalPipelineRoom(room)) {
+    throw new HttpsError(
+      "failed-precondition",
+      "This room is not configured for the Cup global pipeline."
+    );
+  }
+}
+
+function ownerNumberMap(map = {}) {
+  const out = {};
+  if (!map || typeof map !== "object") return out;
+
+  for (const [uid, value] of Object.entries(map)) {
+    const key = String(uid || "").trim();
+    const n = Number(value || 0);
+    if (!key || !Number.isFinite(n)) continue;
+    out[key] = n;
+  }
+
+  return out;
+}
+
+function ownerHasNumberMapValues(map = {}) {
+  return Object.values(ownerNumberMap(map)).some(
+    (value) => Number(value || 0) !== 0
+  );
+}
+
+function ownerAddNumberMaps(base = {}, add = {}) {
+  const out = ownerNumberMap(base);
+
+  for (const [uid, value] of Object.entries(ownerNumberMap(add))) {
+    out[uid] = Number(out[uid] || 0) + Number(value || 0);
+  }
+
+  return out;
+}
+
+function ownerSubtractNumberMaps(base = {}, minus = {}) {
+  const out = ownerNumberMap(base);
+
+  for (const [uid, value] of Object.entries(ownerNumberMap(minus))) {
+    out[uid] = Number(out[uid] || 0) - Number(value || 0);
+  }
+
+  return out;
+}
+
+function ownerTotalsFromBreakdownMap(breakdownByUserId = {}) {
+  const out = {};
+  if (!breakdownByUserId || typeof breakdownByUserId !== "object") return out;
+
+  for (const [uid, breakdown] of Object.entries(breakdownByUserId)) {
+    const key = String(uid || "").trim();
+    if (!key || !breakdown || typeof breakdown !== "object") continue;
+
+    const explicitTotal = Number(breakdown.total);
+    if (Number.isFinite(explicitTotal)) {
+      out[key] = explicitTotal;
+      continue;
+    }
+
+    const starterTotal = Array.isArray(breakdown.starters)
+      ? breakdown.starters.reduce(
+          (sum, player) => sum + Number(player?.points || 0),
+          0
+        )
+      : Object.values(breakdown.perPlayer || {}).reduce((sum, player) => {
+          if (player?.counted === false) return sum;
+          return sum + Number(player?.points || 0);
+        }, 0);
+
+    out[key] = Number.isFinite(starterTotal) ? starterTotal : 0;
+  }
+
+  return out;
+}
+
 function worldCupRepairPlayerIds(player = {}, fallbackId = "") {
   return Array.from(
     new Set(
@@ -11434,7 +12263,7 @@ exports.ownerRunCupEngineNow = onCall(
       const uid = requireOwnerActionUid(request);
       const roomId = getOwnerActionRoomId(request);
       const { roomRef, room } = await loadOwnerActionRoom(roomId);
-      assertOwnerCupRoom(room);
+      assertOwnerLegacyCupRoom(room);
       logOwnerAction(functionName, { functionName, uid, roomId, nowMs });
 
       await setCompetitionState(
@@ -11513,6 +12342,452 @@ exports.ownerRunCupEngineNow = onCall(
         competitionState: freshRoomSnap.exists
           ? getCompetitionState(freshRoomSnap.data() || {})
           : null,
+      };
+    } catch (err) {
+      handleOwnerActionError(functionName, err);
+    }
+  }
+);
+
+exports.ownerRunCupGlobalEngineNow = onCall(
+  { region: "us-west2", secrets: [APIFOOTBALL_KEY], timeoutSeconds: 540, memory: "1GiB" },
+  async (request) => {
+    const functionName = "ownerRunCupGlobalEngineNow";
+    const nowMs = Date.now();
+
+    try {
+      const uid = requireOwnerActionUid(request);
+      const roomId = getOwnerActionRoomId(request);
+      const { roomRef, room } = await loadOwnerActionRoom(roomId);
+      assertOwnerCupGlobalPipelineRoom(room);
+      logOwnerAction(functionName, { functionName, uid, roomId, nowMs });
+
+      const cupRef = db.doc(`rooms/${roomId}/cup/current`);
+      let cupSnap = await cupRef.get();
+      let cup = cupSnap.exists ? (cupSnap.data() || {}) : {};
+      let fixtureIds = Array.isArray(cup?.currentWindowFixtureIds)
+        ? cup.currentWindowFixtureIds.map(String).filter(Boolean)
+        : [];
+
+      if (!fixtureIds.length) {
+        await armNextCupGlobalWindowFromCache({
+          db,
+          roomId,
+          room,
+          nowMs,
+        });
+
+        cupSnap = await cupRef.get();
+        cup = cupSnap.exists ? (cupSnap.data() || {}) : {};
+        fixtureIds = Array.isArray(cup?.currentWindowFixtureIds)
+          ? cup.currentWindowFixtureIds.map(String).filter(Boolean)
+          : [];
+      }
+
+      if (!fixtureIds.length) {
+        throw new HttpsError(
+          "failed-precondition",
+          "Cup global engine requires cup/current.currentWindowFixtureIds."
+        );
+      }
+
+      let refreshResult = null;
+      try {
+        refreshResult = await refreshCupGlobalCacheForRoom({
+          roomId,
+          room,
+          cup,
+          apiKey: APIFOOTBALL_KEY.value(),
+          nowMs,
+          reason: "owner-run-cup-global-engine-now",
+        });
+      } catch (refreshError) {
+        if (isApiFootballCooldownError(refreshError)) {
+          throw refreshError;
+        }
+
+        console.warn("[ownerRunCupGlobalEngineNow] cache refresh failed; using existing global cache", {
+          roomId,
+          code: refreshError?.code,
+          message: refreshError?.message,
+        });
+        refreshResult = {
+          skipped: true,
+          skippedReason: "refresh-failed-existing-cache",
+          errorMessage: refreshError?.message || String(refreshError),
+        };
+      }
+
+      const result = await computeCupCurrentWindowFromGlobalCache({
+        db,
+        roomId,
+        nowMs,
+        writeMode: "global",
+        dryRun: false,
+      });
+
+      const statusValue = String(result?.statusValue || result?.status || "").toLowerCase();
+      const nextKickoffMsRaw = Number(result?.nextKickoffMs || 0);
+      const resultNextPollAtMsRaw = Number(result?.nextPollAtMs || 0);
+      const nextKickoffMs =
+        Number.isFinite(nextKickoffMsRaw) && nextKickoffMsRaw > 0
+          ? nextKickoffMsRaw
+          : null;
+      const nextPollAtMs =
+        Number.isFinite(resultNextPollAtMsRaw) && resultNextPollAtMsRaw > nowMs
+          ? resultNextPollAtMsRaw
+          : statusValue === "live" || statusValue === "resolving"
+            ? nowMs + TOURNAMENT_ACTIVE_POLL_MS
+            : statusValue === "final" || result?.allFinished === true
+              ? null
+              : nextKickoffMs
+                ? getNextPollAtMsFromFixtures(
+                    [{ fixtureId: "cup-window", kickoffMs: nextKickoffMs }],
+                    nowMs
+                  ).nextPollAtMs
+                : nowMs + TOURNAMENT_UNKNOWN_RECHECK_MS;
+      const nextWeekStatus =
+        statusValue === "live"
+          ? "live"
+          : statusValue === "resolving"
+            ? "resolving"
+            : statusValue === "final"
+              ? "resolving"
+              : "scheduled";
+
+      if (Number.isFinite(Number(nextPollAtMs)) && Number(nextPollAtMs) > nowMs) {
+        await setCompetitionState(
+          roomRef,
+          {
+            phaseLabel: "Cup",
+            weekStatus: nextWeekStatus,
+            nextPollAtMs,
+            nextCupPollAtMs: nextPollAtMs,
+            nextKickoffMs,
+            isDone: false,
+            ...buildTournamentPollDebugLabels(room, nextPollAtMs, nextKickoffMs),
+          },
+          { roomData: room, nowMs }
+        );
+        await upsertTournamentPollTask({
+          roomId,
+          phase: "Cup",
+          nextPollAtMs,
+          reason: "owner-run-cup-global-engine-now",
+          nowMs,
+        });
+      } else {
+        await deleteTournamentPollTask(roomId);
+      }
+
+      const [freshCupSnap, freshRoomSnap] = await Promise.all([
+        cupRef.get(),
+        roomRef.get(),
+      ]);
+      const freshCup = freshCupSnap.exists ? (freshCupSnap.data() || {}) : {};
+      const freshRoom = freshRoomSnap.exists ? (freshRoomSnap.data() || {}) : {};
+
+      return {
+        ok: true,
+        roomId,
+        mode: "cup-global-engine-now",
+        refreshSkipped: Boolean(refreshResult?.skipped),
+        refreshSkippedReason: refreshResult?.skippedReason || null,
+        refreshFixtureCount: Number(refreshResult?.refreshFixtureCount || 0),
+        fullWindowFixtureCount: Number(
+          Array.isArray(freshCup?.currentWindowFixtureIds)
+            ? freshCup.currentWindowFixtureIds.length
+            : fixtureIds.length
+        ),
+        payloadCount: Number(refreshResult?.payloadCount || 0),
+        realWriteApplied: Boolean(result.realWriteApplied),
+        fixtureCount: Number(result.fixtureCount || 0),
+        missingFixtureCount: Number(result.missingFixtureCount || 0),
+        statusValue: result.statusValue || null,
+        allFinished: Boolean(result.allFinished),
+        anyInPlay: Boolean(result.anyInPlay),
+        nextPollAtMs: nextPollAtMs || null,
+        nextKickoffMs,
+        queueUpdated:
+          Number.isFinite(Number(nextPollAtMs)) && Number(nextPollAtMs) > nowMs,
+        queueDeleted:
+          !(Number.isFinite(Number(nextPollAtMs)) && Number(nextPollAtMs) > nowMs),
+        cupSummary: {
+          status: freshCup?.status || null,
+          globalApplyStatus: freshCup?.globalApplyStatus || null,
+          currentWindowLabel: freshCup?.currentWindowLabel || null,
+          currentWindowFixtureIds: Array.isArray(freshCup?.currentWindowFixtureIds)
+            ? freshCup.currentWindowFixtureIds
+            : [],
+          projectedTotalsByUid: freshCup?.projectedTotalsByUid || {},
+          livePointsByUid: freshCup?.livePointsByUid || {},
+        },
+        competitionState: getCompetitionState(freshRoom) || null,
+        writtenPath: `rooms/${roomId}/cup/current`,
+        auditPath: `rooms/${roomId}/globalShadowResults/cup-apply-current-window`,
+      };
+    } catch (err) {
+      handleOwnerActionError(functionName, err);
+    }
+  }
+);
+
+exports.ownerRepairCupGlobalDuplicateCurrentWindow = onCall(
+  { region: "us-west2", timeoutSeconds: 120, memory: "512MiB" },
+  async (request) => {
+    const functionName = "ownerRepairCupGlobalDuplicateCurrentWindow";
+    const nowMs = Date.now();
+
+    try {
+      const uid = requireOwnerActionUid(request);
+      const roomId = getOwnerActionRoomId(request);
+      if (request.data?.confirm !== "REPAIR_CUP_GLOBAL_DUPLICATE_WINDOW") {
+        throw new HttpsError(
+          "failed-precondition",
+          "Cup global duplicate-window repair requires confirm='REPAIR_CUP_GLOBAL_DUPLICATE_WINDOW'."
+        );
+      }
+
+      const { room } = await loadOwnerActionRoom(roomId);
+      assertOwnerCupGlobalPipelineRoom(room);
+      logOwnerAction(functionName, { functionName, uid, roomId, nowMs });
+
+      const cupRef = db.doc(`rooms/${roomId}/cup/current`);
+      const cupSnap = await cupRef.get();
+      if (!cupSnap.exists) {
+        throw new HttpsError("not-found", "cup/current was not found.");
+      }
+
+      const cup = cupSnap.data() || {};
+      const fixtureIds = [...new Set(
+        (Array.isArray(cup?.currentWindowFixtureIds)
+          ? cup.currentWindowFixtureIds
+          : [])
+          .map((fixtureId) => String(fixtureId || "").trim())
+          .filter(Boolean)
+      )];
+      const creditedFixtures =
+        cup?.creditedFixtures && typeof cup.creditedFixtures === "object"
+          ? cup.creditedFixtures
+          : {};
+      const creditedCurrentWindowFixtureIds = fixtureIds.filter((fixtureId) =>
+        Boolean(creditedFixtures[fixtureId])
+      );
+      const currentGlobalBreakdownByUserId =
+        cup?.globalCurrentWindowBreakdownByUserId &&
+        typeof cup.globalCurrentWindowBreakdownByUserId === "object" &&
+        Object.keys(cup.globalCurrentWindowBreakdownByUserId).length
+          ? cup.globalCurrentWindowBreakdownByUserId
+          : cup?.liveBreakdownByUserId &&
+            typeof cup.liveBreakdownByUserId === "object"
+            ? cup.liveBreakdownByUserId
+            : {};
+      const currentGlobalPointsByUid = ownerHasNumberMapValues(
+        cup?.globalCurrentWindowPointsByUid
+      )
+        ? ownerNumberMap(cup.globalCurrentWindowPointsByUid)
+        : ownerHasNumberMapValues(cup?.livePointsByUid)
+          ? ownerNumberMap(cup.livePointsByUid)
+          : ownerTotalsFromBreakdownMap(currentGlobalBreakdownByUserId);
+      const legacyBreakdownByUserId =
+        cup?.windowBreakdownByUserId &&
+        typeof cup.windowBreakdownByUserId === "object" &&
+        Object.keys(cup.windowBreakdownByUserId).length
+          ? cup.windowBreakdownByUserId
+          : cup?.breakdownByUserId &&
+            typeof cup.breakdownByUserId === "object"
+            ? cup.breakdownByUserId
+            : {};
+      const legacyWindowPointsByUid = ownerHasNumberMapValues(cup?.windowPointsByUid)
+        ? ownerNumberMap(cup.windowPointsByUid)
+        : ownerTotalsFromBreakdownMap(legacyBreakdownByUserId);
+      const duplicateDetected =
+        ownerHasNumberMapValues(legacyWindowPointsByUid) ||
+        creditedCurrentWindowFixtureIds.length > 0 ||
+        (
+          Object.keys(legacyBreakdownByUserId || {}).length > 0 &&
+          Object.keys(currentGlobalBreakdownByUserId || {}).length > 0
+        );
+      const storedGlobalBaseTotalsByUid =
+        cup?.globalBaseTotalsByUid &&
+        typeof cup.globalBaseTotalsByUid === "object" &&
+        Object.keys(cup.globalBaseTotalsByUid).length
+          ? ownerNumberMap(cup.globalBaseTotalsByUid)
+          : null;
+      const previousPublicTotalsByUid = ownerHasNumberMapValues(cup?.projectedTotalsByUid)
+        ? ownerNumberMap(cup.projectedTotalsByUid)
+        : ownerAddNumberMaps(
+            cup?.creditedTotalsByUid || cup?.cupTotalsByUid || {},
+            cup?.livePointsByUid || {}
+          );
+      const baseSourceTotalsByUid = ownerHasNumberMapValues(cup?.cupTotalsByUid)
+        ? ownerNumberMap(cup.cupTotalsByUid)
+        : ownerNumberMap(cup?.creditedTotalsByUid || {});
+      const baseTotalsByUid = storedGlobalBaseTotalsByUid ||
+        (duplicateDetected && ownerHasNumberMapValues(legacyWindowPointsByUid)
+          ? ownerSubtractNumberMaps(baseSourceTotalsByUid, legacyWindowPointsByUid)
+          : ownerNumberMap(cup?.creditedTotalsByUid || baseSourceTotalsByUid));
+      const projectedTotalsByUid = ownerAddNumberMaps(
+        baseTotalsByUid,
+        currentGlobalPointsByUid
+      );
+      const affectedUids = [...new Set([
+        ...Object.keys(previousPublicTotalsByUid),
+        ...Object.keys(projectedTotalsByUid),
+        ...Object.keys(legacyWindowPointsByUid),
+      ])].filter((uid) =>
+        Number(previousPublicTotalsByUid[uid] || 0) !==
+          Number(projectedTotalsByUid[uid] || 0) ||
+        Number(legacyWindowPointsByUid[uid] || 0) !== 0
+      );
+      const backupPath = `rooms/${roomId}/globalShadowResults/cup-global-duplicate-window-backup-${nowMs}`;
+      const currentWindowFixtureIdSet = new Set(fixtureIds);
+      const fixtureLedgerSnap = await cupRef.collection("fixtures").get();
+      const legacyFixtureLedgerDocs = fixtureLedgerSnap.docs
+        .map((docSnap) => {
+          const data = docSnap.data() || {};
+          const fixtureId = String(data.fixtureId || docSnap.id || "").trim();
+          return {
+            ref: docSnap.ref,
+            id: docSnap.id,
+            fixtureId,
+            data,
+          };
+        })
+        .filter((row) =>
+          fixtureIds.length > 0 &&
+          currentWindowFixtureIdSet.has(String(row.fixtureId || row.id))
+        );
+
+      await db.doc(backupPath).set(
+        {
+          roomId,
+          mode: "cup-global-duplicate-window-backup",
+          originalCupCurrent: cup,
+          originalCupFixtureLedgerDocs: legacyFixtureLedgerDocs.map((row) => ({
+            id: row.id,
+            fixtureId: row.fixtureId,
+            data: row.data,
+          })),
+          duplicateDetected,
+          affectedUids,
+          backedUpAtMs: nowMs,
+          backedUpAt: FieldValue.serverTimestamp(),
+        },
+        { merge: false }
+      );
+
+      if (legacyFixtureLedgerDocs.length) {
+        const batch = db.batch();
+        legacyFixtureLedgerDocs.forEach((row) => batch.delete(row.ref));
+        await batch.commit();
+      }
+
+      const standingsRows = Object.entries(projectedTotalsByUid)
+        .map(([rowUid, total]) => {
+          const breakdown = currentGlobalBreakdownByUserId[rowUid] || {};
+          const displayName =
+            breakdown.displayName ||
+            breakdown.name ||
+            rowUid;
+          return {
+            rank: 0,
+            uid: rowUid,
+            userId: rowUid,
+            name: displayName,
+            displayName,
+            teamName: breakdown.teamName || "",
+            totalFantasyPoints: Number(total || 0),
+          };
+        })
+        .sort((a, b) =>
+          Number(b.totalFantasyPoints || 0) - Number(a.totalFantasyPoints || 0)
+        )
+        .map((row, index) => ({ ...row, rank: index + 1 }));
+
+      await cupRef.set(
+        {
+          creditedTotalsByUid: baseTotalsByUid,
+          cupTotalsByUid: baseTotalsByUid,
+          globalBaseTotalsByUid: baseTotalsByUid,
+          globalBaseAdjustedForCurrentWindow: duplicateDetected,
+          removedLegacyWindowPointsByUid: legacyWindowPointsByUid,
+          creditedCurrentWindowFixtureIds,
+          projectedTotalsByUid,
+          projectedStandingsRows: standingsRows,
+          standingsRows,
+          standings: standingsRows,
+          leaderboard: standingsRows,
+          rows: standingsRows,
+          projectedIncludesLivePoints: Object.values(currentGlobalPointsByUid)
+            .some((value) => Number(value || 0) !== 0),
+          globalCurrentWindowPointsByUid: currentGlobalPointsByUid,
+          globalCurrentWindowBreakdownByUserId: currentGlobalBreakdownByUserId,
+          livePointsByUid: currentGlobalPointsByUid,
+          liveBreakdownByUserId: currentGlobalBreakdownByUserId,
+          windowPointsByUid: {},
+          windowBenchPointsByUid: {},
+          windowBreakdownByUserId: {},
+          breakdownByUserId: {},
+          creditedFixtures: {},
+          duplicateGlobalRepairAtMs: nowMs,
+          duplicateGlobalRepairBackupPath: backupPath,
+          updatedAtMs: nowMs,
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      await db.doc(`rooms/${roomId}/standings/current`).set(
+        {
+          roomId,
+          mode: "cup",
+          source: "global-live-fixtures",
+          projectionOnly: true,
+          creditedTotalsByUid: baseTotalsByUid,
+          globalBaseTotalsByUid: baseTotalsByUid,
+          globalBaseAdjustedForCurrentWindow: duplicateDetected,
+          removedLegacyWindowPointsByUid: legacyWindowPointsByUid,
+          projectedTotalsByUid,
+          livePointsByUid: currentGlobalPointsByUid,
+          includesLivePoints: Object.values(currentGlobalPointsByUid)
+            .some((value) => Number(value || 0) !== 0),
+          standings: standingsRows,
+          projectedStandingsRows: standingsRows,
+          leaderboard: standingsRows,
+          rows: standingsRows,
+          standingsRows,
+          cupTotalsByUid: FieldValue.delete(),
+          windowPointsByUid: FieldValue.delete(),
+          windowBreakdownByUserId: FieldValue.delete(),
+          breakdownByUserId: FieldValue.delete(),
+          legacyWindowPointsByUid: FieldValue.delete(),
+          legacyLivePointsByUid: FieldValue.delete(),
+          totalFantasyPointsByUid: FieldValue.delete(),
+          repairedDuplicateCurrentWindowAtMs: nowMs,
+          updatedAtMs: nowMs,
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      return {
+        ok: true,
+        roomId,
+        mode: "cup-global-duplicate-current-window-repair",
+        duplicateDetected,
+        affectedUids,
+        beforeTotalsByUid: previousPublicTotalsByUid,
+        afterTotalsByUid: projectedTotalsByUid,
+        baseTotalsByUid,
+        currentGlobalPointsByUid,
+        removedLegacyWindowPointsByUid: legacyWindowPointsByUid,
+        creditedCurrentWindowFixtureIds,
+        deletedFixtureLedgerCount: legacyFixtureLedgerDocs.length,
+        deletedFixtureLedgerIds: legacyFixtureLedgerDocs.map((row) => row.id),
+        backupPath,
+        writtenPath: `rooms/${roomId}/cup/current`,
+        standingsPath: `rooms/${roomId}/standings/current`,
       };
     } catch (err) {
       handleOwnerActionError(functionName, err);
@@ -12151,6 +13426,18 @@ exports.ownerRefreshCupGlobalFixtureCache = onCall(
           elapsed: detail.elapsed ?? null,
           extra: detail.extra ?? null,
           kickoffMs: detail.kickoffMs ?? null,
+          isLive: isInPlay(statusShort),
+          isFinished: isFinished(statusShort),
+          homeTeamId: detail.homeTeamId ?? null,
+          homeTeamName: detail.homeTeamName || "",
+          homeTeamLogo: detail.homeTeamLogo || "",
+          awayTeamId: detail.awayTeamId ?? null,
+          awayTeamName: detail.awayTeamName || "",
+          awayTeamLogo: detail.awayTeamLogo || "",
+          goalsHome: toNum(detail.goalsHome),
+          goalsAway: toNum(detail.goalsAway),
+          homeScore: toNum(detail.goalsHome),
+          awayScore: toNum(detail.goalsAway),
           rawStatsByPlayerId,
           fantasyByPlayerId,
           rawStatsPlayerCount: Object.keys(rawStatsByPlayerId || {}).length,
@@ -15053,6 +16340,13 @@ exports.pollGlobalSeasonLiveFixtures = onSchedule(
         continue;
       }
 
+      const room = roomSnap.data() || {};
+      const competitionState = getCompetitionState(room) || {};
+      if (roomLooksCompleteForPolling(room, competitionState)) {
+        await taskDoc.ref.delete().catch(() => {});
+        continue;
+      }
+
       roomDocsById.set(roomId, roomSnap);
     }
 
@@ -15092,17 +16386,38 @@ exports.pollGlobalSeasonLiveFixtures = onSchedule(
     }
 
     for (const seasonTarget of seasonTargets) {
+      let refreshLock = null;
       try {
+        refreshLock = await acquireGlobalSeasonRefreshLock({
+          seasonTarget,
+          nowMs,
+          source: "pollGlobalSeasonLiveFixtures",
+        });
+        if (!refreshLock.acquired) {
+          console.log("[pollGlobalSeasonLiveFixtures] skipped shared cache refresh", {
+            seasonKey: seasonTarget?.seasonKey || "unknown",
+            fixtureCount: Array.isArray(seasonTarget?.fixtureIds)
+              ? seasonTarget.fixtureIds.length
+              : 0,
+            skippedReason: refreshLock.skippedReason,
+            roomIds: seasonTarget?.roomIds || [],
+          });
+          continue;
+        }
+
         const result = await pollGlobalSeasonLiveFixturesOnce({
           seasonTarget,
           apiKey,
           nowMs,
         });
+        await finishGlobalSeasonRefreshLock(refreshLock, { nowMs, result });
 
         console.log(
           `[pollGlobalSeasonLiveFixtures] season=${seasonTarget.seasonKey} fixtures=${result.fixtureCount} payloads=${result.payloadCount} statChecks=${result.uniqueFixtureStatsChecked || 0} statApiCalls=${result.fixturePlayerStatsApiCalls || 0} lockSkips=${result.fixturePlayerStatsLockSkips || 0}`
         );
       } catch (e) {
+        await finishGlobalSeasonRefreshLock(refreshLock, { nowMs, error: e });
+
         if (isApiFootballCooldownError(e)) {
           const retryAtMs = getApiFootballCooldownRetryAtMs(e, nowMs);
           const reason = apiFootballCooldownReason(e);

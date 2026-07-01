@@ -206,6 +206,14 @@ function createCupGlobalEngine(deps = {}) {
         round: summary?.roundLabel || summary?.leagueRound || summary?.round || nextWindow.label || null,
         statusShort: summary?.statusShort || summary?.short || null,
         statusLong: summary?.statusLong || null,
+        elapsed: firstNumber(summary?.elapsed),
+        extra: firstNumber(summary?.extra),
+        isLive: summary?.isLive === true,
+        isFinished: summary?.isFinished === true,
+        goalsHome: firstNumber(summary?.goalsHome, summary?.homeGoals, summary?.homeScore),
+        goalsAway: firstNumber(summary?.goalsAway, summary?.awayGoals, summary?.awayScore),
+        homeScore: firstNumber(summary?.goalsHome, summary?.homeGoals, summary?.homeScore),
+        awayScore: firstNumber(summary?.goalsAway, summary?.awayGoals, summary?.awayScore),
         homeTeamId: summary?.homeTeamId ?? null,
         homeTeamName: summary?.homeTeamName || "",
         homeTeamLogo: summary?.homeTeamLogo || "",
@@ -283,6 +291,191 @@ function createCupGlobalEngine(deps = {}) {
     return Number.isFinite(kickoffMs) && kickoffMs > 0 ? kickoffMs : null;
   }
 
+  function firstDefined(...values) {
+    for (const value of values) {
+      if (value !== undefined && value !== null && value !== "") return value;
+    }
+    return null;
+  }
+
+  function firstText(...values) {
+    const value = firstDefined(...values);
+    return value == null ? null : String(value).trim() || null;
+  }
+
+  function firstNumber(...values) {
+    for (const value of values) {
+      if (value === undefined || value === null || value === "") continue;
+      const n = Number(value);
+      if (Number.isFinite(n)) return n;
+    }
+    return null;
+  }
+
+  function statusShortFromFixtureLike(value = {}) {
+    if (!value || typeof value !== "object") {
+      return firstText(value);
+    }
+
+    return firstText(
+      value.statusShort,
+      value.short,
+      value.status?.short,
+      value.fixture?.status?.short,
+      value.fixtureStatus,
+      value.matchStatus,
+      value.status
+    );
+  }
+
+  function buildCupFixtureCoverageRow({
+    fixtureId,
+    live = null,
+    summary = null,
+    cupFixture = {},
+    rawSample = {},
+    cup = {},
+  }) {
+    const statusShort = firstText(
+      statusShortFromFixtureLike(live),
+      statusShortFromFixtureLike(summary),
+      statusShortFromFixtureLike(cupFixture),
+      statusShortFromFixtureLike(rawSample)
+    );
+    const statusLong = firstText(
+      live?.statusLong,
+      live?.long,
+      summary?.statusLong,
+      summary?.long,
+      cupFixture?.statusLong,
+      cupFixture?.fixture?.status?.long,
+      rawSample?.statusLong
+    );
+    const kickoffMs = firstNumber(
+      live?.kickoffMs,
+      live?.kickoffAtMs,
+      live?.startAtMs,
+      summary?.kickoffMs,
+      summary?.kickoffAtMs,
+      summary?.startAtMs,
+      cupFixture?.kickoffMs,
+      cupFixture?.startAtMs,
+      cupFixture?.fixture?.timestamp,
+      rawSample?.kickoffMs,
+      cup?.currentWindowStartAtMs
+    );
+    const normalizedKickoffMs =
+      kickoffMs && kickoffMs < 100000000000 ? kickoffMs * 1000 : kickoffMs;
+    const goalsHome = firstNumber(
+      live?.goalsHome,
+      live?.homeGoals,
+      live?.homeScore,
+      live?.goals?.home,
+      summary?.goalsHome,
+      summary?.homeGoals,
+      summary?.homeScore,
+      summary?.goals?.home,
+      cupFixture?.goalsHome,
+      cupFixture?.homeGoals,
+      cupFixture?.homeScore,
+      cupFixture?.goals?.home,
+      rawSample?.goalsHome,
+      rawSample?.homeGoals,
+      rawSample?.homeScore
+    );
+    const goalsAway = firstNumber(
+      live?.goalsAway,
+      live?.awayGoals,
+      live?.awayScore,
+      live?.goals?.away,
+      summary?.goalsAway,
+      summary?.awayGoals,
+      summary?.awayScore,
+      summary?.goals?.away,
+      cupFixture?.goalsAway,
+      cupFixture?.awayGoals,
+      cupFixture?.awayScore,
+      cupFixture?.goals?.away,
+      rawSample?.goalsAway,
+      rawSample?.awayGoals,
+      rawSample?.awayScore
+    );
+    const elapsed = firstNumber(
+      live?.elapsed,
+      summary?.elapsed,
+      cupFixture?.elapsed,
+      cupFixture?.fixture?.status?.elapsed,
+      rawSample?.elapsed
+    );
+    const extra = firstNumber(
+      live?.extra,
+      summary?.extra,
+      cupFixture?.extra,
+      cupFixture?.fixture?.status?.extra,
+      rawSample?.extra
+    );
+    const statusUpper = String(statusShort || "").trim().toUpperCase();
+    const isLiveValue = firstDefined(live?.isLive, summary?.isLive, cupFixture?.isLive);
+    const isFinishedValue = firstDefined(live?.isFinished, summary?.isFinished, cupFixture?.isFinished);
+    const fantasyByPlayerId =
+      live?.fantasyByPlayerId && typeof live.fantasyByPlayerId === "object"
+        ? live.fantasyByPlayerId
+        : {};
+    const rawStatsByPlayerId =
+      live?.rawStatsByPlayerId && typeof live.rawStatsByPlayerId === "object"
+        ? live.rawStatsByPlayerId
+        : {};
+
+    return {
+      fixtureId: String(fixtureId),
+      hasLivePayload: Boolean(live),
+      hasSummary: Boolean(summary),
+      statusShort: statusShort || null,
+      statusLong: statusLong || null,
+      kickoffMs: normalizedKickoffMs || null,
+      elapsed,
+      extra,
+      isLive:
+        typeof isLiveValue === "boolean"
+          ? isLiveValue
+          : Boolean(statusUpper && isInPlay(statusUpper) && !isFinished(statusUpper)),
+      isFinished:
+        typeof isFinishedValue === "boolean"
+          ? isFinishedValue
+          : Boolean(statusUpper && isFinished(statusUpper)),
+      goalsHome,
+      goalsAway,
+      homeScore: goalsHome,
+      awayScore: goalsAway,
+      homeTeamId: firstDefined(live?.homeTeamId, summary?.homeTeamId, cupFixture?.homeTeamId),
+      awayTeamId: firstDefined(live?.awayTeamId, summary?.awayTeamId, cupFixture?.awayTeamId),
+      homeTeamName: firstText(
+        live?.homeTeamName,
+        live?.homeTeam,
+        summary?.homeTeamName,
+        summary?.homeTeam,
+        cupFixture?.homeTeamName,
+        cupFixture?.homeTeam,
+        cupFixture?.teams?.home?.name,
+        rawSample?.homeTeamName
+      ) || "",
+      awayTeamName: firstText(
+        live?.awayTeamName,
+        live?.awayTeam,
+        summary?.awayTeamName,
+        summary?.awayTeam,
+        cupFixture?.awayTeamName,
+        cupFixture?.awayTeam,
+        cupFixture?.teams?.away?.name,
+        rawSample?.awayTeamName
+      ) || "",
+      homeTeamLogo: firstText(live?.homeTeamLogo, summary?.homeTeamLogo, cupFixture?.homeTeamLogo, cupFixture?.teams?.home?.logo, rawSample?.homeTeamLogo) || "",
+      awayTeamLogo: firstText(live?.awayTeamLogo, summary?.awayTeamLogo, cupFixture?.awayTeamLogo, cupFixture?.teams?.away?.logo, rawSample?.awayTeamLogo) || "",
+      fantasyPlayerCount: Object.keys(fantasyByPlayerId).length,
+      rawStatsPlayerCount: Object.keys(rawStatsByPlayerId).length,
+    };
+  }
+
   function isCoverageInActiveWakeWindow(coverage = {}, nowMs = Date.now()) {
     const kickoffMs = coverageKickoffMs(coverage);
     return (
@@ -301,6 +494,246 @@ function createCupGlobalEngine(deps = {}) {
     );
   }
 
+  function isCoverageNonPlayable(coverage = {}) {
+    return ["CANC", "PST", "TBD", "ABD", "AWD", "WO"].includes(
+      coverageStatusShort(coverage)
+    );
+  }
+
+  function isCoverageKickoffPassedUnfinished(coverage = {}, nowMs = Date.now()) {
+    const kickoffMs = coverageKickoffMs(coverage);
+    return (
+      Number.isFinite(kickoffMs) &&
+      kickoffMs <= nowMs &&
+      !isFinished(coverageStatusShort(coverage)) &&
+      !isCoverageNonPlayable(coverage)
+    );
+  }
+
+  function isCoverageResolvingAfterKickoffTail(coverage = {}, nowMs = Date.now()) {
+    const kickoffMs = coverageKickoffMs(coverage);
+    return (
+      isCoverageKickoffPassedUnfinished(coverage, nowMs) &&
+      Number.isFinite(kickoffMs) &&
+      nowMs > kickoffMs + CUP_GLOBAL_POST_MS
+    );
+  }
+
+  function coverageNeedsLiveFixturePayload(coverage = {}, nowMs = Date.now()) {
+    const kickoffMs = coverageKickoffMs(coverage);
+    const short = coverageStatusShort(coverage);
+    return (
+      isInPlay(short) ||
+      isFinished(short) ||
+      (
+        Number.isFinite(kickoffMs) &&
+        kickoffMs <= nowMs &&
+        !isCoverageNonPlayable(coverage)
+      )
+    );
+  }
+
+  function nextCupGlobalPollAtFromCoverage({
+    fixtureCoverage = [],
+    nowMs = Date.now(),
+    statusValue = "",
+    allFinished = false,
+  } = {}) {
+    const status = String(statusValue || "").toLowerCase();
+    if (!allFinished && (status === "live" || status === "resolving")) {
+      return nowMs + CUP_GLOBAL_ACTIVE_POLL_MS;
+    }
+
+    const nextKickoffMs = (Array.isArray(fixtureCoverage) ? fixtureCoverage : [])
+      .map((coverage) => Number(coverage?.kickoffMs || 0))
+      .filter((kickoffMs) => Number.isFinite(kickoffMs) && kickoffMs > nowMs)
+      .sort((a, b) => a - b)[0] || null;
+
+    if (!nextKickoffMs) {
+      return allFinished ? null : nowMs + CUP_GLOBAL_RETRY_MS;
+    }
+
+    if (nowMs < nextKickoffMs - CUP_GLOBAL_ACTIVE_PRE_MS) {
+      return nextKickoffMs - CUP_GLOBAL_ACTIVE_PRE_MS;
+    }
+
+    if (nowMs < nextKickoffMs) {
+      return Math.min(nowMs + CUP_GLOBAL_PREGAME_POLL_MS, nextKickoffMs);
+    }
+
+    return nowMs + CUP_GLOBAL_ACTIVE_POLL_MS;
+  }
+
+  function normalizeCupGlobalNumberMap(map = {}) {
+    const out = {};
+    if (!map || typeof map !== "object") return out;
+
+    for (const [uid, value] of Object.entries(map)) {
+      const key = String(uid || "").trim();
+      const n = Number(value || 0);
+      if (!key || !Number.isFinite(n)) continue;
+      out[key] = n;
+    }
+
+    return out;
+  }
+
+  function hasCupGlobalNumberValues(map = {}) {
+    return Object.values(normalizeCupGlobalNumberMap(map)).some(
+      (value) => Number(value || 0) !== 0
+    );
+  }
+
+  function cupGlobalTotalsFromBreakdownMap(breakdownByUserId = {}) {
+    const out = {};
+    if (!breakdownByUserId || typeof breakdownByUserId !== "object") return out;
+
+    for (const [uid, breakdown] of Object.entries(breakdownByUserId)) {
+      const key = String(uid || "").trim();
+      if (!key || !breakdown || typeof breakdown !== "object") continue;
+
+      const explicitTotal = Number(breakdown.total);
+      if (Number.isFinite(explicitTotal)) {
+        out[key] = explicitTotal;
+        continue;
+      }
+
+      const starterTotal = Array.isArray(breakdown.starters)
+        ? breakdown.starters.reduce(
+            (sum, player) => sum + Number(player?.points || 0),
+            0
+          )
+        : Object.values(breakdown.perPlayer || {}).reduce((sum, player) => {
+            if (player?.counted === false) return sum;
+            return sum + Number(player?.points || 0);
+          }, 0);
+
+      out[key] = Number.isFinite(starterTotal) ? starterTotal : 0;
+    }
+
+    return out;
+  }
+
+  function subtractCupGlobalNumberMaps(base = {}, minus = {}) {
+    const out = normalizeCupGlobalNumberMap(base);
+
+    for (const [uid, value] of Object.entries(normalizeCupGlobalNumberMap(minus))) {
+      out[uid] = Number(out[uid] || 0) - Number(value || 0);
+    }
+
+    return out;
+  }
+
+  function addCupGlobalNumberMaps(base = {}, add = {}) {
+    const out = normalizeCupGlobalNumberMap(base);
+
+    for (const [uid, value] of Object.entries(normalizeCupGlobalNumberMap(add))) {
+      out[uid] = Number(out[uid] || 0) + Number(value || 0);
+    }
+
+    return out;
+  }
+
+  function getCupGlobalBaseTotalsForProjection(cup = {}, fixtureIds = []) {
+    const replayBaselineTotalsByUid =
+      cup?.replayTestMode === true &&
+      cup?.replayBaselineTotalsByUid &&
+      typeof cup.replayBaselineTotalsByUid === "object"
+        ? normalizeCupGlobalNumberMap(cup.replayBaselineTotalsByUid)
+        : null;
+    if (replayBaselineTotalsByUid) {
+      return {
+        existingCupTotalsByUid: replayBaselineTotalsByUid,
+        baseTotalsByUid: replayBaselineTotalsByUid,
+        removedLegacyWindowPointsByUid: {},
+        creditedCurrentWindowFixtureIds: [],
+        legacyCurrentWindowCreditDetected: false,
+        replayBaselineApplied: true,
+      };
+    }
+
+    const storedGlobalBaseTotals =
+      cup?.globalBaseTotalsByUid && typeof cup.globalBaseTotalsByUid === "object"
+        ? normalizeCupGlobalNumberMap(cup.globalBaseTotalsByUid)
+        : null;
+    if (storedGlobalBaseTotals && Object.keys(storedGlobalBaseTotals).length) {
+      return {
+        existingCupTotalsByUid:
+          cup?.cupTotalsByUid && typeof cup.cupTotalsByUid === "object"
+            ? normalizeCupGlobalNumberMap(cup.cupTotalsByUid)
+            : storedGlobalBaseTotals,
+        baseTotalsByUid: storedGlobalBaseTotals,
+        removedLegacyWindowPointsByUid:
+          cup?.removedLegacyWindowPointsByUid &&
+          typeof cup.removedLegacyWindowPointsByUid === "object"
+            ? normalizeCupGlobalNumberMap(cup.removedLegacyWindowPointsByUid)
+            : {},
+        creditedCurrentWindowFixtureIds: Array.isArray(cup?.creditedCurrentWindowFixtureIds)
+          ? cup.creditedCurrentWindowFixtureIds.map(String).filter(Boolean)
+          : [],
+        legacyCurrentWindowCreditDetected:
+          cup?.globalBaseAdjustedForCurrentWindow === true,
+        replayBaselineApplied: false,
+      };
+    }
+
+    const existingCupTotalsByUid =
+      cup?.cupTotalsByUid && typeof cup.cupTotalsByUid === "object"
+        ? normalizeCupGlobalNumberMap(cup.cupTotalsByUid)
+        : {};
+    const currentFixtureIds = new Set(
+      (Array.isArray(fixtureIds) ? fixtureIds : [])
+        .map((id) => String(id || "").trim())
+        .filter(Boolean)
+    );
+    const creditedFixtures =
+      cup?.creditedFixtures && typeof cup.creditedFixtures === "object"
+        ? cup.creditedFixtures
+        : {};
+    const creditedCurrentWindowFixtureIds = Array.from(currentFixtureIds).filter(
+      (fixtureId) => Boolean(creditedFixtures[fixtureId])
+    );
+    const windowPointsByUid =
+      cup?.windowPointsByUid && typeof cup.windowPointsByUid === "object"
+        ? normalizeCupGlobalNumberMap(cup.windowPointsByUid)
+        : {};
+    const breakdownTotalsByUid = cupGlobalTotalsFromBreakdownMap(
+      cup?.windowBreakdownByUserId ||
+        cup?.breakdownByUserId ||
+        {}
+    );
+    const removedLegacyWindowPointsByUid = hasCupGlobalNumberValues(windowPointsByUid)
+      ? windowPointsByUid
+      : creditedCurrentWindowFixtureIds.length
+        ? breakdownTotalsByUid
+        : {};
+    const legacyCurrentWindowCreditDetected =
+      creditedCurrentWindowFixtureIds.length > 0 ||
+      hasCupGlobalNumberValues(windowPointsByUid) ||
+      (
+        cup?.windowBreakdownByUserId &&
+        typeof cup.windowBreakdownByUserId === "object" &&
+        Object.keys(cup.windowBreakdownByUserId).length > 0
+      );
+    const baseTotalsByUid =
+      legacyCurrentWindowCreditDetected &&
+      hasCupGlobalNumberValues(removedLegacyWindowPointsByUid)
+        ? subtractCupGlobalNumberMaps(
+            existingCupTotalsByUid,
+            removedLegacyWindowPointsByUid
+          )
+        : { ...existingCupTotalsByUid };
+
+    return {
+      existingCupTotalsByUid,
+      baseTotalsByUid,
+      removedLegacyWindowPointsByUid,
+      creditedCurrentWindowFixtureIds,
+      legacyCurrentWindowCreditDetected,
+      replayBaselineApplied: false,
+    };
+  }
+ 
   async function loadLatestCupHistoryWindow({ db, roomId }) {
     let snap = await db
       .collection(`rooms/${roomId}/cupHistory`)
@@ -437,10 +870,6 @@ function createCupGlobalEngine(deps = {}) {
       const live = patchedLiveFixturesById[String(fixtureId)] || null;
       const summary = fixtureSummariesById[String(fixtureId)] || null;
       const cupFixture = cupFixtureMetaById.get(String(fixtureId)) || {};
-      const fantasyByPlayerId =
-        live?.fantasyByPlayerId && typeof live.fantasyByPlayerId === "object"
-          ? live.fantasyByPlayerId
-          : {};
       const rawStatsByPlayerId =
         live?.rawStatsByPlayerId && typeof live.rawStatsByPlayerId === "object"
           ? live.rawStatsByPlayerId
@@ -448,34 +877,14 @@ function createCupGlobalEngine(deps = {}) {
       const rawSample =
         Object.values(rawStatsByPlayerId).find((value) => value && typeof value === "object") || {};
   
-      return {
-        fixtureId: String(fixtureId),
-        hasLivePayload: Boolean(live),
-        hasSummary: Boolean(summary),
-        statusShort:
-          live?.statusShort ||
-          summary?.short ||
-          summary?.statusShort ||
-          cupFixture?.statusShort ||
-          cupFixture?.fixtureStatus ||
-          cupFixture?.matchStatus ||
-          rawSample?.statusShort ||
-          rawSample?.fixtureStatus ||
-          rawSample?.matchStatus ||
-          null,
-        statusLong: live?.statusLong || summary?.statusLong || cupFixture?.statusLong || rawSample?.statusLong || null,
-        kickoffMs: Number(
-          live?.kickoffMs ??
-            summary?.kickoffMs ??
-            cupFixture?.kickoffMs ??
-            cupFixture?.startAtMs ??
-            rawSample?.kickoffMs ??
-            cup?.currentWindowStartAtMs ??
-            0
-        ) || null,
-        fantasyPlayerCount: Object.keys(fantasyByPlayerId).length,
-        rawStatsPlayerCount: Object.keys(rawStatsByPlayerId).length,
-      };
+      return buildCupFixtureCoverageRow({
+        fixtureId,
+        live,
+        summary,
+        cupFixture,
+        rawSample,
+        cup,
+      });
     });
   
     const users = await loadRoomUsersLineupsForGlobalAggregation({ db, roomId });
@@ -524,6 +933,7 @@ function createCupGlobalEngine(deps = {}) {
           player?.position ||
           playersById.get(pid)?.position ||
           aggregated?.position ||
+          rawStats?.rawApiPosition ||
           rawStats?.position ||
           "MID"
         );
@@ -1000,47 +1410,34 @@ function createCupGlobalEngine(deps = {}) {
       const live = patchedLiveFixturesById[String(fixtureId)] || null;
       const summary = fixtureSummariesById[String(fixtureId)] || null;
       const cupFixture = cupFixtureMetaById.get(String(fixtureId)) || {};
-      const fantasyByPlayerId =
-        live?.fantasyByPlayerId && typeof live.fantasyByPlayerId === "object"
-          ? live.fantasyByPlayerId
-          : {};
       const rawStatsByPlayerId =
         live?.rawStatsByPlayerId && typeof live.rawStatsByPlayerId === "object"
           ? live.rawStatsByPlayerId
           : {};
       const rawSample =
         Object.values(rawStatsByPlayerId).find((value) => value && typeof value === "object") || {};
-      const statusShort =
-        live?.statusShort ||
-        summary?.short ||
-        summary?.statusShort ||
-        cupFixture?.statusShort ||
-        cupFixture?.fixtureStatus ||
-        cupFixture?.matchStatus ||
-        rawSample?.statusShort ||
-        rawSample?.fixtureStatus ||
-        rawSample?.matchStatus ||
-        null;
   
-      return {
-        fixtureId: String(fixtureId),
-        hasLivePayload: Boolean(live),
-        hasSummary: Boolean(summary),
-        statusShort,
-        statusLong: live?.statusLong || summary?.statusLong || rawSample?.statusLong || null,
-        kickoffMs: Number(
-          live?.kickoffMs ??
-            summary?.kickoffMs ??
-            cupFixture?.kickoffMs ??
-            cupFixture?.startAtMs ??
-            rawSample?.kickoffMs ??
-            cup?.currentWindowStartAtMs ??
-            0
-        ) || null,
-        fantasyPlayerCount: Object.keys(fantasyByPlayerId).length,
-        rawStatsPlayerCount: Object.keys(rawStatsByPlayerId).length,
-      };
+      return buildCupFixtureCoverageRow({
+        fixtureId,
+        live,
+        summary,
+        cupFixture,
+        rawSample,
+        cup,
+      });
     });
+    const missingLiveFixtureIdSet = new Set(
+      (Array.isArray(missingFixtureIds) ? missingFixtureIds : [])
+        .map((id) => String(id || "").trim())
+        .filter(Boolean)
+    );
+    const missingRequiredFixtureIds = fixtureCoverage
+      .filter((coverage) =>
+        missingLiveFixtureIdSet.has(String(coverage.fixtureId)) &&
+        coverageNeedsLiveFixturePayload(coverage, nowMs)
+      )
+      .map((coverage) => String(coverage.fixtureId))
+      .filter(Boolean);
   
     const hasStartedFixture = fixtureCoverage.some((coverage) => {
       const kickoffMs = coverageKickoffMs(coverage);
@@ -1057,14 +1454,23 @@ function createCupGlobalEngine(deps = {}) {
       .map((coverage) => String(coverage.fixtureId))
       .filter(Boolean);
     const hasStaleInPlayFixtures = staleInPlayFixtureIds.length > 0;
+    const kickoffPassedUnfinishedFixtureIds = fixtureCoverage
+      .filter((coverage) => isCoverageKickoffPassedUnfinished(coverage, nowMs))
+      .map((coverage) => String(coverage.fixtureId))
+      .filter(Boolean);
+    const hasKickoffPassedUnfinishedFixtures =
+      kickoffPassedUnfinishedFixtureIds.length > 0;
+    const hasResolvingKickoffPassedFixtures = fixtureCoverage.some((coverage) =>
+      isCoverageResolvingAfterKickoffTail(coverage, nowMs)
+    );
     const allFinished = fixtureIds.length > 0 && fixtureCoverage.every((coverage) =>
       isFinished(coverage.statusShort)
     );
     const statusValue = allFinished
       ? "final"
-      : hasStaleInPlayFixtures
+      : hasStaleInPlayFixtures || hasResolvingKickoffPassedFixtures
         ? "resolving"
-        : anyInPlay
+        : anyInPlay || hasKickoffPassedUnfinishedFixtures
           ? "live"
           : "idle";
     const nextKickoffMs = fixtureCoverage
@@ -1099,12 +1505,15 @@ function createCupGlobalEngine(deps = {}) {
         skippedReason,
         fixtureIds,
         fixtureCount: fixtureIds.length,
-        missingFixtureCount: missingFixtureIds.length,
+        missingFixtureCount: missingRequiredFixtureIds.length,
+        missingFullWindowFixtureCount: missingFixtureIds.length,
         statusValue,
         allFinished,
         anyInPlay,
         staleInPlayFixtureIds,
         hasStaleInPlayFixtures,
+        kickoffPassedUnfinishedFixtureIds,
+        hasKickoffPassedUnfinishedFixtures,
         nextKickoffMs,
         nextPollAtMs,
         globalTotalsByUid: {},
@@ -1117,6 +1526,7 @@ function createCupGlobalEngine(deps = {}) {
         ),
         fixtureCoverage,
         missingFixtureIds,
+        missingRequiredFixtureIds,
         missingPlayerIdsByUid: {},
         updatedAtMs: nowMs,
       };
@@ -1129,6 +1539,8 @@ function createCupGlobalEngine(deps = {}) {
             globalApplyStatus: skippedReason,
             staleInPlayFixtureIds,
             hasStaleInPlayFixtures,
+            kickoffPassedUnfinishedFixtureIds,
+            hasKickoffPassedUnfinishedFixtures,
             fixtureStatusById: skippedPayload.fixtureStatusById,
             fixtureCoverage,
             nextPollAtMs,
@@ -1148,16 +1560,18 @@ function createCupGlobalEngine(deps = {}) {
       return skippedPayload;
     }
 
-    if (realWriteRequested && missingFixtureIds.length > 0) {
+    if (realWriteRequested && missingRequiredFixtureIds.length > 0) {
       throw new HttpsError(
         "failed-precondition",
-        "Cannot apply Cup global result while global fixture cache is missing fixtures."
+        "Cannot apply Cup global result while global fixture cache is missing active fixtures."
       );
     }
-    const nextPollAtMs =
-      !allFinished && hasStartedFixture
-        ? nowMs + CUP_GLOBAL_ACTIVE_POLL_MS
-        : null;
+    const nextPollAtMs = nextCupGlobalPollAtFromCoverage({
+      fixtureCoverage,
+      nowMs,
+      statusValue,
+      allFinished,
+    });
   
     const users = await loadRoomUsersLineupsForGlobalAggregation({ db, roomId });
     const globalRawStatsByPlayerId = buildAggregatedGlobalRawStatsByPlayerId(patchedLiveFixturesById);
@@ -1201,6 +1615,7 @@ function createCupGlobalEngine(deps = {}) {
           player?.position ||
           playersById.get(pid)?.position ||
           aggregated?.position ||
+          rawStats?.rawApiPosition ||
           rawStats?.position ||
           "MID"
         );
@@ -1261,23 +1676,19 @@ function createCupGlobalEngine(deps = {}) {
       fixtureStatusById[String(coverage.fixtureId)] = coverage.statusShort || null;
     }
   
-    const replayBaselineTotalsByUid =
-      cup?.replayTestMode === true &&
-      cup?.replayBaselineTotalsByUid &&
-      typeof cup.replayBaselineTotalsByUid === "object"
-        ? cup.replayBaselineTotalsByUid
-        : null;
-    const existingCupTotalsByUid =
-      replayBaselineTotalsByUid ||
-      (cup?.cupTotalsByUid && typeof cup.cupTotalsByUid === "object"
-        ? cup.cupTotalsByUid
-        : {});
-    const projectedTotalsByUid = { ...existingCupTotalsByUid };
-  
-    for (const [uid, total] of Object.entries(globalTotalsByUid)) {
-      projectedTotalsByUid[uid] =
-        Number(projectedTotalsByUid[uid] || 0) + Number(total || 0);
-    }
+    const cupGlobalBase = getCupGlobalBaseTotalsForProjection(cup, fixtureIds);
+    const {
+      existingCupTotalsByUid,
+      baseTotalsByUid,
+      removedLegacyWindowPointsByUid,
+      creditedCurrentWindowFixtureIds,
+      legacyCurrentWindowCreditDetected,
+      replayBaselineApplied,
+    } = cupGlobalBase;
+    const projectedTotalsByUid = addCupGlobalNumberMaps(
+      baseTotalsByUid,
+      globalTotalsByUid
+    );
   
     const displayNameByUid = new Map();
     for (const user of users) {
@@ -1319,22 +1730,32 @@ function createCupGlobalEngine(deps = {}) {
       replayHistoryLabel: cup?.replayHistoryLabel || null,
       fixtureIds,
       fixtureCount: fixtureIds.length,
-      missingFixtureCount: missingFixtureIds.length,
+      missingFixtureCount: missingRequiredFixtureIds.length,
+      missingFullWindowFixtureCount: missingFixtureIds.length,
       statusValue,
       allFinished,
       anyInPlay,
       staleInPlayFixtureIds,
       hasStaleInPlayFixtures,
+      kickoffPassedUnfinishedFixtureIds,
+      hasKickoffPassedUnfinishedFixtures,
       nextKickoffMs,
       nextPollAtMs,
       globalTotalsByUid,
       globalBenchTotalsByUid,
       globalBreakdownByUserId,
+      existingCupTotalsByUid,
+      baseTotalsByUid,
+      removedLegacyWindowPointsByUid,
+      creditedCurrentWindowFixtureIds,
+      legacyCurrentWindowCreditDetected,
+      replayBaselineApplied,
       projectedTotalsByUid,
       projectedStandingsRows,
       fixtureStatusById,
       fixtureCoverage,
       missingFixtureIds,
+      missingRequiredFixtureIds,
       missingPlayerIdsByUid,
       updatedAtMs: nowMs,
     };
@@ -1353,6 +1774,10 @@ function createCupGlobalEngine(deps = {}) {
         globalCurrentWindowPointsByUid: globalTotalsByUid,
         globalCurrentWindowBenchPointsByUid: globalBenchTotalsByUid,
         globalCurrentWindowBreakdownByUserId: globalBreakdownByUserId,
+        globalBaseTotalsByUid: baseTotalsByUid,
+        globalBaseAdjustedForCurrentWindow: legacyCurrentWindowCreditDetected,
+        creditedCurrentWindowFixtureIds,
+        removedLegacyWindowPointsByUid,
   
         livePointsByUid: globalTotalsByUid,
         liveBenchPointsByUid: globalBenchTotalsByUid,
@@ -1360,12 +1785,20 @@ function createCupGlobalEngine(deps = {}) {
   
         projectedTotalsByUid,
         projectedStandingsRows,
+        standingsRows: projectedStandingsRows,
+        leaderboard: projectedStandingsRows,
+        rows: projectedStandingsRows,
         projectedIncludesLivePoints,
         projectedUpdatedAtMs: nowMs,
   
         globalApplyStatus: statusValue,
+        missingFixtureIds,
+        missingRequiredFixtureIds,
+        missingFullWindowFixtureCount: missingFixtureIds.length,
         staleInPlayFixtureIds,
         hasStaleInPlayFixtures,
+        kickoffPassedUnfinishedFixtureIds,
+        hasKickoffPassedUnfinishedFixtures,
         globalApplyMode: "projection-only",
         globalApplyWarning: allFinished
           ? "Final window is finished; this projection did not write cupHistory or finalResults."
@@ -1374,6 +1807,16 @@ function createCupGlobalEngine(deps = {}) {
         updatedAtMs: nowMs,
         updatedAt: FieldValue.serverTimestamp(),
       };
+
+      if (legacyCurrentWindowCreditDetected) {
+        Object.assign(cupUpdate, {
+          windowPointsByUid: {},
+          windowBenchPointsByUid: {},
+          windowBreakdownByUserId: {},
+          breakdownByUserId: {},
+          creditedFixtures: {},
+        });
+      }
   
       await cupRef.set(cupUpdate, { merge: true });
   
@@ -1383,11 +1826,18 @@ function createCupGlobalEngine(deps = {}) {
           mode: "cup",
           source: "global-live-fixtures",
           projectionOnly: true,
-          creditedTotalsByUid: existingCupTotalsByUid,
+          creditedTotalsByUid: baseTotalsByUid,
+          globalBaseTotalsByUid: baseTotalsByUid,
+          globalBaseAdjustedForCurrentWindow: legacyCurrentWindowCreditDetected,
+          removedLegacyWindowPointsByUid,
           projectedTotalsByUid,
           livePointsByUid: globalTotalsByUid,
           includesLivePoints: projectedIncludesLivePoints,
           standings: projectedStandingsRows,
+          projectedStandingsRows,
+          leaderboard: projectedStandingsRows,
+          rows: projectedStandingsRows,
+          standingsRows: projectedStandingsRows,
           updatedAtMs: nowMs,
           updatedAt: FieldValue.serverTimestamp(),
         },
@@ -1485,27 +1935,12 @@ function createCupGlobalEngine(deps = {}) {
       applyResult?.globalBreakdownByUserId && typeof applyResult.globalBreakdownByUserId === "object"
         ? applyResult.globalBreakdownByUserId
         : {};
-    const replayBaselineTotalsByUid =
-      cup?.replayTestMode === true &&
-      cup?.replayBaselineTotalsByUid &&
-      typeof cup.replayBaselineTotalsByUid === "object"
-        ? cup.replayBaselineTotalsByUid
-        : null;
-    const previousCupTotalsByUid =
-      replayBaselineTotalsByUid ||
-      (cup?.cupTotalsByUid && typeof cup.cupTotalsByUid === "object"
-        ? cup.cupTotalsByUid
-        : {});
-    const nextCupTotalsByUid = {};
-  
-    for (const [uid, total] of Object.entries(previousCupTotalsByUid)) {
-      nextCupTotalsByUid[String(uid)] = Number(total || 0);
-    }
-  
-    for (const [uid, total] of Object.entries(windowPointsByUid)) {
-      const key = String(uid);
-      nextCupTotalsByUid[key] = Number(nextCupTotalsByUid[key] || 0) + Number(total || 0);
-    }
+    const cupGlobalBase = getCupGlobalBaseTotalsForProjection(cup, fixtureIds);
+    const previousCupTotalsByUid = cupGlobalBase.baseTotalsByUid || {};
+    const nextCupTotalsByUid = addCupGlobalNumberMaps(
+      previousCupTotalsByUid,
+      windowPointsByUid
+    );
   
     const standingsRows = Object.entries(nextCupTotalsByUid)
       .map(([uid, total]) => {
@@ -1546,6 +1981,13 @@ function createCupGlobalEngine(deps = {}) {
       windowBenchPointsByUid,
       breakdownByUserId: windowBreakdownByUserId,
       previousCupTotalsByUid,
+      originalCupTotalsByUid: cupGlobalBase.existingCupTotalsByUid || {},
+      removedLegacyWindowPointsByUid:
+        cupGlobalBase.removedLegacyWindowPointsByUid || {},
+      creditedCurrentWindowFixtureIds:
+        cupGlobalBase.creditedCurrentWindowFixtureIds || [],
+      legacyCurrentWindowCreditDetected:
+        cupGlobalBase.legacyCurrentWindowCreditDetected === true,
       cupTotalsByUid: nextCupTotalsByUid,
       standingsRows,
       top3,
@@ -1629,6 +2071,9 @@ function createCupGlobalEngine(deps = {}) {
         status: "final",
         source: "global-live-fixtures",
         cupTotalsByUid: payload.nextCupTotalsByUid,
+        globalBaseTotalsByUid: payload.nextCupTotalsByUid,
+        globalBaseAdjustedForCurrentWindow: false,
+        removedLegacyWindowPointsByUid: {},
         windowPointsByUid: payload.windowPointsByUid,
         windowBenchPointsByUid: payload.windowBenchPointsByUid,
         windowBreakdownByUserId: payload.windowBreakdownByUserId,

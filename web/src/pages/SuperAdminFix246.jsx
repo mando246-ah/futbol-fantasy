@@ -82,22 +82,36 @@ function getRoomTypeFlags(room = {}) {
   const competitionKey = String(room.competitionKey || "").trim().toLowerCase();
   const competitionType = String(room.competitionType || "").trim().toLowerCase();
   const seasonKey = String(room.seasonKey || "").trim().toLowerCase();
+  const pipelineMode = String(room.pipelineMode || "").trim().toLowerCase();
   const isWorldCupGroupRoom =
     room.engineType === "worldCupDaily" ||
     room.phaseLabel === "WorldCupGroup" ||
     normalizedWorldCupPhase === "group" ||
     worldCupPhase === "WorldCupGroup";
+  const isWorldCupKnockoutRoom =
+    normalizedWorldCupPhase === "knockout" ||
+    (room.engineType === "cupEngine" && competitionKey === "worldcup") ||
+    (room.engineType === "cupEngine" && seasonKey.startsWith("worldcup-"));
 
   const isWorldCupRoom =
     isWorldCupGroupRoom ||
-    normalizedWorldCupPhase === "knockout" ||
+    isWorldCupKnockoutRoom ||
     competitionKey === "worldcup" ||
     competitionType === "worldcup" ||
     seasonKey.startsWith("worldcup-");
   const isCupRoom = room.phaseLabel === "Cup" && !isWorldCupGroupRoom;
+  const isGlobalCupRoom =
+    isCupRoom && (pipelineMode === "global" || isWorldCupKnockoutRoom);
   const isRegularRoom = !isCupRoom && !isWorldCupGroupRoom;
 
-  return { isWorldCupGroupRoom, isWorldCupRoom, isCupRoom, isRegularRoom };
+  return {
+    isWorldCupGroupRoom,
+    isWorldCupKnockoutRoom,
+    isWorldCupRoom,
+    isCupRoom,
+    isGlobalCupRoom,
+    isRegularRoom,
+  };
 }
 
 function groupLooksWorldCupGroup(group = {}) {
@@ -227,7 +241,13 @@ function getWorldCupGlobalPlayerPoolSection() {
 function getOwnerActionSections(room = {}) {
   const currentWeekIndex = getCurrentWeekIndex(room);
   const missingWeek = !currentWeekIndex;
-  const { isWorldCupGroupRoom, isWorldCupRoom, isCupRoom, isRegularRoom } =
+  const {
+    isWorldCupGroupRoom,
+    isWorldCupRoom,
+    isCupRoom,
+    isGlobalCupRoom,
+    isRegularRoom,
+  } =
     getRoomTypeFlags(room);
 
   if (isWorldCupGroupRoom) {
@@ -258,16 +278,50 @@ function getOwnerActionSections(room = {}) {
       {
         title: "Quick Fixes",
         actions: [
-          {
-            key: "cupEngineNow",
-            label: "Force Cup Engine Now",
-            callableName: "ownerRunCupEngineNow",
-            payloadBuilder: (r) => ({ roomId: r.roomId }),
-            confirm: true,
-            confirmMessage:
-              "DANGER: This can rewrite Cup current state/results for this room. Use only if a Cup room is stuck. Continue?",
-            className: "danger",
-          },
+          ...(isGlobalCupRoom
+            ? [
+                {
+                  key: "cupGlobalEngineNow",
+                  label: "Force Global Cup Engine Now",
+                  callableName: "ownerRunCupGlobalEngineNow",
+                  payloadBuilder: (r) => ({ roomId: r.roomId }),
+                  confirm: true,
+                  confirmMessage:
+                    "This refreshes only active/due Cup fixtures through the shared global cache and writes cup/current projections. Continue?",
+                  description:
+                    "Default for World Cup Knockout/global Cup rooms. Does not call legacy runCupEngine.",
+                  className: "apply",
+                },
+                {
+                  key: "repairCupGlobalDuplicateWindow",
+                  label: "Repair Duplicate Global Cup Window",
+                  callableName: "ownerRepairCupGlobalDuplicateCurrentWindow",
+                  payloadBuilder: (r) => ({
+                    roomId: r.roomId,
+                    confirm: "REPAIR_CUP_GLOBAL_DUPLICATE_WINDOW",
+                  }),
+                  confirm: true,
+                  confirmMessage:
+                    "This backs up cup/current, then repairs duplicate current-window global projection/display fields. It does not call API-Football. Continue?",
+                  description:
+                    "Use only if a global Cup window appears double-counted after legacy/global overlap.",
+                  className: "danger",
+                },
+              ]
+            : [
+                {
+                  key: "cupEngineNow",
+                  label: "Force Legacy Cup Engine Now",
+                  callableName: "ownerRunCupEngineNow",
+                  payloadBuilder: (r) => ({ roomId: r.roomId }),
+                  confirm: true,
+                  confirmMessage:
+                    "DANGER: This runs the legacy Cup engine and can rewrite Cup current state/results. Do not use for global or World Cup Knockout rooms. Continue?",
+                  description:
+                    "Legacy Cup rooms only. Global Cup rooms should use Force Global Cup Engine Now.",
+                  className: "danger",
+                },
+              ]),
           ...(isWorldCupRoom ? getWorldCupPlayerRepairActions() : []),
         ],
       },
@@ -588,6 +642,8 @@ function renderActionResult(resultWrapper) {
     "refreshed",
     "wasStale",
     "refreshReason",
+    "refreshSkipped",
+    "refreshSkippedReason",
     "lastApiRefreshAtMs",
     "staleMs",
     "enabled",
@@ -600,6 +656,8 @@ function renderActionResult(resultWrapper) {
     "windowKey",
     "historyDocId",
     "fixtureCount",
+    "fullWindowFixtureCount",
+    "refreshFixtureCount",
     "refreshedFixtureCount",
     "refreshedStatusCount",
     "refreshedStatsCount",
@@ -631,6 +689,8 @@ function renderActionResult(resultWrapper) {
     "userCount",
     "standingsCount",
     "queueRepaired",
+    "queueUpdated",
+    "queueDeleted",
     "nextPollAtMs",
     "nextKickoffMs",
     "realWriteApplied",
@@ -641,6 +701,14 @@ function renderActionResult(resultWrapper) {
     "wroteFinalResults",
     "source",
     "compareScope",
+    "duplicateDetected",
+    "affectedUids",
+    "beforeTotalsByUid",
+    "afterTotalsByUid",
+    "baseTotalsByUid",
+    "currentGlobalPointsByUid",
+    "removedLegacyWindowPointsByUid",
+    "creditedCurrentWindowFixtureIds",
     "shadowSource",
     "replaySource",
     "statusByFixtureId",
@@ -1755,6 +1823,12 @@ export default function SuperAdminFix246() {
                   {(group.rooms || []).map((room) => {
                     const displayStatus = getDisplayStatus(room);
                     const isOpen = openRoomId === room.roomId;
+                    const roomFlags = getRoomTypeFlags(room);
+                    const shouldRecommendGlobalCupAction =
+                      roomFlags.isGlobalCupRoom &&
+                      ["stale", "problem", "due"].includes(
+                        String(displayStatus?.key || "").toLowerCase()
+                      );
 
                     return (
                     <div
@@ -1813,6 +1887,11 @@ export default function SuperAdminFix246() {
                       {room.managerCountWarning ? (
                         <div className="ownerRoomWarning">
                           Managers warning: {room.managerCountWarning}
+                        </div>
+                      ) : null}
+                      {shouldRecommendGlobalCupAction ? (
+                        <div className="ownerRoomWarning">
+                          Recommended action: use Force Global Cup Engine Now.
                         </div>
                       ) : null}
                       {isOpen && renderRoomActionsDrawer(room)}

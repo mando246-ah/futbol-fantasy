@@ -615,6 +615,12 @@
   border-bottom: 1px solid rgba(148, 163, 184, 0.1);
 }
 
+.wcFieldGameInfo {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
 .wcFieldGameRow:last-child,
 .wcFieldManagerRow:last-child {
   border-bottom: 0;
@@ -639,6 +645,71 @@
   color: rgba(203, 213, 225, 0.7);
 }
 
+.wcFieldGameMatch {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.wcFieldGameTeam {
+  min-width: 0;
+  overflow: hidden;
+  color: rgba(241, 245, 249, 0.92);
+  font-size: 0.78rem;
+  font-weight: 900;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wcFieldGameTeam--home {
+  justify-self: start;
+  text-align: left;
+}
+
+.wcFieldGameTeam--away {
+  justify-self: end;
+  text-align: right;
+}
+
+.wcFieldGameScore {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 44px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  color: #f8fafc;
+  font-size: 0.86rem;
+  font-weight: 950;
+  white-space: nowrap;
+}
+
+.wcFieldGameScore--vs {
+  color: rgba(148, 163, 184, 0.72);
+  font-size: 0.68rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.wcFieldGameMeta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 8px;
+  min-width: 0;
+  color: rgba(148, 163, 184, 0.78);
+  font-size: 0.66rem;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+}
+
+.wcFieldGameMeta span + span::before {
+  content: "•";
+  margin-right: 8px;
+  color: rgba(52, 211, 153, 0.68);
+}
+
 .wcFieldGameResult {
   display: grid;
   justify-items: end;
@@ -652,7 +723,17 @@
 }
 
 .wcFieldGameStatus {
-  color: rgba(203, 213, 225, 0.66);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 92px;
+  min-height: 22px;
+  padding: 3px 8px;
+  box-sizing: border-box;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.58);
+  color: rgba(203, 213, 225, 0.76);
   font-size: 0.66rem;
   font-weight: 900;
   letter-spacing: 0.05em;
@@ -661,16 +742,28 @@
 }
 
 .wcFieldGameStatus--live {
+  border-color: rgba(52, 211, 153, 0.5);
+  background: rgba(5, 150, 105, 0.18);
   color: #6ee7b7;
   text-shadow: 0 0 10px rgba(52, 211, 153, 0.44);
 }
 
 .wcFieldGameStatus--final {
+  border-color: rgba(250, 204, 21, 0.34);
+  background: rgba(250, 204, 21, 0.11);
   color: #fde68a;
 }
 
 .wcFieldGameStatus--alert {
+  border-color: rgba(248, 113, 113, 0.38);
+  background: rgba(127, 29, 29, 0.18);
   color: #fca5a5;
+}
+
+.wcFieldGameStatus--scheduled {
+  border-color: rgba(148, 163, 184, 0.2);
+  background: rgba(15, 23, 42, 0.5);
+  color: rgba(226, 232, 240, 0.72);
 }
 
 .wcFieldManagerRow {
@@ -931,6 +1024,40 @@
   .wcFieldManagerRow {
     min-height: 52px;
     padding: 8px 10px;
+  }
+
+  .wcFieldGameRow {
+    grid-template-columns: minmax(0, 1fr);
+    align-items: stretch;
+    gap: 7px;
+  }
+
+  .wcFieldGameResult {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    justify-items: initial;
+  }
+  .wcFieldGameMatch {
+    gap: 6px;
+  }
+
+  .wcFieldGameTeam {
+    font-size: 0.72rem;
+  }
+
+  .wcFieldGameScore {
+    min-width: 38px;
+    padding-inline: 5px;
+    font-size: 0.78rem;
+  }
+
+  .wcFieldGameMeta {
+    font-size: 0.62rem;
+  }
+
+  .wcFieldGameStatus {
+    width: 86px;
   }
 
 }

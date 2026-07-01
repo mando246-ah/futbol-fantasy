@@ -1100,7 +1100,12 @@ function buildPlayerEntriesForDay({
     const rawStats = statsByFixtureId.get(fixtureId)?.[pid];
     if (!rawStats) continue;
 
-    const position = toPos(meta.position || rawStats.position || "MID");
+    const position = toPos(
+      meta.position ||
+        rawStats.rawApiPosition ||
+        rawStats.position ||
+        "MID"
+    );
     const scored = scorePlayer(rawStats, position);
     const points = toNumber(scored?.points, 0);
     total += points;

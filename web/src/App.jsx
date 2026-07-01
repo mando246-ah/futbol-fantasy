@@ -1,5 +1,5 @@
 // web/src/App.jsx
-import React, { useEffect, useState, useRef } from "react";
+import React, { useEffect, useMemo, useState, useRef } from "react";
 import {
   BrowserRouter as Router,
   Routes,
@@ -22,6 +22,13 @@ import CopyrightPage from "./pages/Legal/CopyrightPage";
 import DataDeletionPage from "./pages/Legal/DataDeletionPage";
 import RoomChatBubble from "./components/RoomChatBubble";
 import AppUpdateBanner from "./components/AppUpdateBanner";
+import newsPosts from "./data/newsPosts";
+import {
+  getLastSeenNewsPostId,
+  getLatestNewsPostId,
+  markNewsPostSeen,
+  NEWS_SEEN_EVENT,
+} from "./utils/newsStatus";
 //import TournamentPage from "./pages/TournamentPage/TournamentPage";
 import TournamentRouter from "./pages/TournamentPage/TournamentRouter";
 import {
@@ -55,6 +62,10 @@ const OWNER_UIDS = new Set([
 function Nav({ user, displayName, photoURL }) {
   const [lastRoomId, setLastRoomIdState] = useState("");
   const [open, setOpen] = useState(false);
+  const latestNewsPostId = useMemo(() => getLatestNewsPostId(newsPosts), []);
+  const [lastSeenNewsPostId, setLastSeenNewsPostId] = useState(() =>
+    getLastSeenNewsPostId()
+  );
 
   useEffect(() => {
     const refresh = () => {
@@ -72,6 +83,21 @@ function Nav({ user, displayName, photoURL }) {
     };
   }, [user?.uid]);
 
+  useEffect(() => {
+    const refreshNewsSeen = () => {
+      setLastSeenNewsPostId(getLastSeenNewsPostId());
+    };
+
+    refreshNewsSeen();
+    window.addEventListener("storage", refreshNewsSeen);
+    window.addEventListener(NEWS_SEEN_EVENT, refreshNewsSeen);
+
+    return () => {
+      window.removeEventListener("storage", refreshNewsSeen);
+      window.removeEventListener(NEWS_SEEN_EVENT, refreshNewsSeen);
+    };
+  }, []);
+
   // close mobile menu on route change (basic)
   useEffect(() => {
     const close = () => setOpen(false);
@@ -80,10 +106,39 @@ function Nav({ user, displayName, photoURL }) {
   }, []);
 
   const isOwner = Boolean(user?.uid && OWNER_UIDS.has(user.uid));
+  const hasUnreadNews = Boolean(
+    latestNewsPostId && lastSeenNewsPostId !== latestNewsPostId
+  );
+
+  function markNewsSeen() {
+    if (!latestNewsPostId) return;
+    markNewsPostSeen(latestNewsPostId);
+    setLastSeenNewsPostId(latestNewsPostId);
+  }
+
+  function renderTabLabel(tab) {
+    if (tab.to !== "/news") return tab.label;
+
+    return (
+      <span
+        className="ffNavNewsLabel"
+        title={tab.hasUnreadNews ? "New update" : undefined}
+      >
+        <span>{tab.label}</span>
+        {tab.hasUnreadNews ? (
+          <span
+            className="ffNavNewsDot"
+            aria-label="New update"
+            title="New update"
+          />
+        ) : null}
+      </span>
+    );
+  }
 
   const tabs = [
     { to: "/", label: "Home" },
-    { to: "/news", label: "News" },
+    { to: "/news", label: "News", hasUnreadNews },
     { to: "/draft", label: "Draft", hideWhenNoUser: true },
     {
       to: lastRoomId ? `/room?room=${lastRoomId}` : null,
@@ -135,13 +190,19 @@ function Nav({ user, displayName, photoURL }) {
               <NavLink
                 key={t.to}
                 to={t.to}
+                onClick={t.to === "/news" ? markNewsSeen : undefined}
                 className={({ isActive }) =>
                   isActive
                     ? "font-semibold text-blue-600"
                     : "opacity-70 hover:opacity-100"
                 }
+                aria-label={
+                  t.to === "/news" && t.hasUnreadNews
+                    ? "News, new update"
+                    : undefined
+                }
               >
-                {t.label}
+                {renderTabLabel(t)}
               </NavLink>
             );
           })}
@@ -218,14 +279,22 @@ function Nav({ user, displayName, photoURL }) {
                   <NavLink
                     key={t.to}
                     to={t.to}
-                    onClick={() => setOpen(false)}
+                    onClick={() => {
+                      if (t.to === "/news") markNewsSeen();
+                      setOpen(false);
+                    }}
                     className={({ isActive }) =>
                       isActive
                         ? "font-semibold text-blue-600"
                         : "opacity-80"
                     }
+                    aria-label={
+                      t.to === "/news" && t.hasUnreadNews
+                        ? "News, new update"
+                        : undefined
+                    }
                   >
-                    {t.label}
+                    {renderTabLabel(t)}
                   </NavLink>
                 );
               })}

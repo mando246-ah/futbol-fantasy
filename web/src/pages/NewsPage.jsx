@@ -1,7 +1,8 @@
-import React, { useMemo } from "react";
+import React, { useEffect, useMemo } from "react";
 import { Link } from "react-router-dom";
 import { ArrowLeft, CalendarDays, Newspaper } from "lucide-react";
 import newsPosts from "../data/newsPosts";
+import { markLatestNewsPostSeen } from "../utils/newsStatus";
 import "./NewsPage.css";
 
 function dateValue(date) {
@@ -22,6 +23,10 @@ function formatNewsDate(date) {
 }
 
 export default function NewsPage() {
+  useEffect(() => {
+    markLatestNewsPostSeen(newsPosts);
+  }, []);
+
   const posts = useMemo(
     () => [...newsPosts].sort((a, b) => dateValue(b.date) - dateValue(a.date)),
     []
@@ -95,4 +100,3 @@ export default function NewsPage() {
     </main>
   );
 }
-

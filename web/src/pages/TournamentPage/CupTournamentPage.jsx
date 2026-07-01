@@ -128,6 +128,25 @@ function normalizeDisplayPos(pos) {
   return p;
 }
 
+function resolveRawStatsDisplayPosition(stats = {}, fantasyPosition = "") {
+  const rawApiPositionOriginal = String(stats?.rawApiPositionOriginal || "").trim();
+  if (rawApiPositionOriginal) {
+    return { label: "Raw/API Position", value: rawApiPositionOriginal };
+  }
+
+  const rawApiPosition = normalizeDisplayPos(stats?.rawApiPosition || "");
+  if (rawApiPosition) {
+    return { label: "Raw/API Position", value: rawApiPosition };
+  }
+
+  const savedFantasyPosition = normalizeDisplayPos(fantasyPosition || "");
+  if (savedFantasyPosition) {
+    return { label: "Fantasy Position", value: savedFantasyPosition };
+  }
+
+  return { label: "Position", value: "Unknown" };
+}
+
 function sortPlayersForDisplay(list = []) {
   return [...list].sort((a, b) => {
     const aRank = DISPLAY_POS_ORDER[normalizeDisplayPos(a.position)] ?? 99;
@@ -656,7 +675,7 @@ function getLiveTimerDisplay(stats, nowMs) {
   };
 }
 
-function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
+function PlayerStatsCard({ stats, breakdown, teamName, opponentName, fantasyPosition = "" }) {
   const hasStats = stats && Object.keys(stats).length > 0;
   const hasBD = breakdown && Object.keys(breakdown).length > 0;
 
@@ -732,7 +751,7 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
   }
 
   const STAT_ORDER = [
-    "position",
+    "rawApiPosition",
     "rating",
     "minutes",
     "goals",
@@ -766,6 +785,7 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
   const displayRawKeys = showLiveNoAppearanceNote && !sortedRawKeys.includes("minutes")
     ? ["minutes", ...sortedRawKeys]
     : sortedRawKeys;
+  const positionRow = resolveRawStatsDisplayPosition(stats, fantasyPosition);
 
   const sortedBreakdownKeys = Object.keys(breakdown || {}).sort((a, b) => {
     const indexA = STAT_ORDER.indexOf(a);
@@ -832,6 +852,10 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
       <div className="tpStatsGrid">
         <div className="tpStatsCol">
           <span className="tpStatsHead">Raw Stats</span>
+          <div className="tpStatRow">
+            <span>{positionRow.label}</span>
+            <span>{positionRow.value}</span>
+          </div>
           {displayRawKeys.map((k) => {
             const v = k === "minutes" ? minutes : stats[k];
             if (k !== "minutes" && (v == null || v === false || v === 0 || v === "0")) return null;
@@ -840,6 +864,11 @@ function PlayerStatsCard({ stats, breakdown, teamName, opponentName }) {
             // 4. Hide the score keys from the list below so they don't randomly show up twice!
             if (
               k === "isLive" ||
+              k === "position" ||
+              k === "pos" ||
+              k === "role" ||
+              k === "rawApiPosition" ||
+              k === "rawApiPositionOriginal" ||
               k === "teamId" ||
               k === "fixtureId" ||
               k === "fixtureStatus" ||
@@ -1268,14 +1297,21 @@ export default function CupTournamentPage() {
 
     const isLive = statusLower === "live";
     const isResolving = statusLower === "resolving";
-    const pollWeekStatus = String(
+    const roomWeekStatus = String(
       room?.competitionState?.weekStatus ||
         room?.["competitionState.weekStatus"] ||
-        statusRaw ||
         ""
     )
       .trim()
       .toLowerCase();
+    const derivedDisplayStatus = String(statusRaw || "")
+      .trim()
+      .toLowerCase();
+    const pollWeekStatus =
+      derivedDisplayStatus === "live" ||
+      derivedDisplayStatus === "resolving"
+        ? derivedDisplayStatus
+        : roomWeekStatus || derivedDisplayStatus || "idle";
     const pollNextAtMs = Number(
       room?.competitionState?.nextPollAtMs ||
         room?.["competitionState.nextPollAtMs"] ||
@@ -1897,7 +1933,13 @@ export default function CupTournamentPage() {
 
     const scored = scorePlayerFromCore(
       stats,
-      toCorePos(player?.position || stats?.position || stats?.pos || stats?.role)
+      toCorePos(
+        player?.position ||
+          stats?.rawApiPosition ||
+          stats?.position ||
+          stats?.pos ||
+          stats?.role
+      )
     );
     const derivedPoints = Number(scored?.points || 0);
     const derivedBreakdown = hasBreakdownMap(scored?.breakdown) ? scored.breakdown : null;
@@ -1908,7 +1950,13 @@ export default function CupTournamentPage() {
 
     return {
       ...player,
-      position: player?.position || stats?.position || stats?.pos || stats?.role || "MID",
+      position:
+        player?.position ||
+        stats?.rawApiPosition ||
+        stats?.position ||
+        stats?.pos ||
+        stats?.role ||
+        "MID",
       points: shouldKeepExistingPoints ? existingPoints : derivedPoints,
       breakdown: breakdown || derivedBreakdown,
     };
@@ -2281,6 +2329,7 @@ export default function CupTournamentPage() {
                                 breakdown={p.breakdown}
                                 teamName={displayTeamName}
                                 opponentName={displayOpponentName}
+                                fantasyPosition={p.position}
                             />
                             )}
                         </li>
@@ -2331,6 +2380,7 @@ export default function CupTournamentPage() {
                                         breakdown={p.breakdown}
                                         teamName={displayTeamName}
                                         opponentName={displayOpponentName}
+                                        fantasyPosition={p.position}
                                     />
                                     )}
                             </li>
@@ -2414,6 +2464,7 @@ export default function CupTournamentPage() {
                                             breakdown={p.breakdown}
                                             teamName={displayTeamName}
                                             opponentName={displayOpponentName}
+                                            fantasyPosition={p.position}
                                         />}
                                       </li>
                                     );
@@ -2464,6 +2515,7 @@ export default function CupTournamentPage() {
                                                 breakdown={p.breakdown}
                                                 teamName={displayTeamName}
                                                 opponentName={displayOpponentName}
+                                                fantasyPosition={p.position}
                                               />
                                             )}
                                           </li>
