@@ -232,6 +232,7 @@
 
   .fieldPlayerCard--live,
   .fieldPlayerCard--live:hover {
+    animation: none;
     filter:
       drop-shadow(0 8px 9px rgba(0, 0, 0, 0.6))
       drop-shadow(0 0 7px rgba(45, 255, 190, 0.76))
@@ -240,11 +241,16 @@
 
   .fieldPlayerCard--selected,
   .fieldPlayerCard--selected:hover {
+    animation: none;
     transform: none;
     filter:
       drop-shadow(0 8px 10px rgba(0, 0, 0, 0.62))
       drop-shadow(0 0 12px rgba(250, 204, 21, 0.58))
       drop-shadow(0 0 18px rgba(16, 185, 129, 0.38));
+  }
+
+  .fieldPlayerCard--live.fieldPlayerCard--selected {
+    animation: none;
   }
 }
 

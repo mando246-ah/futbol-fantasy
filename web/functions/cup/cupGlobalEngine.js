@@ -30,6 +30,14 @@ function createCupGlobalEngine(deps = {}) {
   const CUP_GLOBAL_ACTIVE_POLL_MS = 60 * 1000;
   const CUP_GLOBAL_POST_MS = 3 * 60 * 60 * 1000;
   const CUP_GLOBAL_RETRY_MS = 60 * 60 * 1000;
+  const WORLD_CUP_KNOCKOUT_ROUND_COUNTS = {
+    "round-of-32": 16,
+    "round-of-16": 8,
+    "quarter-final": 4,
+    "semi-final": 2,
+    "third-place": 1,
+    final: 1,
+  };
 
   function isWorldCupKnockoutRoom(room = {}) {
     const competitionKey = String(room?.competitionKey || "").toLowerCase();
@@ -53,9 +61,9 @@ function createCupGlobalEngine(deps = {}) {
     );
   }
 
-  function isWorldCupKnockoutRoundLabel(label = "") {
+  function canonicalWorldCupKnockoutRoundKey(label = "") {
     const value = String(label || "").toLowerCase().trim();
-    if (!value) return false;
+    if (!value) return null;
     if (
       value.includes("club world cup") ||
       value.includes("group stage") ||
@@ -63,25 +71,213 @@ function createCupGlobalEngine(deps = {}) {
       value.includes("qualification") ||
       value.includes("qualifying")
     ) {
-      return false;
+      return null;
     }
 
-    return (
-      value.includes("round of 32") ||
-      value.includes("16th finals") ||
-      value.includes("round of 16") ||
-      value.includes("8th finals") ||
-      value.includes("eighth finals") ||
-      value.includes("quarter-final") ||
-      value.includes("quarter final") ||
-      value.includes("semi-final") ||
-      value.includes("semi final") ||
-      value === "final" ||
-      value.startsWith("final ") ||
-      value.endsWith(" final") ||
-      value.includes("third place") ||
-      value.includes("3rd place")
+    const normalized = value
+      .replace(/[–—]/g, "-")
+      .replace(/\s+/g, " ");
+
+    if (normalized.includes("round of 32")) return "round-of-32";
+    if (
+      normalized.includes("16th finals") ||
+      normalized.includes("16th final") ||
+      normalized.includes("round of 16") ||
+      normalized.includes("8th finals") ||
+      normalized.includes("8th final") ||
+      normalized.includes("eighth finals") ||
+      normalized.includes("eighth final")
+    ) {
+      return "round-of-16";
+    }
+    if (
+      normalized.includes("quarter-finals") ||
+      normalized.includes("quarter-final") ||
+      normalized.includes("quarter finals") ||
+      normalized.includes("quarter final") ||
+      normalized.includes("quarterfinal")
+    ) {
+      return "quarter-final";
+    }
+    if (
+      normalized.includes("semi-finals") ||
+      normalized.includes("semi-final") ||
+      normalized.includes("semi finals") ||
+      normalized.includes("semi final") ||
+      normalized.includes("semifinal")
+    ) {
+      return "semi-final";
+    }
+    if (
+      normalized.includes("third place") ||
+      normalized.includes("3rd place")
+    ) {
+      return "third-place";
+    }
+    if (
+      normalized === "final" ||
+      normalized.startsWith("final ") ||
+      normalized.endsWith(" final")
+    ) {
+      return "final";
+    }
+
+    return null;
+  }
+
+  function isWorldCupKnockoutRoundLabel(label = "") {
+    return Boolean(canonicalWorldCupKnockoutRoundKey(label));
+  }
+
+  function worldCupKnockoutExpectedFixtureCount(roundKey = "") {
+    return WORLD_CUP_KNOCKOUT_ROUND_COUNTS[String(roundKey || "")] || null;
+  }
+
+  function cupFixtureIdFromAny(value = {}) {
+    return String(
+      value?.fixtureId ||
+        value?.id ||
+        value?.fixture?.id ||
+        ""
+    ).trim();
+  }
+
+  function cupFixtureRoundLabel(value = {}) {
+    return firstText(
+      value?.roundLabel,
+      value?.leagueRound,
+      value?.round,
+      value?.league?.round,
+      value?.fixture?.round
     );
+  }
+
+  function getCupCurrentWindowRoundKey(cup = {}, applyResult = {}) {
+    const labels = [
+      cup?.currentWindowLabel,
+      applyResult?.currentWindowLabel,
+      applyResult?.roundLabel,
+      ...(Array.isArray(cup?.currentWindowFixtures)
+        ? cup.currentWindowFixtures.map(cupFixtureRoundLabel)
+        : []),
+      ...(Array.isArray(applyResult?.fixtureCoverage)
+        ? applyResult.fixtureCoverage.map(cupFixtureRoundLabel)
+        : []),
+    ];
+
+    const counts = new Map();
+    for (const label of labels) {
+      const key = canonicalWorldCupKnockoutRoundKey(label);
+      if (!key) continue;
+      counts.set(key, Number(counts.get(key) || 0) + 1);
+    }
+
+    return Array.from(counts.entries())
+      .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0))[0]?.[0] || null;
+  }
+
+  function getWorldCupKnockoutRoundCompleteness({
+    room = {},
+    cup = {},
+    applyResult = {},
+  } = {}) {
+    if (!isWorldCupKnockoutRoom(room)) {
+      return {
+        isWorldCupKnockout: false,
+        roundKey: null,
+        expectedFixtureCount: null,
+        discoveredFixtureCount: null,
+        isComplete: true,
+      };
+    }
+
+    const roundKey = getCupCurrentWindowRoundKey(cup, applyResult);
+    const fixtureIds = new Set(
+      [
+        ...(Array.isArray(applyResult?.fixtureIds) ? applyResult.fixtureIds : []),
+        ...(Array.isArray(cup?.currentWindowFixtureIds) ? cup.currentWindowFixtureIds : []),
+      ]
+        .map((id) => String(id || "").trim())
+        .filter(Boolean)
+    );
+    const discoveredFixtureCount = fixtureIds.size;
+    const expectedFixtureCount = worldCupKnockoutExpectedFixtureCount(roundKey);
+    const isRecognizedRound = Boolean(roundKey && expectedFixtureCount);
+
+    return {
+      isWorldCupKnockout: true,
+      roundKey,
+      expectedFixtureCount,
+      discoveredFixtureCount,
+      isRecognizedRound,
+      isComplete:
+        discoveredFixtureCount > 0 &&
+        isRecognizedRound &&
+        discoveredFixtureCount >= Number(expectedFixtureCount || 0),
+    };
+  }
+
+  function cupGlobalWindowKeyForCurrentCup(roomId, cup = {}) {
+    const fixtureIds = [...new Set(
+      (Array.isArray(cup?.currentWindowFixtureIds) ? cup.currentWindowFixtureIds : [])
+        .map((id) => String(id || "").trim())
+        .filter(Boolean)
+    )];
+    if (!fixtureIds.length) return null;
+
+    const label = cup?.currentWindowLabel || "Cup Window";
+    const labelKey = safeId(label) || "cup-window";
+    const fixtureKey = fixtureIds.map(String).sort().join("_");
+    return `cup-global-${labelKey}-${hashToUint32(`${roomId}:${fixtureKey}`)}`;
+  }
+
+  function buildCupWindowFixtureFromSummary({
+    fixtureId,
+    summary = {},
+    fallback = {},
+    label = null,
+  } = {}) {
+    const id = String(fixtureId || cupFixtureIdFromAny(summary) || cupFixtureIdFromAny(fallback));
+    return {
+      id,
+      fixtureId: id,
+      kickoffMs: firstNumber(summary?.kickoffMs, fallback?.kickoffMs) || null,
+      round:
+        cupFixtureRoundLabel(summary) ||
+        cupFixtureRoundLabel(fallback) ||
+        label ||
+        null,
+      roundLabel:
+        summary?.roundLabel ||
+        fallback?.roundLabel ||
+        cupFixtureRoundLabel(summary) ||
+        cupFixtureRoundLabel(fallback) ||
+        label ||
+        null,
+      leagueRound:
+        summary?.leagueRound ||
+        fallback?.leagueRound ||
+        cupFixtureRoundLabel(summary) ||
+        cupFixtureRoundLabel(fallback) ||
+        label ||
+        null,
+      statusShort: statusShortFromFixtureLike(summary) || statusShortFromFixtureLike(fallback) || null,
+      statusLong: summary?.statusLong || fallback?.statusLong || null,
+      elapsed: firstNumber(summary?.elapsed, fallback?.elapsed),
+      extra: firstNumber(summary?.extra, fallback?.extra),
+      isLive: firstDefined(summary?.isLive, fallback?.isLive) === true,
+      isFinished: firstDefined(summary?.isFinished, fallback?.isFinished) === true,
+      goalsHome: firstNumber(summary?.goalsHome, summary?.homeGoals, summary?.homeScore, fallback?.goalsHome, fallback?.homeGoals, fallback?.homeScore),
+      goalsAway: firstNumber(summary?.goalsAway, summary?.awayGoals, summary?.awayScore, fallback?.goalsAway, fallback?.awayGoals, fallback?.awayScore),
+      homeScore: firstNumber(summary?.goalsHome, summary?.homeGoals, summary?.homeScore, fallback?.goalsHome, fallback?.homeGoals, fallback?.homeScore),
+      awayScore: firstNumber(summary?.goalsAway, summary?.awayGoals, summary?.awayScore, fallback?.goalsAway, fallback?.awayGoals, fallback?.awayScore),
+      homeTeamId: firstDefined(summary?.homeTeamId, fallback?.homeTeamId),
+      homeTeamName: summary?.homeTeamName || fallback?.homeTeamName || "",
+      homeTeamLogo: summary?.homeTeamLogo || fallback?.homeTeamLogo || "",
+      awayTeamId: firstDefined(summary?.awayTeamId, fallback?.awayTeamId),
+      awayTeamName: summary?.awayTeamName || fallback?.awayTeamName || "",
+      awayTeamLogo: summary?.awayTeamLogo || fallback?.awayTeamLogo || "",
+    };
   }
 
   function isCupFinalWindowLabel(label = "") {
@@ -102,6 +298,97 @@ function createCupGlobalEngine(deps = {}) {
     return value === "final" || value.startsWith("final ") || value.endsWith(" final");
   }
 
+  function buildCupGlobalStandingsRowsFromTotals(totalsByUid = {}, rowSources = []) {
+    const normalizedTotals = normalizeCupGlobalNumberMap(totalsByUid);
+    const rowByUid = new Map();
+
+    for (const source of Array.isArray(rowSources) ? rowSources : []) {
+      for (const row of Array.isArray(source) ? source : []) {
+        const uid = String(row?.userId || row?.uid || "").trim();
+        if (!uid || rowByUid.has(uid)) continue;
+        rowByUid.set(uid, row || {});
+      }
+    }
+
+    return Object.entries(normalizedTotals)
+      .map(([uid, total]) => {
+        const previousRow = rowByUid.get(uid) || {};
+        const displayName =
+          previousRow.displayName ||
+          previousRow.name ||
+          uid;
+
+        return {
+          rank: 0,
+          uid,
+          userId: uid,
+          name: displayName,
+          displayName,
+          teamName: previousRow.teamName || "",
+          totalFantasyPoints: Number(total || 0),
+        };
+      })
+      .sort((a, b) =>
+        Number(b.totalFantasyPoints || 0) - Number(a.totalFantasyPoints || 0)
+      )
+      .map((row, index) => ({ ...row, rank: index + 1 }));
+  }
+
+  function getCupGlobalCumulativeBaseForNextWindow(cup = {}) {
+    if (cup?.globalBaseTotalsByUid && typeof cup.globalBaseTotalsByUid === "object") {
+      return normalizeCupGlobalNumberMap(cup.globalBaseTotalsByUid);
+    }
+
+    if (cup?.cupTotalsByUid && typeof cup.cupTotalsByUid === "object") {
+      return normalizeCupGlobalNumberMap(cup.cupTotalsByUid);
+    }
+
+    if (cup?.creditedTotalsByUid && typeof cup.creditedTotalsByUid === "object") {
+      return normalizeCupGlobalNumberMap(cup.creditedTotalsByUid);
+    }
+
+    return {};
+  }
+
+  function buildCupGlobalNewWindowResetPayload({
+    baseTotalsByUid = {},
+    projectedStandingsRows = [],
+  } = {}) {
+    const normalizedBaseTotals = normalizeCupGlobalNumberMap(baseTotalsByUid);
+
+    return {
+      creditedTotalsByUid: normalizedBaseTotals,
+      cupTotalsByUid: normalizedBaseTotals,
+      globalBaseTotalsByUid: normalizedBaseTotals,
+      globalBaseAdjustedForCurrentWindow: false,
+      removedLegacyWindowPointsByUid: {},
+
+      windowPointsByUid: {},
+      windowBenchPointsByUid: {},
+      windowBreakdownByUserId: {},
+      currentWindowBreakdownByUserId: {},
+      breakdownByUserId: {},
+
+      livePointsByUid: {},
+      liveBenchPointsByUid: {},
+      liveBreakdownByUserId: {},
+
+      globalCurrentWindowPointsByUid: {},
+      globalCurrentWindowBenchPointsByUid: {},
+      globalCurrentWindowBreakdownByUserId: {},
+
+      creditedFixtures: {},
+      creditedCurrentWindowFixtureIds: [],
+
+      projectedTotalsByUid: normalizedBaseTotals,
+      projectedStandingsRows,
+      standingsRows: projectedStandingsRows,
+      leaderboard: projectedStandingsRows,
+      rows: projectedStandingsRows,
+      projectedIncludesLivePoints: false,
+    };
+  }
+
   async function armNextCupGlobalWindowFromCache({
     db,
     roomId,
@@ -115,6 +402,25 @@ function createCupGlobalEngine(deps = {}) {
     if (!seasonContext?.seasonKey) {
       throw new HttpsError("failed-precondition", "Could not resolve seasonKey for room.");
     }
+
+    const cupRef = roomRef.collection("cup").doc("current");
+    const cupSnap = await cupRef.get().catch(() => null);
+    const existingCup = cupSnap?.exists ? (cupSnap.data() || {}) : {};
+    const cumulativeBaseTotalsByUid =
+      getCupGlobalCumulativeBaseForNextWindow(existingCup);
+    const cumulativeStandingsRows = buildCupGlobalStandingsRowsFromTotals(
+      cumulativeBaseTotalsByUid,
+      [
+        existingCup?.projectedStandingsRows,
+        existingCup?.standingsRows,
+        existingCup?.leaderboard,
+        existingCup?.rows,
+      ]
+    );
+    const newWindowResetPayload = buildCupGlobalNewWindowResetPayload({
+      baseTotalsByUid: cumulativeBaseTotalsByUid,
+      projectedStandingsRows: cumulativeStandingsRows,
+    });
 
     const lowerBoundMs = Number(afterMs) > 0
       ? Number(afterMs) + 1
@@ -147,17 +453,78 @@ function createCupGlobalEngine(deps = {}) {
       );
     }
 
-    const nextWindow = pickCupWindow(candidates, {
+    let nextWindow = pickCupWindow(candidates, {
       nowMs,
       gapHours: 36,
       afterMs,
       excludeFixtureIds,
     });
 
+    if (isWorldCupKnockoutRoom(room) && candidates.length) {
+      const exclude = new Set(
+        (Array.isArray(excludeFixtureIds) ? excludeFixtureIds : [])
+          .map(String)
+          .filter(Boolean)
+      );
+      const afterNumber = Number(afterMs);
+      const START_GRACE_MS = 3 * 60 * 60 * 1000;
+      const eligibleKnockoutCandidates = candidates
+        .map((candidate) => ({
+          ...candidate,
+          id: String(candidate?.id || ""),
+          kickoffMs: Number(candidate?.kickoffMs || 0),
+          roundKey: canonicalWorldCupKnockoutRoundKey(candidate?.round),
+        }))
+        .filter((candidate) => candidate.id)
+        .filter((candidate) => candidate.roundKey)
+        .filter((candidate) => Number.isFinite(candidate.kickoffMs) && candidate.kickoffMs > 0)
+        .filter((candidate) => !exclude.has(String(candidate.id)))
+        .filter((candidate) =>
+          Number.isFinite(afterNumber) && afterNumber > 0
+            ? Number(candidate.kickoffMs) > afterNumber
+            : true
+        )
+        .sort((a, b) => Number(a.kickoffMs) - Number(b.kickoffMs));
+
+      const seed =
+        eligibleKnockoutCandidates.find(
+          (candidate) => Number(candidate.kickoffMs) >= nowMs - START_GRACE_MS
+        ) ||
+        eligibleKnockoutCandidates[0] ||
+        null;
+
+      if (seed?.roundKey) {
+        const picked = eligibleKnockoutCandidates
+          .filter((candidate) => candidate.roundKey === seed.roundKey)
+          .sort((a, b) => Number(a.kickoffMs) - Number(b.kickoffMs));
+        const fixtureIds = picked.map((candidate) => String(candidate.id)).filter(Boolean);
+
+        if (fixtureIds.length) {
+          const minKo = Math.min(...picked.map((candidate) => Number(candidate.kickoffMs)));
+          const maxKo = Math.max(...picked.map((candidate) => Number(candidate.kickoffMs)));
+          nextWindow = {
+            windowId: `${seed.round || seed.roundKey}:${minKo}-${maxKo}`,
+            label: seed.round || seed.roundKey || "Cup",
+            fixtureIds,
+            fixtures: picked.map((candidate) => ({
+              id: String(candidate.id),
+              kickoffMs: Number(candidate.kickoffMs) || null,
+              round: candidate.round || null,
+            })),
+            startAtMs: minKo,
+            endAtMs: maxKo,
+            canonicalRoundKey: seed.roundKey,
+            expectedFixtureCount: worldCupKnockoutExpectedFixtureCount(seed.roundKey),
+          };
+        }
+      }
+    }
+
     if (!nextWindow?.fixtureIds?.length) {
       const nextPollAtMs = nowMs + CUP_GLOBAL_RETRY_MS;
-      await roomRef.collection("cup").doc("current").set(
+      await cupRef.set(
         {
+          ...newWindowResetPayload,
           roomId,
           status: "scheduled",
           source: "global-live-fixtures",
@@ -167,13 +534,6 @@ function createCupGlobalEngine(deps = {}) {
           currentWindowFixtures: [],
           currentWindowStartAtMs: null,
           currentWindowEndAtMs: null,
-          windowPointsByUid: {},
-          creditedFixtures: {},
-          breakdownByUserId: {},
-          livePointsByUid: {},
-          liveBreakdownByUserId: {},
-          projectedTotalsByUid: {},
-          projectedIncludesLivePoints: false,
           globalApplyStatus: "waiting-for-global-window",
           nextPollAtMs,
           updatedAtMs: nowMs,
@@ -199,28 +559,11 @@ function createCupGlobalEngine(deps = {}) {
 
     const currentWindowFixtures = nextWindow.fixtureIds.map((fixtureId) => {
       const summary = summaryById.get(String(fixtureId)) || {};
-      return {
-        id: String(fixtureId),
-        fixtureId: String(fixtureId),
-        kickoffMs: Number(summary?.kickoffMs || 0) || null,
-        round: summary?.roundLabel || summary?.leagueRound || summary?.round || nextWindow.label || null,
-        statusShort: summary?.statusShort || summary?.short || null,
-        statusLong: summary?.statusLong || null,
-        elapsed: firstNumber(summary?.elapsed),
-        extra: firstNumber(summary?.extra),
-        isLive: summary?.isLive === true,
-        isFinished: summary?.isFinished === true,
-        goalsHome: firstNumber(summary?.goalsHome, summary?.homeGoals, summary?.homeScore),
-        goalsAway: firstNumber(summary?.goalsAway, summary?.awayGoals, summary?.awayScore),
-        homeScore: firstNumber(summary?.goalsHome, summary?.homeGoals, summary?.homeScore),
-        awayScore: firstNumber(summary?.goalsAway, summary?.awayGoals, summary?.awayScore),
-        homeTeamId: summary?.homeTeamId ?? null,
-        homeTeamName: summary?.homeTeamName || "",
-        homeTeamLogo: summary?.homeTeamLogo || "",
-        awayTeamId: summary?.awayTeamId ?? null,
-        awayTeamName: summary?.awayTeamName || "",
-        awayTeamLogo: summary?.awayTeamLogo || "",
-      };
+      return buildCupWindowFixtureFromSummary({
+        fixtureId,
+        summary,
+        label: nextWindow.label || "Cup",
+      });
     });
     const firstKickoffMs = Math.min(
       ...currentWindowFixtures
@@ -231,6 +574,7 @@ function createCupGlobalEngine(deps = {}) {
       ? Math.max(nowMs, firstKickoffMs - CUP_GLOBAL_ACTIVE_PRE_MS)
       : nowMs + CUP_GLOBAL_RETRY_MS;
     const cupPayload = {
+      ...newWindowResetPayload,
       roomId,
       status: "scheduled",
       source: "global-live-fixtures",
@@ -240,20 +584,19 @@ function createCupGlobalEngine(deps = {}) {
       currentWindowFixtures,
       currentWindowStartAtMs: Number(nextWindow.startAtMs || 0) || null,
       currentWindowEndAtMs: Number(nextWindow.endAtMs || 0) || null,
-      windowPointsByUid: {},
-      creditedFixtures: {},
-      breakdownByUserId: {},
-      livePointsByUid: {},
-      liveBreakdownByUserId: {},
-      projectedTotalsByUid: {},
-      projectedIncludesLivePoints: false,
       globalApplyStatus: "scheduled",
+      currentWindowRoundKey: nextWindow.canonicalRoundKey || getCupCurrentWindowRoundKey({
+        currentWindowLabel: nextWindow.label,
+        currentWindowFixtures,
+      }),
+      expectedFixtureCount: nextWindow.expectedFixtureCount || null,
+      discoveredFixtureCount: currentWindowFixtures.length,
       nextPollAtMs,
       updatedAtMs: nowMs,
       updatedAt: FieldValue.serverTimestamp(),
     };
 
-    await roomRef.collection("cup").doc("current").set(cupPayload, { merge: true });
+    await cupRef.set(cupPayload, { merge: true });
     await setCompetitionState(
       roomRef,
       {
@@ -274,6 +617,189 @@ function createCupGlobalEngine(deps = {}) {
       nextPollAtMs,
       nextKickoffMs: Number.isFinite(firstKickoffMs) ? firstKickoffMs : null,
       source: "global-live-fixtures",
+    };
+  }
+
+  async function reconcileCupGlobalCurrentWindowFromCache({
+    db,
+    roomId,
+    room = {},
+    cup = null,
+    nowMs = Date.now(),
+  }) {
+    if (!isWorldCupKnockoutRoom(room)) {
+      return { applied: false, skippedReason: "not-world-cup-knockout" };
+    }
+
+    const roomRef = db.doc(`rooms/${roomId}`);
+    const cupRef = roomRef.collection("cup").doc("current");
+    let currentCup = cup && typeof cup === "object" ? cup : null;
+    if (!currentCup) {
+      const cupSnap = await cupRef.get();
+      currentCup = cupSnap.exists ? (cupSnap.data() || {}) : {};
+    }
+
+    const existingFixtureIds = [...new Set(
+      (Array.isArray(currentCup?.currentWindowFixtureIds)
+        ? currentCup.currentWindowFixtureIds
+        : [])
+        .map((id) => String(id || "").trim())
+        .filter(Boolean)
+    )];
+
+    if (!existingFixtureIds.length) {
+      return { applied: false, skippedReason: "no-current-window-fixtures", cup: currentCup };
+    }
+
+    const currentWindowKey = cupGlobalWindowKeyForCurrentCup(roomId, currentCup);
+    const finalizedKeys = Array.isArray(currentCup?.finalizedGlobalWindowKeys)
+      ? currentCup.finalizedGlobalWindowKeys.map((key) => String(key))
+      : [];
+    if (currentWindowKey && finalizedKeys.includes(currentWindowKey)) {
+      return {
+        applied: false,
+        skippedReason: "current-window-already-finalized",
+        cup: currentCup,
+      };
+    }
+
+    const roundKey = getCupCurrentWindowRoundKey(currentCup);
+    if (!roundKey) {
+      return { applied: false, skippedReason: "missing-canonical-round-key", cup: currentCup };
+    }
+
+    const seasonContext = deriveRoomSeasonContext(room);
+    if (!seasonContext?.seasonKey) {
+      return { applied: false, skippedReason: "missing-season-key", cup: currentCup };
+    }
+
+    const existingFixturesById = new Map(
+      (Array.isArray(currentCup?.currentWindowFixtures)
+        ? currentCup.currentWindowFixtures
+        : [])
+        .map((fixture) => [cupFixtureIdFromAny(fixture), fixture || {}])
+        .filter(([fixtureId]) => Boolean(fixtureId))
+    );
+
+    const kickoffValues = Array.from(existingFixturesById.values())
+      .map((fixture) => firstNumber(fixture?.kickoffMs, fixture?.startAtMs))
+      .filter((kickoffMs) => Number.isFinite(kickoffMs) && kickoffMs > 0);
+    const storedStart = firstNumber(currentCup?.currentWindowStartAtMs);
+    const storedEnd = firstNumber(currentCup?.currentWindowEndAtMs);
+    const baseStart = storedStart || (kickoffValues.length ? Math.min(...kickoffValues) : nowMs);
+    const baseEnd = storedEnd || (kickoffValues.length ? Math.max(...kickoffValues) : nowMs);
+    const queryStartMs = Math.max(0, Number(baseStart || nowMs) - 14 * 24 * 60 * 60 * 1000);
+    const queryEndMs = Number(baseEnd || nowMs) + 14 * 24 * 60 * 60 * 1000;
+    const roomLeague = String(room?.competition?.league || "").trim();
+
+    const summariesSnap = await getSeasonFixturesCollectionRef(db, seasonContext.seasonKey)
+      .where("kickoffMs", ">=", queryStartMs)
+      .orderBy("kickoffMs", "asc")
+      .limit(500)
+      .get();
+
+    const summaryById = new Map();
+    for (const summaryDoc of summariesSnap.docs) {
+      const summary = summaryDoc.data() || {};
+      const fixtureId = String(summary?.fixtureId || summaryDoc.id || "").trim();
+      const kickoffMs = Number(summary?.kickoffMs || 0);
+      const summaryLeague = String(summary?.league || summary?.leagueId || "").trim();
+      const summaryRoundKey = canonicalWorldCupKnockoutRoundKey(cupFixtureRoundLabel(summary));
+      if (!fixtureId || !Number.isFinite(kickoffMs) || kickoffMs <= 0) continue;
+      if (kickoffMs > queryEndMs) continue;
+      if (roomLeague && summaryLeague && roomLeague !== summaryLeague) continue;
+      if (summaryRoundKey !== roundKey) continue;
+      summaryById.set(fixtureId, summary);
+    }
+
+    const mergedFixtureIds = [...new Set([
+      ...existingFixtureIds,
+      ...Array.from(summaryById.keys()),
+    ])].filter(Boolean);
+
+    const label = currentCup?.currentWindowLabel || cupFixtureRoundLabel(currentCup) || roundKey || "Cup";
+    const mergedFixtures = mergedFixtureIds
+      .map((fixtureId) => {
+        const summary = summaryById.get(String(fixtureId)) || {};
+        const fallback = existingFixturesById.get(String(fixtureId)) || { fixtureId };
+        return buildCupWindowFixtureFromSummary({
+          fixtureId,
+          summary,
+          fallback,
+          label,
+        });
+      })
+      .sort((a, b) => Number(a?.kickoffMs || 0) - Number(b?.kickoffMs || 0));
+
+    const kickoffMsList = mergedFixtures
+      .map((fixture) => Number(fixture?.kickoffMs || 0))
+      .filter((kickoffMs) => Number.isFinite(kickoffMs) && kickoffMs > 0)
+      .sort((a, b) => a - b);
+    const currentWindowStartAtMs = kickoffMsList[0] || currentCup?.currentWindowStartAtMs || null;
+    const currentWindowEndAtMs =
+      kickoffMsList[kickoffMsList.length - 1] || currentCup?.currentWindowEndAtMs || null;
+    const expectedFixtureCount = worldCupKnockoutExpectedFixtureCount(roundKey);
+    const discoveredFixtureCount = mergedFixtureIds.length;
+    const existingIdsKey = existingFixtureIds.map(String).sort().join("|");
+    const mergedIdsKey = mergedFixtureIds.map(String).sort().join("|");
+    const shouldWrite =
+      existingIdsKey !== mergedIdsKey ||
+      Number(currentCup?.currentWindowStartAtMs || 0) !== Number(currentWindowStartAtMs || 0) ||
+      Number(currentCup?.currentWindowEndAtMs || 0) !== Number(currentWindowEndAtMs || 0) ||
+      currentCup?.currentWindowRoundKey !== roundKey ||
+      Number(currentCup?.expectedFixtureCount || 0) !== Number(expectedFixtureCount || 0) ||
+      Number(currentCup?.discoveredFixtureCount || 0) !== Number(discoveredFixtureCount || 0);
+
+    const nextCup = {
+      ...currentCup,
+      currentWindowFixtureIds: mergedFixtureIds,
+      currentWindowFixtures: mergedFixtures,
+      currentWindowStartAtMs,
+      currentWindowEndAtMs,
+      currentWindowRoundKey: roundKey,
+      expectedFixtureCount: expectedFixtureCount || null,
+      discoveredFixtureCount,
+    };
+
+    if (!shouldWrite) {
+      return {
+        applied: false,
+        skippedReason: "current-window-already-complete-for-cache",
+        cup: nextCup,
+        roundKey,
+        expectedFixtureCount: expectedFixtureCount || null,
+        discoveredFixtureCount,
+      };
+    }
+
+    const update = {
+      currentWindowFixtureIds: mergedFixtureIds,
+      currentWindowFixtures: mergedFixtures,
+      currentWindowStartAtMs,
+      currentWindowEndAtMs,
+      currentWindowRoundKey: roundKey,
+      expectedFixtureCount: expectedFixtureCount || null,
+      discoveredFixtureCount,
+      lastRoundReconciledAtMs: nowMs,
+      updatedAtMs: nowMs,
+      updatedAt: FieldValue.serverTimestamp(),
+    };
+
+    if (expectedFixtureCount && discoveredFixtureCount < expectedFixtureCount) {
+      update.globalApplyStatus = "waiting-for-complete-round";
+    } else if (!expectedFixtureCount) {
+      update.globalApplyStatus = "waiting-for-recognized-round";
+    }
+
+    await cupRef.set(update, { merge: true });
+
+    return {
+      applied: true,
+      cup: nextCup,
+      roundKey,
+      expectedFixtureCount: expectedFixtureCount || null,
+      discoveredFixtureCount,
+      addedFixtureIds: mergedFixtureIds.filter((id) => !existingFixtureIds.includes(String(id))),
     };
   }
 
@@ -1426,6 +1952,14 @@ function createCupGlobalEngine(deps = {}) {
         cup,
       });
     });
+    const worldCupRoundCompleteness = getWorldCupKnockoutRoundCompleteness({
+      room,
+      cup,
+      applyResult: {
+        fixtureIds,
+        fixtureCoverage,
+      },
+    });
     const missingLiveFixtureIdSet = new Set(
       (Array.isArray(missingFixtureIds) ? missingFixtureIds : [])
         .map((id) => String(id || "").trim())
@@ -1505,6 +2039,10 @@ function createCupGlobalEngine(deps = {}) {
         skippedReason,
         fixtureIds,
         fixtureCount: fixtureIds.length,
+        currentWindowRoundKey: worldCupRoundCompleteness.roundKey || null,
+        expectedFixtureCount: worldCupRoundCompleteness.expectedFixtureCount || null,
+        discoveredFixtureCount: worldCupRoundCompleteness.discoveredFixtureCount || null,
+        worldCupKnockoutRoundComplete: worldCupRoundCompleteness.isComplete,
         missingFixtureCount: missingRequiredFixtureIds.length,
         missingFullWindowFixtureCount: missingFixtureIds.length,
         statusValue,
@@ -1543,6 +2081,10 @@ function createCupGlobalEngine(deps = {}) {
             hasKickoffPassedUnfinishedFixtures,
             fixtureStatusById: skippedPayload.fixtureStatusById,
             fixtureCoverage,
+            currentWindowRoundKey: worldCupRoundCompleteness.roundKey || null,
+            expectedFixtureCount: worldCupRoundCompleteness.expectedFixtureCount || null,
+            discoveredFixtureCount: worldCupRoundCompleteness.discoveredFixtureCount || null,
+            worldCupKnockoutRoundComplete: worldCupRoundCompleteness.isComplete,
             nextPollAtMs,
             updatedAtMs: nowMs,
             updatedAt: FieldValue.serverTimestamp(),
@@ -1566,12 +2108,19 @@ function createCupGlobalEngine(deps = {}) {
         "Cannot apply Cup global result while global fixture cache is missing active fixtures."
       );
     }
-    const nextPollAtMs = nextCupGlobalPollAtFromCoverage({
+    let nextPollAtMs = nextCupGlobalPollAtFromCoverage({
       fixtureCoverage,
       nowMs,
       statusValue,
       allFinished,
     });
+    if (
+      worldCupRoundCompleteness.isWorldCupKnockout &&
+      worldCupRoundCompleteness.isComplete === false &&
+      allFinished
+    ) {
+      nextPollAtMs = nowMs + CUP_GLOBAL_PREGAME_POLL_MS;
+    }
   
     const users = await loadRoomUsersLineupsForGlobalAggregation({ db, roomId });
     const globalRawStatsByPlayerId = buildAggregatedGlobalRawStatsByPlayerId(patchedLiveFixturesById);
@@ -1730,6 +2279,10 @@ function createCupGlobalEngine(deps = {}) {
       replayHistoryLabel: cup?.replayHistoryLabel || null,
       fixtureIds,
       fixtureCount: fixtureIds.length,
+      currentWindowRoundKey: worldCupRoundCompleteness.roundKey || null,
+      expectedFixtureCount: worldCupRoundCompleteness.expectedFixtureCount || null,
+      discoveredFixtureCount: worldCupRoundCompleteness.discoveredFixtureCount || null,
+      worldCupKnockoutRoundComplete: worldCupRoundCompleteness.isComplete,
       missingFixtureCount: missingRequiredFixtureIds.length,
       missingFullWindowFixtureCount: missingFixtureIds.length,
       statusValue,
@@ -1770,6 +2323,10 @@ function createCupGlobalEngine(deps = {}) {
         currentWindowFixtureIds: fixtureIds,
         fixtureStatusById,
         fixtureCoverage,
+        currentWindowRoundKey: worldCupRoundCompleteness.roundKey || null,
+        expectedFixtureCount: worldCupRoundCompleteness.expectedFixtureCount || null,
+        discoveredFixtureCount: worldCupRoundCompleteness.discoveredFixtureCount || null,
+        worldCupKnockoutRoundComplete: worldCupRoundCompleteness.isComplete,
   
         globalCurrentWindowPointsByUid: globalTotalsByUid,
         globalCurrentWindowBenchPointsByUid: globalBenchTotalsByUid,
@@ -1791,7 +2348,14 @@ function createCupGlobalEngine(deps = {}) {
         projectedIncludesLivePoints,
         projectedUpdatedAtMs: nowMs,
   
-        globalApplyStatus: statusValue,
+        globalApplyStatus:
+          worldCupRoundCompleteness.isWorldCupKnockout &&
+          worldCupRoundCompleteness.isComplete === false &&
+          allFinished
+            ? (worldCupRoundCompleteness.isRecognizedRound
+                ? "waiting-for-complete-round"
+                : "waiting-for-recognized-round")
+            : statusValue,
         missingFixtureIds,
         missingRequiredFixtureIds,
         missingFullWindowFixtureCount: missingFixtureIds.length,
@@ -1880,6 +2444,32 @@ function createCupGlobalEngine(deps = {}) {
   
     if (missingFixtureCount !== 0) {
       throw new HttpsError("failed-precondition", "Cup global finalization requires no missing fixtures.");
+    }
+
+    const roundCompleteness = getWorldCupKnockoutRoundCompleteness({
+      room,
+      cup,
+      applyResult,
+    });
+    if (
+      roundCompleteness.isWorldCupKnockout &&
+      roundCompleteness.isComplete === false
+    ) {
+      const waitingReason = roundCompleteness.isRecognizedRound
+        ? "waiting-for-complete-round"
+        : "waiting-for-recognized-round";
+      throw new HttpsError(
+        "failed-precondition",
+        roundCompleteness.isRecognizedRound
+          ? "Cup global finalization is waiting for the complete World Cup knockout round."
+          : "Cup global finalization is waiting for a recognized World Cup knockout round label.",
+        {
+          reason: waitingReason,
+          roundKey: roundCompleteness.roundKey || null,
+          expectedFixtureCount: roundCompleteness.expectedFixtureCount || null,
+          discoveredFixtureCount: roundCompleteness.discoveredFixtureCount || null,
+        }
+      );
     }
 
     if (
@@ -1974,6 +2564,7 @@ function createCupGlobalEngine(deps = {}) {
       label: windowLabel,
       roundLabel: windowLabel || null,
       fixtureIds,
+      fixtureCount,
       fixtures: Array.isArray(cup?.currentWindowFixtures) ? cup.currentWindowFixtures : [],
       fixtureCoverage: applyResult?.fixtureCoverage || [],
       fixtureStatusById: applyResult?.fixtureStatusById || {},
@@ -1989,10 +2580,14 @@ function createCupGlobalEngine(deps = {}) {
       legacyCurrentWindowCreditDetected:
         cupGlobalBase.legacyCurrentWindowCreditDetected === true,
       cupTotalsByUid: nextCupTotalsByUid,
+      cupTotalsAfterByUid: nextCupTotalsByUid,
       standingsRows,
+      rows: standingsRows,
       top3,
       startAtMs: cup?.currentWindowStartAtMs || null,
       endAtMs: cup?.currentWindowEndAtMs || null,
+      closedAtMs: nowMs,
+      closedAt: FieldValue.serverTimestamp(),
       finalizedAtMs: nowMs,
       finalizedAt: FieldValue.serverTimestamp(),
     };
@@ -2031,6 +2626,46 @@ function createCupGlobalEngine(deps = {}) {
       throw new HttpsError(
         "failed-precondition",
         "Real Cup global finalization is blocked in replayTestMode. Use rehearsal for replay testing."
+      );
+    }
+
+    const roundCompleteness = getWorldCupKnockoutRoundCompleteness({
+      room,
+      cup,
+      applyResult,
+    });
+    if (
+      roundCompleteness.isWorldCupKnockout &&
+      roundCompleteness.isComplete === false
+    ) {
+      const waitingReason = roundCompleteness.isRecognizedRound
+        ? "waiting-for-complete-round"
+        : "waiting-for-recognized-round";
+      await db.doc(`rooms/${roomId}/cup/current`).set(
+        {
+          source: "global-live-fixtures",
+          globalApplyStatus: waitingReason,
+          currentWindowRoundKey: roundCompleteness.roundKey || null,
+          expectedFixtureCount: roundCompleteness.expectedFixtureCount || null,
+          discoveredFixtureCount: roundCompleteness.discoveredFixtureCount || null,
+          worldCupKnockoutRoundComplete: false,
+          nextPollAtMs: nowMs + CUP_GLOBAL_PREGAME_POLL_MS,
+          updatedAtMs: nowMs,
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+      throw new HttpsError(
+        "failed-precondition",
+        roundCompleteness.isRecognizedRound
+          ? "Cup global finalization is waiting for the complete World Cup knockout round."
+          : "Cup global finalization is waiting for a recognized World Cup knockout round label.",
+        {
+          reason: waitingReason,
+          roundKey: roundCompleteness.roundKey || null,
+          expectedFixtureCount: roundCompleteness.expectedFixtureCount || null,
+          discoveredFixtureCount: roundCompleteness.discoveredFixtureCount || null,
+        }
       );
     }
   
@@ -2094,7 +2729,16 @@ function createCupGlobalEngine(deps = {}) {
         projectionOnly: false,
         finalizedByGlobal: true,
         finalizedWindowKey: payload.windowKey,
+        creditedTotalsByUid: payload.nextCupTotalsByUid,
+        cupTotalsByUid: payload.nextCupTotalsByUid,
+        globalBaseTotalsByUid: payload.nextCupTotalsByUid,
+        projectedTotalsByUid: payload.nextCupTotalsByUid,
         standings: payload.standingsRows,
+        projectedStandingsRows: payload.standingsRows,
+        leaderboard: payload.standingsRows,
+        rows: payload.standingsRows,
+        standingsRows: payload.standingsRows,
+        includesLivePoints: false,
         updatedAtMs: nowMs,
         updatedAt: FieldValue.serverTimestamp(),
       },
@@ -2149,6 +2793,7 @@ function createCupGlobalEngine(deps = {}) {
   
   return {
     armNextCupGlobalWindowFromCache,
+    reconcileCupGlobalCurrentWindowFromCache,
     loadLatestCupHistoryWindow,
     computeGlobalCupShadowResults,
     buildCupGlobalWriteRehearsalPayload,

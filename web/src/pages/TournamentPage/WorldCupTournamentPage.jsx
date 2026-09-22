@@ -1,5 +1,5 @@
 // src/pages/TournamentPage/WorldCupTournamentPage.jsx
-import { useEffect, useMemo, useState, useRef } from "react";
+import { lazy, Suspense, useEffect, useMemo, useState, useRef } from "react";
 import { useParams, Link } from "react-router-dom";
 import { doc, onSnapshot, collection, query, orderBy, limit, getDocs } from "firebase/firestore";
 
@@ -8,15 +8,15 @@ import { scorePlayerFromCore, toCorePos } from "../../tournament/logic/scoringCo
 import { auth, db } from "../../firebase";
 import { buildTournamentPlayerResolver } from "./tournamentPlayerResolver";
 import { useTargetedTournamentPlayers } from "./useTargetedTournamentPlayers";
-import stadiumBg from "../../assets/stadium.png";
 
 import "./TournamentPage.css";
 import "./WorldCupTournamentPage.css";
 import { Avatar, AvatarImage, AvatarFallback } from "../../components/ui/avatar";
 import FlagIcon from "../../components/FlagIcon";
 import FinalResultsCard from "../../components/ui/FinalResultsCard";
-import FieldPlayerCard from "../../components/ui/FieldPlayerCard";
-import FieldPlayerDetailsPanel from "../../components/ui/FieldPlayerDetailsPanel";
+
+const FieldPlayerCard = lazy(() => import("../../components/ui/FieldPlayerCard"));
+const FieldPlayerDetailsPanel = lazy(() => import("../../components/ui/FieldPlayerDetailsPanel"));
 
 const SCORING_DISPLAY = [
   { label: "Appearance", detail: "+1 (any minutes)" },
@@ -52,6 +52,16 @@ const SCORING_DISPLAY = [
 
 const WORLD_CUP_UI_RESET_BEFORE_NEXT_DAY_MS = 60 * 60 * 1000;
 const WORLD_CUP_ROSTER_VIEW_MODE_KEY = "worldcupRosterViewMode";
+const WORLD_CUP_PAGE_CLOCK_MS = 30 * 1000;
+const EMPTY_FIELD_LAYOUT = { formation: "0-0-0", positionedPlayers: [] };
+
+function FieldViewLoadingFallback() {
+  return (
+    <div className="wcFieldViewLoading" role="status">
+      Loading Field View...
+    </div>
+  );
+}
 
 function loadWorldCupRosterViewMode() {
   if (typeof window === "undefined") return "legacy";
@@ -841,11 +851,20 @@ function sortCupHistoryRows(rows = []) {
     .map((row, idx) => ({ ...row, rank: idx + 1 }));
 }
 
+function cupHistoryTimestampMs(round = {}) {
+  return Number(
+    round?.closedAtMs ||
+      round?.finalizedAtMs ||
+      round?.endAtMs ||
+      round?.startAtMs ||
+      round?.updatedAtMs ||
+      0
+  );
+}
+
 function normalizeCupHistoryRounds(rounds = [], userById = {}) {
   const asc = [...(rounds || [])].sort(
-    (a, b) =>
-      Number(a?.closedAtMs || a?.endAtMs || a?.startAtMs || 0) -
-      Number(b?.closedAtMs || b?.endAtMs || b?.startAtMs || 0)
+    (a, b) => cupHistoryTimestampMs(a) - cupHistoryTimestampMs(b)
   );
 
   const cumulativeByUid = {};
@@ -893,9 +912,7 @@ function normalizeCupHistoryRounds(rounds = [], userById = {}) {
   });
 
   return normalizedAsc.sort(
-    (a, b) =>
-      Number(b?.closedAtMs || b?.endAtMs || b?.startAtMs || 0) -
-      Number(a?.closedAtMs || a?.endAtMs || a?.startAtMs || 0)
+    (a, b) => cupHistoryTimestampMs(b) - cupHistoryTimestampMs(a)
   );
 }
 
@@ -2274,14 +2291,19 @@ export default function WorldCupTournamentPage() {
   const worldCupLeaderboardTitle = isWorldCupGroupRoom
     ? "Group Stage Leaderboard"
     : "Knockout Leaderboard";
-  const marqueeFlags = [...WORLD_CUP_FLAG_MARQUEE, ...WORLD_CUP_FLAG_MARQUEE];
   const [myUid, setMyUid] = useState(auth.currentUser?.uid || null);
   const [nowMs, setNowMs] = useState(() => Date.now());
+  const [showFlagMarquee, setShowFlagMarquee] = useState(false);
   const [rosterViewMode, setRosterViewMode] = useState(
     loadWorldCupRosterViewMode
   );
+  const [stadiumBgUrl, setStadiumBgUrl] = useState("");
 
   const [selectedFieldPlayerId, setSelectedFieldPlayerId] = useState(null);
+  const marqueeFlags = useMemo(
+    () => (showFlagMarquee ? [...WORLD_CUP_FLAG_MARQUEE, ...WORLD_CUP_FLAG_MARQUEE] : []),
+    [showFlagMarquee]
+  );
 
   const selectRosterViewMode = (nextMode) => {
     const safeMode = nextMode === "field" ? "field" : "legacy";
@@ -2303,6 +2325,49 @@ export default function WorldCupTournamentPage() {
       setSelectedFieldPlayerId(null);
     }
   }, [rosterViewMode]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const isSmallScreen =
+      typeof window !== "undefined" &&
+      window.matchMedia?.("(max-width: 640px)")?.matches;
+
+    if (isSmallScreen) {
+      setShowFlagMarquee(false);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const timer = window.setTimeout(() => {
+      if (!cancelled) setShowFlagMarquee(true);
+    }, 200);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (rosterViewMode !== "field" || stadiumBgUrl) {
+      return undefined;
+    }
+
+    let cancelled = false;
+
+    import("../../assets/stadium.png")
+      .then((asset) => {
+        if (!cancelled) setStadiumBgUrl(asset.default || asset);
+      })
+      .catch(() => {
+        if (!cancelled) setStadiumBgUrl("");
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [rosterViewMode, stadiumBgUrl]);
 
   useEffect(() => {
     if (rosterViewMode !== "field" || !selectedFieldPlayerId) {
@@ -2457,12 +2522,14 @@ export default function WorldCupTournamentPage() {
   }, []);
 
   useEffect(() => {
-    const t = setInterval(() => setNowMs(Date.now()), 1000);
+    const t = setInterval(() => setNowMs(Date.now()), WORLD_CUP_PAGE_CLOCK_MS);
     return () => clearInterval(t);
   }, []);
 
   useEffect(() => {
     let cancelled = false;
+    let idleId = null;
+    let timeoutId = null;
 
     if (!roomId) {
       setRoomPickDocs([]);
@@ -2489,10 +2556,27 @@ export default function WorldCupTournamentPage() {
       }
     }
 
-    loadRoomPickMetadata();
+    const scheduleLoad = () => {
+      if (typeof window !== "undefined" && "requestIdleCallback" in window) {
+        idleId = window.requestIdleCallback(loadRoomPickMetadata, {
+          timeout: 2200,
+        });
+        return;
+      }
+
+      timeoutId = window.setTimeout(loadRoomPickMetadata, 350);
+    };
+
+    scheduleLoad();
 
     return () => {
       cancelled = true;
+      if (idleId != null && typeof window !== "undefined" && "cancelIdleCallback" in window) {
+        window.cancelIdleCallback(idleId);
+      }
+      if (timeoutId != null && typeof window !== "undefined") {
+        window.clearTimeout(timeoutId);
+      }
     };
   }, [roomId]);
 
@@ -2528,20 +2612,28 @@ export default function WorldCupTournamentPage() {
       }
 
       if (historyEnabled) {
-        const historyQ = query(
+        unsubHistory = onSnapshot(
           collection(db, "rooms", roomId, "cupHistory"),
-          orderBy("closedAtMs", "desc")
+          (snap) => {
+            const rows = snap.docs
+              .map((d) => ({ id: d.id, ...d.data() }))
+              .sort((a, b) => cupHistoryTimestampMs(b) - cupHistoryTimestampMs(a));
+            setHistoryRounds(rows);
+
+            setSelectedHistoryId((prev) => {
+              if (prev && rows.some((r) => r.id === prev)) return prev;
+              return "";
+            });
+          },
+          (error) => {
+            console.warn("[WorldCupTournamentPage] cupHistory listener failed", {
+              roomId,
+              message: error?.message || String(error),
+            });
+            setHistoryRounds([]);
+            setSelectedHistoryId("");
+          }
         );
-
-        unsubHistory = onSnapshot(historyQ, (snap) => {
-          const rows = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-          setHistoryRounds(rows);
-
-          setSelectedHistoryId((prev) => {
-            if (prev && rows.some((r) => r.id === prev)) return prev;
-            return "";
-          });
-        });
       } else {
         setHistoryRounds([]);
         setSelectedHistoryId("");
@@ -2589,7 +2681,7 @@ export default function WorldCupTournamentPage() {
   }, [roomId, isWorldCupGroupRoom, historyEnabled]);
 
   useEffect(() => {
-    if (!roomId || !isWorldCupGroupRoom) {
+    if (!roomId || !isWorldCupGroupRoom || !historyEnabled) {
       setWorldCupDayDocs([]);
       setWorldCupDisplayDayResultDocs([]);
       return undefined;
@@ -2628,7 +2720,7 @@ export default function WorldCupTournamentPage() {
       unsubDays();
       unsubResults();
     };
-  }, [roomId, isWorldCupGroupRoom]);
+  }, [roomId, isWorldCupGroupRoom, historyEnabled]);
 
   useEffect(() => {
     if (!roomId || !isWorldCupGroupRoom) {
@@ -2724,19 +2816,29 @@ export default function WorldCupTournamentPage() {
     enabled: Boolean(roomId && !loading),
   });
   const stagedUsersById = stagedLineups.usersById || {};
-  const users = [
-    ...(data?.users || []).map((u) => ({
-      ...u,
-      ...(stagedUsersById[String(u.userId)] || {}),
-    })),
-    ...Object.values(stagedUsersById).filter(
-      (u) => !(data?.users || []).some((base) => String(base.userId) === String(u.userId))
-    ),
-  ];
+  const users = useMemo(() => {
+    const baseUsers = Array.isArray(data?.users) ? data.users : [];
+    const baseUserIds = new Set(
+      baseUsers.map((u) => String(u?.userId || "")).filter(Boolean)
+    );
+
+    return [
+      ...baseUsers.map((u) => ({
+        ...u,
+        ...(stagedUsersById[String(u.userId)] || {}),
+      })),
+      ...Object.values(stagedUsersById).filter(
+        (u) => !baseUserIds.has(String(u?.userId || ""))
+      ),
+    ];
+  }, [data?.users, stagedUsersById]);
   const lineups = stagedLineups.lineupsByUid || {};
   const picksMap = stagedLineups.picksMap || {};
   const rosterByUid = stagedLineups.rosterByUid || {};
-  const userById = Object.fromEntries(users.map((u) => [u.userId, u]));
+  const userById = useMemo(
+    () => Object.fromEntries(users.map((u) => [u.userId, u])),
+    [users]
+  );
   const resolverPicks = useMemo(
     () => [...roomPickDocs, ...Object.values(picksMap || {})],
     [picksMap, roomPickDocs]
@@ -3046,7 +3148,7 @@ export default function WorldCupTournamentPage() {
           : cupDoc?.updatedAtMs ||
             standingsDoc?.updatedAtMs ||
             displayHistoryRounds[0]?.updatedAtMs ||
-            displayHistoryRounds[0]?.closedAtMs
+            cupHistoryTimestampMs(displayHistoryRounds[0])
       ) || 0
     ) || null;
     const pollNextAtMs = Number(
@@ -3087,7 +3189,13 @@ export default function WorldCupTournamentPage() {
       : cupDoc?.currentWindowLabel || "Waiting for next round";
     const isFinal = status === "FINAL" || cupDoc?.completed || (isWorldCupGroupRoom && room?.competitionState?.isDone);
     
-    const livePoints = cupDoc?.livePointsByUid || {};
+    const livePoints = isGlobalCupRoom
+      ? (
+          cupDoc?.globalCurrentWindowPointsByUid ||
+          cupDoc?.livePointsByUid ||
+          {}
+        )
+      : (cupDoc?.livePointsByUid || {});
     const hasCupProjectedTotals = hasNumberMapValues(cupDoc?.projectedTotalsByUid);
     const globalCupBaseTotalsByUid =
       cupDoc?.globalBaseTotalsByUid ||
@@ -3627,27 +3735,14 @@ export default function WorldCupTournamentPage() {
       cupDoc?.globalApplyMode ||
       cupDoc?.globalApplyStatus
     );
-  const cupGlobalLiveBreakdownByUserId = firstNonEmptyBreakdownMap(
+  const cupGlobalCurrentBreakdownByUserId = firstNonEmptyBreakdownMap(
     cupDoc?.globalCurrentWindowBreakdownByUserId,
     cupDoc?.liveBreakdownByUserId
   );
-  const cupGlobalFinalBreakdownByUserId = firstNonEmptyBreakdownMap(
-    cupDoc?.windowBreakdownByUserId,
-    cupDoc?.breakdownByUserId,
-    cupGlobalLiveBreakdownByUserId
-  );
-  const cupStatusLower = String(cupDoc?.status || cupDoc?.globalApplyStatus || "")
-    .trim()
-    .toLowerCase();
   const currentBreakdownByUserId = isWorldCupGroupRoom
     ? (activeWorldCupResult?.breakdownByUserId || {})
     : isCupGlobalCurrentWindow
-      ? (cupStatusLower === "final" || cupStatusLower === "complete"
-          ? cupGlobalFinalBreakdownByUserId
-          : firstNonEmptyBreakdownMap(
-              cupGlobalLiveBreakdownByUserId,
-              cupGlobalFinalBreakdownByUserId
-            ))
+      ? cupGlobalCurrentBreakdownByUserId
       : mergeBreakdownMaps(
           cupDoc?.breakdownByUserId || {},
           cupDoc?.liveBreakdownByUserId || {}
@@ -4223,8 +4318,11 @@ export default function WorldCupTournamentPage() {
   const myBench = sortPlayersForDisplay(getResolvedRoster(myUid, 'bench'));
   const myRoundTotal = sumDisplayedPoints(myStarters);
   const myBenchTotal = sumDisplayedPoints(myBench);
-  const myFieldLayout = buildWorldCupFieldLayout(myStarters);
-  const selectedFieldPlayer = selectedFieldPlayerId
+  const isFieldViewActive = rosterViewMode === "field" && !showFinalPodium;
+  const myFieldLayout = isFieldViewActive
+    ? buildWorldCupFieldLayout(myStarters)
+    : EMPTY_FIELD_LAYOUT;
+  const selectedFieldPlayer = isFieldViewActive && selectedFieldPlayerId
     ? myStarters.find(
         (player) =>
           getFieldPlayerKey(player) === String(selectedFieldPlayerId)
@@ -4240,10 +4338,12 @@ export default function WorldCupTournamentPage() {
     selectedFieldPlayer?.scoringBreakdown ||
     {};
   const selectedFieldPlayerIsLive =
-    isPlayerLiveFromStats(selectedFieldPlayerStats, {
+    selectedFieldPlayer
+      ? isPlayerLiveFromStats(selectedFieldPlayerStats, {
       activeLiveFixtureIds: activeLiveFixtureIdsForRoster,
       allowBareIsLive: allowBarePlayerLiveStats,
-    });
+        })
+      : false;
   const selectedFieldPlayerPoints = Number.isFinite(
     Number(
       selectedFieldPlayer?.points ??
@@ -4257,12 +4357,14 @@ export default function WorldCupTournamentPage() {
           selectedFieldPlayer?.total
       )
     : 0;
-  const selectedFieldPlayerRawRows =
-    buildFieldPlayerRawStatRows(selectedFieldPlayerStats, {
+  const selectedFieldPlayerRawRows = selectedFieldPlayer
+    ? buildFieldPlayerRawStatRows(selectedFieldPlayerStats, {
       fantasyPosition: selectedFieldPlayer?.position,
-    });
-  const selectedFieldPlayerBreakdownRows =
-    buildFieldPlayerBreakdownRows(selectedFieldPlayerBreakdown);
+      })
+    : [];
+  const selectedFieldPlayerBreakdownRows = selectedFieldPlayer
+    ? buildFieldPlayerBreakdownRows(selectedFieldPlayerBreakdown)
+    : [];
   const otherUsers = users.filter(u => u.userId !== myUid);
   const fieldDashboardGames = buildFieldDashboardGames(
     isWorldCupGroupRoom
@@ -4332,15 +4434,17 @@ export default function WorldCupTournamentPage() {
         {/* --- HEADER --- */}
         <div className="tpHeaderRow">
           <div className="tpHeaderLeft">
-            <div className="worldcup-flag-marquee" aria-label="World Cup flags">
-              <div className="worldcup-flag-track">
-                {marqueeFlags.map((country, index) => (
-                  <span className="worldcup-flag" key={`${country}-${index}`} title={country}>
-                    <FlagIcon country={country} size={26} title={country} />
-                  </span>
-                ))}
+            {showFlagMarquee && (
+              <div className="worldcup-flag-marquee" aria-label="World Cup flags">
+                <div className="worldcup-flag-track">
+                  {marqueeFlags.map((country, index) => (
+                    <span className="worldcup-flag" key={`${country}-${index}`} title={country}>
+                      <FlagIcon country={country} size={26} title={country} />
+                    </span>
+                  ))}
+                </div>
               </div>
-            </div>
+            )}
             <h2 className="tpTitle worldcup-title">{worldCupPageTitle}</h2>
             <div className="tpHeaderMetaBlock">
               {competitionLabel && (
@@ -4489,8 +4593,14 @@ export default function WorldCupTournamentPage() {
                 </div>
               </div>
 
-              {rosterViewMode === "field" && (
-                <>
+              {!isWorldCupGroupRoom && (
+                <div className="wcRosterWindowHint">
+                  Current Round Points - {currentWindowLabel}
+                </div>
+              )}
+
+              {isFieldViewActive && (
+                <Suspense fallback={<FieldViewLoadingFallback />}>
                   <div
                     className={`wcFieldViewShell ${
                       selectedFieldPlayer ? "has-selected-player" : ""
@@ -4514,7 +4624,11 @@ export default function WorldCupTournamentPage() {
                       <div className="wcLineupPitchViewport">
                         <div
                           className="wcLineupPitch"
-                          style={{ "--wc-stadium-bg": `url("${stadiumBg}")` }}
+                          style={
+                            stadiumBgUrl
+                              ? { "--wc-stadium-bg": `url("${stadiumBgUrl}")` }
+                              : undefined
+                          }
                         >
                           {myFieldLayout.positionedPlayers.map((item, index) => {
                             const player = item.player;
@@ -4623,7 +4737,7 @@ export default function WorldCupTournamentPage() {
                     </aside>
                   ) : null}
                 </div>
-                </>
+                </Suspense>
               )}
 
               {rosterViewMode === "legacy" && (
@@ -4732,10 +4846,10 @@ export default function WorldCupTournamentPage() {
               )}
             </div>
           )}
-          <section
-            className="wcFieldDashboard"
-            aria-labelledby="wc-field-dashboard-title"
-          >
+            <section
+              className="wcFieldDashboard"
+              aria-labelledby="wc-field-dashboard-title"
+            >
             <div className="wcFieldDashboardHeader">
                 <div>
                     <div className="wcFieldDashboardEyebrow">
@@ -4857,7 +4971,8 @@ export default function WorldCupTournamentPage() {
                         </div>
                       </article>
                     </div>
-                  </section>
+            </section>
+          
 
           {/* OTHER MANAGERS */}
           {!showFinalPodium && (

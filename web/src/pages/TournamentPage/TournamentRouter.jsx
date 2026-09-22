@@ -1,13 +1,37 @@
 // src/pages/TournamentPage/TournamentRouter.jsx
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { useParams, Link, useLocation } from "react-router-dom";
 import { doc, onSnapshot } from "firebase/firestore";
 
 import { db } from "../../firebase";
-import TournamentPage from "./TournamentPage";
-import CupTournamentPage from "./CupTournamentPage";
-import WorldCupTournamentPage from "./WorldCupTournamentPage";
 import "./TournamentPage.css";
+
+const TournamentPage = lazy(() => import("./TournamentPage"));
+const CupTournamentPage = lazy(() => import("./CupTournamentPage"));
+const WorldCupTournamentPage = lazy(() => import("./WorldCupTournamentPage"));
+
+function TournamentChunkFallback() {
+  return (
+    <div className="tpPage">
+      <div className="tpCenter">
+        <div className="tpWrap tpCenter">
+          <div className="loader" aria-label="Loading tournament page">
+            <div className="loader_cube loader_cube--color" />
+            <div className="loader_cube loader_cube--glowing" />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function renderTournamentPage(PageComponent) {
+  return (
+    <Suspense fallback={<TournamentChunkFallback />}>
+      <PageComponent />
+    </Suspense>
+  );
+}
 
 function detectPhaseFromRoundLabelClient(roundLabel) {
   const s = String(roundLabel || "").toLowerCase().trim();
@@ -141,11 +165,11 @@ export default function TournamentRouter() {
   const viewOverride = new URLSearchParams(location.search).get("view");
 
   if (viewOverride === "worldcup") {
-    return <WorldCupTournamentPage />;
+    return renderTournamentPage(WorldCupTournamentPage);
   }
 
   if (viewOverride === "cup") {
-    return <CupTournamentPage />;
+    return renderTournamentPage(CupTournamentPage);
   }
 
   const isWorldCupRoom = Boolean(
@@ -173,7 +197,7 @@ export default function TournamentRouter() {
     );
 
   if (isWorldCupGroupRoom || isWorldCupKnockoutRoom) {
-    return <WorldCupTournamentPage />;
+    return renderTournamentPage(WorldCupTournamentPage);
   }
 
   const storedPhase =
@@ -200,5 +224,5 @@ export default function TournamentRouter() {
 
   
 
-  return isCup ? <CupTournamentPage /> : <TournamentPage />;
+  return renderTournamentPage(isCup ? CupTournamentPage : TournamentPage);
 }

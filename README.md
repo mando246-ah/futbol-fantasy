@@ -4,7 +4,7 @@ A fantasy fútball web app with real-time rooms/leagues, drafting, and a marketp
 This is a work in progress app with mock stats and players
 
 ## Live Demo
-- https://fifa-fantasy-4a7e3.web.app/  
+-  https://futbol-fantasy.com
 
 ## Tech Stack
 - React + Vite
